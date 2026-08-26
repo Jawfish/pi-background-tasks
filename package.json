@@ -1,0 +1,59 @@
+{
+  "name": "@jawfish/pi-background-tasks",
+  "version": "0.1.0",
+  "description": "Session-scoped background shell tasks for Pi",
+  "keywords": [
+    "pi-extension",
+    "pi-package"
+  ],
+  "homepage": "https://github.com/jawfish/pi-background-tasks#readme",
+  "bugs": {
+    "url": "https://github.com/jawfish/pi-background-tasks/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jawfish/pi-background-tasks.git"
+  },
+  "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.84.0",
+    "@earendil-works/pi-coding-agent": "^0.84.0",
+    "@types/bun": "^1.3.14",
+    "@types/node": "^25.9.2",
+    "typebox": "^1.2.3",
+    "typescript": "^6.0.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "bun@1.3.14",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

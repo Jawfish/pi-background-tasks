@@ -1,0 +1,565 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { access, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
+
+import {
+  BACKGROUND_TASK_SHELL_ENV,
+  BackgroundTaskManager,
+  DEFAULT_SHELL,
+  formatModelContext,
+  formatTaskList,
+} from "./core.ts";
+import type {
+  BackgroundTaskManagerOptions,
+  TaskCompletion,
+  TaskSnapshot,
+} from "./core.ts";
+
+const managers: BackgroundTaskManager[] = [];
+const runtimeDirs: string[] = [];
+const linuxTest = process.platform === "linux" ? test : test.skip;
+
+const createManager = async function createManager(
+  options: BackgroundTaskManagerOptions = {}
+): Promise<BackgroundTaskManager> {
+  const runtimeDir = await mkdtemp(path.join(tmpdir(), "pi-bg-test-"));
+  const manager = new BackgroundTaskManager({
+    killGraceMs: 100,
+    runtimeDir,
+    ...options,
+  });
+  managers.push(manager);
+  runtimeDirs.push(runtimeDir);
+  await manager.initialize();
+  return manager;
+};
+
+const waitForTerminal = async function waitForTerminal(
+  manager: BackgroundTaskManager,
+  taskId: string
+): Promise<TaskSnapshot> {
+  return await Promise.race([
+    manager.wait(taskId),
+    sleep(3000).then(() => {
+      throw new Error(`Task ${taskId} did not finish`);
+    }),
+  ]);
+};
+
+const pathExists = async function pathExists(
+  filePath: string
+): Promise<boolean> {
+  try {
+    await access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const processIsAlive = async function processIsAlive(
+  pid: number
+): Promise<boolean> {
+  try {
+    const stat = await readFile(`/proc/${String(pid)}/stat`, "utf-8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    return fields[0] !== "Z";
+  } catch {
+    return false;
+  }
+};
+
+const waitForLog = async function waitForLog(
+  manager: BackgroundTaskManager,
+  taskId: string,
+  expected: string
+): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    // Polling is intentional here because the child writes asynchronously.
+    // oxlint-disable-next-line eslint/no-await-in-loop
+    const logs = await manager.logs(taskId);
+    if (logs.text.includes(expected)) {
+      return;
+    }
+    // oxlint-disable-next-line eslint/no-await-in-loop
+    await sleep(10);
+  }
+  throw new Error(`Task ${taskId} did not log ${expected}`);
+};
+
+afterEach(async () => {
+  await Promise.all(managers.splice(0).map((manager) => manager.shutdown()));
+  await Promise.all(
+    runtimeDirs
+      .splice(0)
+      .map((runtimeDir) => rm(runtimeDir, { force: true, recursive: true }))
+  );
+});
+
+describe("BackgroundTaskManager", () => {
+  test("runs a command and returns its log", async () => {
+    const finished: TaskSnapshot[] = [];
+    const manager = await createManager({
+      onFinished: (completion) => finished.push(completion.task),
+    });
+    const started = await manager.start({
+      command: "printf 'hello from task'",
+      cwd: process.cwd(),
+      name: "Greeting",
+      wakeOnExit: true,
+    });
+
+    const terminal = await waitForTerminal(manager, started.id);
+    const logs = await manager.logs(started.id);
+
+    expect(terminal).toMatchObject({
+      name: "Greeting",
+      status: "completed",
+      wakeOnExit: true,
+    });
+    expect(logs.text).toContain("hello from task");
+    expect(finished).toHaveLength(1);
+    expect(finished[0]?.id).toBe(started.id);
+  });
+
+  test("truncates names without splitting a Unicode character", async () => {
+    const manager = await createManager();
+    const started = await manager.start({
+      command: "true",
+      cwd: process.cwd(),
+      name: `${"x".repeat(59)}🙂tail`,
+    });
+
+    const terminal = await waitForTerminal(manager, started.id);
+
+    expect([...terminal.name]).toHaveLength(60);
+    expect(terminal.name).toEndWith("🙂");
+    expect(terminal.name).not.toContain("�");
+  });
+
+  test("uses a predictable POSIX shell from PATH", async () => {
+    expect(DEFAULT_SHELL).toBe("sh");
+    const manager = await createManager();
+    const started = await manager.start({
+      command: "value='shell ok'; printf '%s' \"$value\"",
+      cwd: process.cwd(),
+    });
+
+    const terminal = await waitForTerminal(manager, started.id);
+    const logs = await manager.logs(started.id);
+
+    expect(terminal.status).toBe("completed");
+    expect(logs.text).toContain("shell ok");
+  });
+
+  test("accepts a shell override through the environment", async () => {
+    const previous = process.env[BACKGROUND_TASK_SHELL_ENV];
+    let manager: BackgroundTaskManager;
+    try {
+      process.env[BACKGROUND_TASK_SHELL_ENV] =
+        "/definitely/missing/background-task-environment-shell";
+      manager = await createManager();
+    } finally {
+      if (previous === undefined) {
+        Reflect.deleteProperty(process.env, BACKGROUND_TASK_SHELL_ENV);
+      } else {
+        process.env[BACKGROUND_TASK_SHELL_ENV] = previous;
+      }
+    }
+
+    const started = await manager.start({
+      command: "true",
+      cwd: process.cwd(),
+    });
+    const terminal = await waitForTerminal(manager, started.id);
+
+    expect(terminal.status).toBe("failed");
+    expect(terminal.error).toContain("ENOENT");
+  });
+
+  test("cleans the log after a synchronous spawn failure", async () => {
+    const manager = await createManager();
+    const runtimeDir = runtimeDirs.at(-1);
+    expect(runtimeDir).toBeString();
+    if (!runtimeDir) {
+      throw new Error("Missing test runtime directory");
+    }
+
+    await expect(
+      manager.start({ command: "printf '\0'", cwd: process.cwd() })
+    ).rejects.toThrow("Failed to start background task");
+
+    expect(await readdir(runtimeDir)).toHaveLength(0);
+  });
+
+  test("records command and spawn failures", async () => {
+    const manager = await createManager();
+    const exited = await manager.start({
+      command: "printf 'failure output' >&2; exit 7",
+      cwd: process.cwd(),
+    });
+    const missingShell = await createManager({
+      shell: "/definitely/missing/background-task-shell",
+    });
+    const notSpawned = await missingShell.start({
+      command: "true",
+      cwd: process.cwd(),
+    });
+
+    const [exitFailure, spawnFailure] = await Promise.all([
+      waitForTerminal(manager, exited.id),
+      waitForTerminal(missingShell, notSpawned.id),
+    ]);
+    const logs = await manager.logs(exited.id);
+
+    expect(exitFailure.status).toBe("failed");
+    expect(exitFailure.exitCode).toBe(7);
+    expect(exitFailure.error).toContain("Exited with code 7");
+    expect(logs.text).toContain("failure output");
+    expect(spawnFailure.status).toBe("failed");
+    expect(spawnFailure.error).toContain("ENOENT");
+  });
+
+  test("reports external signal termination clearly", async () => {
+    const manager = await createManager();
+    const started = await manager.start({
+      command: "kill -TERM $$",
+      cwd: process.cwd(),
+    });
+
+    const terminal = await waitForTerminal(manager, started.id);
+
+    expect(terminal.status).toBe("failed");
+    expect(terminal.signal).toBe("SIGTERM");
+    expect(terminal.error).toBe("Terminated by SIGTERM");
+  });
+
+  linuxTest(
+    "cleans up redirected children after the command shell exits",
+    async () => {
+      const manager = await createManager();
+      const started = await manager.start({
+        command: "sleep 30 >/dev/null 2>&1 & printf '%s\\n' \"$!\"",
+        cwd: process.cwd(),
+      });
+
+      const terminal = await waitForTerminal(manager, started.id);
+      const logs = await manager.logs(started.id);
+      const childPid = Number(/^(?<pid>\d+)$/mu.exec(logs.output)?.groups?.pid);
+      expect(childPid).toBeGreaterThan(0);
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        // Process-group cleanup is asynchronous in the kernel.
+        // oxlint-disable-next-line eslint/no-await-in-loop
+        if (!(await processIsAlive(childPid))) {
+          break;
+        }
+        // oxlint-disable-next-line eslint/no-await-in-loop
+        await sleep(10);
+      }
+
+      expect(terminal.status).toBe("completed");
+      expect(await processIsAlive(childPid)).toBe(false);
+    }
+  );
+
+  test("stops the whole background process group", async () => {
+    const manager = await createManager();
+    const started = await manager.start({
+      command: "sleep 30 & wait",
+      cwd: process.cwd(),
+      name: "Long task",
+    });
+
+    const stopping = manager.stop(started.id.slice(0, 4));
+    const terminal = await waitForTerminal(manager, started.id);
+
+    expect(stopping.status).toBe("stopping");
+    expect(terminal.status).toBe("stopped");
+    expect(() => manager.stop(started.id)).toThrow("already stopped");
+  });
+
+  test("escalates to SIGKILL when a process ignores SIGTERM", async () => {
+    const manager = await createManager({ killGraceMs: 25 });
+    const started = await manager.start({
+      command: "trap '' TERM; printf 'ready\\n'; while :; do sleep 1; done",
+      cwd: process.cwd(),
+    });
+    await waitForLog(manager, started.id, "ready");
+
+    manager.stop(started.id);
+    const terminal = await waitForTerminal(manager, started.id);
+
+    expect(terminal.status).toBe("stopped");
+    expect(terminal.signal).toBe("SIGKILL");
+  });
+
+  test("marks a timed-out task as failed even when it traps TERM", async () => {
+    const manager = await createManager();
+    const started = await manager.start({
+      command: "trap 'exit 0' TERM; sleep 30",
+      cwd: process.cwd(),
+      timeoutSeconds: 1,
+    });
+
+    const terminal = await waitForTerminal(manager, started.id);
+
+    expect(terminal.status).toBe("failed");
+    expect(terminal.error).toBe("Timed out after 1s");
+  });
+
+  test("fails and stops a task that exceeds the output cap", async () => {
+    const manager = await createManager({ maxOutputBytes: 16 });
+    const started = await manager.start({
+      command: "printf '123456789012345678901234567890'",
+      cwd: process.cwd(),
+    });
+
+    const terminal = await waitForTerminal(manager, started.id);
+    const logs = await manager.logs(started.id);
+
+    expect(terminal.status).toBe("failed");
+    expect(terminal.error).toContain("Output exceeded 16 bytes");
+    expect(logs.totalBytes).toBeGreaterThanOrEqual(16);
+    expect(logs.text).toContain("background task stopped");
+  });
+
+  test("enforces the active limit across concurrent starts", async () => {
+    const manager = await createManager({ maxActiveTasks: 2 });
+    const attempts = await Promise.allSettled(
+      Array.from(
+        { length: 3 },
+        async () =>
+          await manager.start({ command: "sleep 30", cwd: process.cwd() })
+      )
+    );
+
+    expect(
+      attempts.filter((result) => result.status === "fulfilled")
+    ).toHaveLength(2);
+    const rejected = attempts.find((result) => result.status === "rejected");
+    expect(rejected?.reason).toBeInstanceOf(Error);
+    expect(String(rejected?.reason)).toContain(
+      "At most 2 background tasks may run at once"
+    );
+  });
+
+  test("keeps the visible recent list small but retains concurrent results", async () => {
+    const manager = await createManager({
+      maxActiveTasks: 3,
+      maxRecentTasks: 1,
+    });
+    const started = await Promise.all(
+      Array.from(
+        { length: 3 },
+        async (_, index) =>
+          await manager.start({
+            command: "true",
+            cwd: process.cwd(),
+            name: `Concurrent ${String(index)}`,
+          })
+      )
+    );
+    await Promise.all(
+      started.map(async (task) => await waitForTerminal(manager, task.id))
+    );
+
+    expect(manager.list()).toHaveLength(1);
+    for (const task of started) {
+      expect(manager.status(task.id)).toHaveLength(1);
+    }
+  });
+
+  test("preserves wake output after task state and logs are pruned", async () => {
+    const completions: TaskCompletion[] = [];
+    const manager = await createManager({
+      maxActiveTasks: 1,
+      maxRecentTasks: 1,
+      maxRetainedTasks: 1,
+      onFinished: (completion) => completions.push(completion),
+    });
+    const first = await manager.start({
+      command: "printf first-output",
+      cwd: process.cwd(),
+      wakeOnExit: true,
+    });
+    await waitForTerminal(manager, first.id);
+    const second = await manager.start({
+      command: "printf second-output",
+      cwd: process.cwd(),
+      wakeOnExit: true,
+    });
+    await waitForTerminal(manager, second.id);
+
+    expect(() => manager.status(first.id)).toThrow(
+      "Unknown background task ID"
+    );
+    expect(await pathExists(first.logPath)).toBe(false);
+    expect(completions[0]?.output).toContain("first-output");
+    expect(completions[1]?.output).toContain("second-output");
+  });
+
+  test("prunes old task state and its log", async () => {
+    const manager = await createManager({
+      maxActiveTasks: 2,
+      maxRecentTasks: 2,
+      maxRetainedTasks: 2,
+    });
+    const tasks: TaskSnapshot[] = [];
+    for (let index = 0; index < 3; index += 1) {
+      // Sequential completion makes the pruning order deterministic.
+      // oxlint-disable-next-line eslint/no-await-in-loop
+      const task = await manager.start({
+        command: "true",
+        cwd: process.cwd(),
+        name: `Task ${String(index)}`,
+      });
+      tasks.push(task);
+      // oxlint-disable-next-line eslint/no-await-in-loop
+      await waitForTerminal(manager, task.id);
+    }
+
+    const [oldest] = tasks;
+    expect(oldest).toBeDefined();
+    if (!oldest) {
+      throw new Error("Missing oldest task");
+    }
+    expect(manager.list()).toHaveLength(2);
+    expect(() => manager.status(oldest.id)).toThrow(
+      "Unknown background task ID"
+    );
+    expect(await pathExists(oldest.logPath)).toBe(false);
+  });
+
+  test("returns a valid UTF-8 tail when truncation splits a character", async () => {
+    const manager = await createManager();
+    const started = await manager.start({
+      command: `printf '${"x".repeat(100)}🙂END'`,
+      cwd: process.cwd(),
+    });
+    await waitForTerminal(manager, started.id);
+
+    const splitTail = await manager.logs(started.id, 6);
+    const completeTail = await manager.logs(started.id, 7);
+
+    expect(splitTail.text).not.toContain("�");
+    expect(splitTail.text).toContain("END");
+    expect(completeTail.text).toContain("🙂END");
+
+    const emojiOnly = await manager.start({
+      command: "printf '🙂'",
+      cwd: process.cwd(),
+    });
+    await waitForTerminal(manager, emojiOnly.id);
+    const continuationOnly = await manager.logs(emojiOnly.id, 1);
+    expect(continuationOnly.text).toContain(
+      "No complete UTF-8 character in the selected log tail"
+    );
+    expect(continuationOnly.text).not.toContain("no output yet");
+  });
+
+  test("rejects starts after shutdown and removes its temporary directory", async () => {
+    const manager = new BackgroundTaskManager();
+    managers.push(manager);
+    const initializePromise = manager.initialize();
+    const shutdownPromise = manager.shutdown();
+    const runtimeDir = await initializePromise;
+
+    await shutdownPromise;
+
+    expect(await pathExists(runtimeDir)).toBe(false);
+    await expect(
+      manager.start({ command: "true", cwd: process.cwd() })
+    ).rejects.toThrow("shutting down");
+  });
+
+  test("does not recreate its runtime directory when shutdown races a start", async () => {
+    const manager = new BackgroundTaskManager();
+    managers.push(manager);
+    const runtimeDir = await manager.initialize();
+
+    const starting = manager.start({
+      command: "sleep 30",
+      cwd: process.cwd(),
+    });
+    const shuttingDown = manager.shutdown();
+
+    await expect(starting).rejects.toThrow("shutting down");
+    await shuttingDown;
+    expect(await pathExists(runtimeDir)).toBe(false);
+  });
+
+  test("rejects ambiguous task ID prefixes", async () => {
+    const manager = await createManager({
+      maxActiveTasks: 20,
+      maxRecentTasks: 1,
+      maxRetainedTasks: 20,
+    });
+    const tasks = await Promise.all(
+      Array.from(
+        { length: 17 },
+        async () =>
+          await manager.start({
+            command: "true",
+            cwd: process.cwd(),
+          })
+      )
+    );
+    await Promise.all(
+      tasks.map(async (task) => await waitForTerminal(manager, task.id))
+    );
+    const counts = new Map<string, number>();
+    for (const task of tasks) {
+      const prefix = task.id.slice(0, 1);
+      counts.set(prefix, (counts.get(prefix) ?? 0) + 1);
+    }
+    const ambiguous = [...counts].find(([, count]) => count > 1)?.[0];
+
+    expect(ambiguous).toBeString();
+    expect(() => manager.status(ambiguous)).toThrow("Ambiguous task ID prefix");
+  });
+});
+
+describe("task formatting", () => {
+  const task: TaskSnapshot = {
+    bytesWritten: 0,
+    command: "true",
+    cwd: "/tmp/project",
+    id: "abc12345",
+    logPath: "/tmp/task.log",
+    name: "Build <main>",
+    startedAt: 1000,
+    status: "running",
+    wakeOnExit: true,
+  };
+
+  test("injects active status and escapes model-controlled names", () => {
+    const context = formatModelContext([task]);
+
+    expect(context).toContain("abc12345 [running");
+    expect(context).toContain("Build &lt;main&gt;");
+    expect(context).toContain("automatic continuation enabled");
+  });
+
+  test("formats an empty and populated task list", () => {
+    expect(formatTaskList([])).toBe("No background tasks.");
+    expect(formatTaskList([task], 2000)).toContain(
+      "abc12345 running 1s wake=on"
+    );
+  });
+
+  test("shows a stop signal instead of a null exit code", () => {
+    const stopped: TaskSnapshot = {
+      ...task,
+      endedAt: 2000,
+      exitCode: null,
+      signal: "SIGTERM",
+      status: "stopped",
+    };
+
+    expect(formatTaskList([stopped], 2000)).toContain("signal=SIGTERM");
+    expect(formatTaskList([stopped], 2000)).not.toContain("exit=null");
+    expect(formatModelContext([stopped])).toContain("signal SIGTERM");
+  });
+});
