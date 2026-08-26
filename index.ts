@@ -13,6 +13,18 @@ import {
   MAX_LOG_READ_BYTES,
 } from "./core.ts";
 import type { TaskCompletion } from "./core.ts";
+import {
+  formatUiDuration,
+  renderBackgroundTaskCall,
+  renderBackgroundTaskResult,
+  renderCompletionMessage,
+  sanitizeUiInline,
+  TaskDashboardComponent,
+} from "./tui.ts";
+import type {
+  BackgroundTaskToolDetails,
+  CompletionDisplayDetails,
+} from "./tui.ts";
 
 const WAKE_BATCH_MS = 100;
 const MAX_COMPLETION_TASKS = 16;
@@ -119,7 +131,7 @@ export const completionMessage = function completionMessage(
     const { task } = completion;
     const name = escapeXmlWithinBytes(task.name, MAX_COMPLETION_NAME_BYTES);
     lines.push(
-      `  <task id="${task.id}">`,
+      `  <task id="${escapeXml(task.id)}">`,
       `    <name truncated="${String(name.truncated)}">${name.text}</name>`,
       `    <status>${task.status}</status>`
     );
@@ -185,6 +197,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
   let currentCtx: ExtensionContext | undefined;
   let shuttingDown = false;
   let wakeHandle: NodeJS.Timeout | undefined;
+  let activeDashboard: TaskDashboardComponent | undefined;
   const pendingWake = new Map<string, TaskCompletion>();
   // Callbacks close over the manager, so initialization follows their definitions.
   // oxlint-disable-next-line eslint/prefer-const
@@ -195,15 +208,19 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     if (!ctx?.hasUI) {
       return;
     }
-    const activeCount = manager
-      .list()
-      .filter(
-        (task) => task.status === "running" || task.status === "stopping"
-      ).length;
+    const tasks = manager.list();
+    const running = tasks.filter((task) => task.status === "running").length;
+    const stopping = tasks.filter((task) => task.status === "stopping").length;
+    const activeCount = running + stopping;
+    const parts = [
+      running > 0 ? `${String(running)} running` : undefined,
+      stopping > 0 ? `${String(stopping)} stopping` : undefined,
+    ].filter((part): part is string => part !== undefined);
     ctx.ui.setStatus(
       "background-tasks",
-      activeCount > 0 ? `bg ${String(activeCount)}` : undefined
+      activeCount > 0 ? `bg: ${parts.join(" · ")}` : undefined
     );
+    activeDashboard?.refresh();
   };
 
   const flushWake = (): void => {
@@ -222,13 +239,16 @@ const backgroundTasksExtension = function backgroundTasksExtension(
           customType: "background-task-completion",
           details: {
             omitted: completions.length - included.length,
-            tasks: included.map(({ task }) => ({
-              error: task.error,
-              exitCode: task.exitCode,
-              id: task.id,
-              name: task.name,
-              signal: task.signal,
-              status: task.status,
+            tasks: included.map((completion) => ({
+              error: completion.task.error,
+              exitCode: completion.task.exitCode,
+              id: completion.task.id,
+              name: completion.task.name,
+              output: completion.output,
+              outputError: completion.outputError,
+              outputTruncated: completion.outputTruncated,
+              signal: completion.task.signal,
+              status: completion.task.status,
             })),
           },
           display: true,
@@ -246,8 +266,17 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     const { task } = completion;
     const ctx = currentCtx;
     if (!shuttingDown && ctx?.hasUI) {
+      const duration = formatUiDuration(
+        (task.endedAt ?? Date.now()) - task.startedAt
+      );
+      const terminal =
+        typeof task.exitCode === "number"
+          ? `, exit ${String(task.exitCode)}`
+          : task.signal
+            ? `, ${task.signal}`
+            : "";
       ctx.ui.notify(
-        `Background task ${task.name} (${task.id}) ${task.status}.`,
+        `${sanitizeUiInline(task.name)} ${task.status} after ${duration} (${task.id}${terminal}).`,
         task.status === "failed" ? "error" : "info"
       );
     }
@@ -270,7 +299,13 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     onFinished: handleFinished,
   });
 
-  pi.registerTool({
+  pi.registerMessageRenderer<CompletionDisplayDetails>(
+    "background-task-completion",
+    (message, options, theme) =>
+      renderCompletionMessage(message, options, theme)
+  );
+
+  pi.registerTool<typeof Parameters, BackgroundTaskToolDetails>({
     description: [
       "Manage session-scoped background shell tasks.",
       "Actions: start, status, logs, stop.",
@@ -352,6 +387,12 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     label: "Background Task",
     name: "background_task",
     parameters: Parameters,
+    renderCall(args, theme, context) {
+      return renderBackgroundTaskCall(args, theme, context);
+    },
+    renderResult(result, options, theme, context) {
+      return renderBackgroundTaskResult(result, options, theme, context);
+    },
     promptGuidelines: [
       "Use background_task with action=start for commands that should run without blocking the agent.",
       "Set background_task wakeOnExit=true only when the agent must continue automatically after that task completes or fails.",
@@ -360,6 +401,48 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     ],
     promptSnippet:
       "Start, inspect, read, or stop session-scoped background shell tasks",
+  });
+
+  pi.registerCommand("background-tasks", {
+    description: "Open the interactive background task monitor",
+    handler: async (_args, ctx) => {
+      if (ctx.mode !== "tui") {
+        ctx.ui.notify("/background-tasks requires TUI mode", "error");
+        return;
+      }
+
+      let dashboard: TaskDashboardComponent | undefined;
+      try {
+        await ctx.ui.custom<void>(
+          (tui, theme, keybindings, done) => {
+            dashboard = new TaskDashboardComponent({
+              keybindings,
+              manager,
+              onClose: () => done(),
+              theme,
+              tui,
+            });
+            activeDashboard = dashboard;
+            return dashboard;
+          },
+          {
+            overlay: true,
+            overlayOptions: {
+              anchor: "center",
+              margin: 1,
+              maxHeight: "90%",
+              minWidth: 44,
+              width: "90%",
+            },
+          }
+        );
+      } finally {
+        dashboard?.dispose();
+        if (activeDashboard === dashboard) {
+          activeDashboard = undefined;
+        }
+      }
+    },
   });
 
   pi.on("context", (event) => ({
@@ -384,6 +467,8 @@ const backgroundTasksExtension = function backgroundTasksExtension(
 
   pi.on("session_shutdown", async () => {
     shuttingDown = true;
+    activeDashboard?.dispose();
+    activeDashboard = undefined;
     if (wakeHandle) {
       clearTimeout(wakeHandle);
       wakeHandle = undefined;

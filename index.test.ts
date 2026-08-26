@@ -55,6 +55,12 @@ const createHarness = function createHarness() {
       registered.push(handler);
       handlers.set(event, registered);
     },
+    registerCommand() {
+      // Command behavior is covered by the dashboard component tests.
+    },
+    registerMessageRenderer() {
+      // Rendering is covered independently from the extension harness.
+    },
     registerTool(value: RegisteredTool) {
       tool = value;
     },
@@ -152,6 +158,16 @@ describe("completion messages", () => {
     expect(message).toContain("TRUE-END");
     expect(message).not.toContain("FALSE-START");
     expect(message).toContain('<omitted count="16">');
+  });
+
+  test("escapes task IDs used in XML attributes", () => {
+    const completion = fakeCompletion(1);
+    completion.task.id = `bad\"&<id`;
+
+    const message = completionMessage([completion]);
+
+    expect(message).toContain('id="bad&quot;&amp;&lt;id"');
+    expect(message).not.toContain('id="bad\"&<id"');
   });
 
   test("does not claim output exists when capture failed", () => {
@@ -255,7 +271,7 @@ describe("background tasks extension", () => {
     await waitForCompletion();
 
     expect(harness.sentMessages).toHaveLength(0);
-    expect(harness.statuses).toContain("bg 1");
+    expect(harness.statuses).toContain("bg: 1 running");
 
     await harness.emit("session_shutdown");
   });

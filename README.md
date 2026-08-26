@@ -38,6 +38,24 @@ Stop a task:
 
 `taskId` accepts a full ID or a unique prefix.
 
+## Interactive monitor
+
+Run `/background-tasks` in Pi's TUI to open an auto-refreshing task monitor. It
+adapts to narrow and short terminals and shows task state, elapsed time,
+commands, process details, and a bounded log tail.
+
+- Use the configured up and down keys, or `j` and `k`, to select a task.
+- Press Enter or `l` to switch between task details and its log tail.
+- Press `r` to refresh immediately.
+- Press `x` twice to stop a running task. The second press prevents accidental
+  stops.
+- Press Escape or the configured cancel key to close the monitor.
+
+The footer shows a compact running and stopping count. Tool calls, tool results,
+and automatic completions use themed, expandable summaries instead of raw task
+data. Terminal control sequences from commands and logs are removed before
+custom TUI rendering.
+
 ## Automatic continuation
 
 `wakeOnExit` defaults to `false`. When it is `true`, a completed or failed task starts one follow-up model turn. Completions within 100 milliseconds share one follow-up.
