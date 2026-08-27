@@ -58,9 +58,9 @@ custom TUI rendering.
 
 ## Automatic continuation
 
-`wakeOnExit` defaults to `false`. When it is `true`, a completed or failed task starts one follow-up model turn. Completions within 100 milliseconds share one follow-up.
+`wakeOnExit` defaults to `false`. When it is `true`, a completed or failed task delivers one automatic continuation. If the agent is active, the completion steers the next model call instead of waiting for the whole run to settle. If the agent is idle, it starts a turn. Completions within 100 milliseconds share one continuation.
 
-The follow-up includes bounded output tails captured before log pruning. Its model-facing message is capped at 32 KiB and includes details for at most 16 tasks. A manual stop does not start a follow-up. Pi also suppresses follow-ups during session shutdown.
+The continuation includes bounded output tails captured before log pruning. Its model-facing message is capped at 32 KiB and includes details for at most 16 tasks. Completed and failed wake-enabled tasks are omitted from the parallel recent-task status because the continuation is authoritative. A manual stop does not start a continuation. Pi also suppresses continuations during session shutdown.
 
 ## Status context
 
