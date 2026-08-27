@@ -208,7 +208,7 @@ describe("background tasks extension", () => {
     await harness.emit("session_shutdown");
   });
 
-  test("batches wake-enabled completions into an automatic follow-up", async () => {
+  test("steers batched wake completions into the next model call", async () => {
     const harness = createHarness();
     await harness.emit("session_start");
 
@@ -230,7 +230,7 @@ describe("background tasks extension", () => {
 
     expect(harness.sentMessages).toHaveLength(1);
     expect(harness.sentMessages[0]?.options).toEqual({
-      deliverAs: "followUp",
+      deliverAs: "steer",
       triggerTurn: true,
     });
     expect(harness.sentMessages[0]?.message).toMatchObject({
@@ -245,6 +245,12 @@ describe("background tasks extension", () => {
     expect(completion.content).toContain("second");
     expect(completion.content).not.toContain("<log>");
     expect(harness.notifications).toHaveLength(2);
+
+    const context = (await harness.emit("context", {
+      messages: [],
+    })) as { messages: { content: string }[] };
+    expect(context.messages.at(-1)?.content).not.toContain("First task");
+    expect(context.messages.at(-1)?.content).not.toContain("Second task");
 
     await harness.emit("session_shutdown");
   });
@@ -272,6 +278,12 @@ describe("background tasks extension", () => {
 
     expect(harness.sentMessages).toHaveLength(0);
     expect(harness.statuses).toContain("bg: 1 running");
+
+    const context = (await harness.emit("context", {
+      messages: [],
+    })) as { messages: { content: string }[] };
+    expect(context.messages.at(-1)?.content).toContain("No wake");
+    expect(context.messages.at(-1)?.content).toContain("Stopped task");
 
     await harness.emit("session_shutdown");
   });

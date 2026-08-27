@@ -69,7 +69,7 @@ const Parameters = Type.Object({
   wakeOnExit: Type.Optional(
     Type.Boolean({
       description:
-        "For action=start, start one automatic follow-up model turn when the task completes or fails. Default: false.",
+        "For action=start, deliver one automatic continuation when the task completes or fails. Default: false.",
     })
   ),
 });
@@ -253,7 +253,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
           },
           display: true,
         },
-        { deliverAs: "followUp", triggerTurn: true }
+        { deliverAs: "steer", triggerTurn: true }
       );
     } catch (error) {
       console.error(
@@ -396,7 +396,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     promptGuidelines: [
       "Use background_task with action=start for commands that should run without blocking the agent.",
       "Set background_task wakeOnExit=true only when the agent must continue automatically after that task completes or fails.",
-      "Do not poll background_task status or logs merely to wait. Current status is injected before every model call, and wakeOnExit starts a follow-up turn when enabled.",
+      "Do not poll background_task status or logs merely to wait. Current active status is injected before every model call, and wakeOnExit steers completion into the next model call or starts a turn when idle.",
       "Use background_task logs only when task output is needed. Keep maxBytes modest to protect model context.",
     ],
     promptSnippet:
@@ -449,7 +449,13 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     messages: [
       ...event.messages,
       {
-        content: formatModelContext(manager.list()),
+        content: formatModelContext(
+          manager.list().filter(
+            (task) =>
+              !task.wakeOnExit ||
+              (task.status !== "completed" && task.status !== "failed")
+          )
+        ),
         customType: "background-task-status",
         display: false,
         role: "custom" as const,
