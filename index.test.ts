@@ -5,6 +5,7 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
+import { BackgroundTaskManager } from "./core.ts";
 import type { TaskCompletion } from "./core.ts";
 import backgroundTasksExtension, {
   completionMessage,
@@ -303,5 +304,51 @@ describe("background tasks extension", () => {
     await waitForCompletion();
 
     expect(harness.sentMessages).toHaveLength(0);
+  });
+
+  test("clears UI and context when manager shutdown fails", async () => {
+    const harness = createHarness();
+    await harness.emit("session_start");
+    const originalShutdown = BackgroundTaskManager.prototype.shutdown;
+    BackgroundTaskManager.prototype.shutdown = async () => {
+      throw new Error("manager shutdown failed");
+    };
+
+    try {
+      await expect(harness.emit("session_shutdown")).rejects.toThrow(
+        "manager shutdown failed"
+      );
+      expect(harness.statuses.at(-1)).toBeUndefined();
+      const context = (await harness.emit("context", {
+        messages: [],
+      })) as { messages: unknown[] };
+      expect(context.messages).toHaveLength(0);
+    } finally {
+      BackgroundTaskManager.prototype.shutdown = originalShutdown;
+      await harness.emit("session_shutdown");
+    }
+  });
+
+  test("clears UI and context when runtime removal fails", async () => {
+    const harness = createHarness();
+    await harness.emit("session_start");
+    const originalShutdown = BackgroundTaskManager.prototype.shutdown;
+    BackgroundTaskManager.prototype.shutdown = async function shutdown() {
+      await originalShutdown.call(this);
+      throw new Error("runtime removal failed");
+    };
+
+    try {
+      await expect(harness.emit("session_shutdown")).rejects.toThrow(
+        "runtime removal failed"
+      );
+      expect(harness.statuses.at(-1)).toBeUndefined();
+      const context = (await harness.emit("context", {
+        messages: [],
+      })) as { messages: unknown[] };
+      expect(context.messages).toHaveLength(0);
+    } finally {
+      BackgroundTaskManager.prototype.shutdown = originalShutdown;
+    }
   });
 });

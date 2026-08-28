@@ -445,24 +445,29 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     },
   });
 
-  pi.on("context", (event) => ({
-    messages: [
-      ...event.messages,
-      {
-        content: formatModelContext(
-          manager.list().filter(
-            (task) =>
-              !task.wakeOnExit ||
-              (task.status !== "completed" && task.status !== "failed")
-          )
-        ),
-        customType: "background-task-status",
-        display: false,
-        role: "custom" as const,
-        timestamp: Date.now(),
-      },
-    ],
-  }));
+  pi.on("context", (event) => {
+    if (shuttingDown) {
+      return { messages: event.messages };
+    }
+    return {
+      messages: [
+        ...event.messages,
+        {
+          content: formatModelContext(
+            manager.list().filter(
+              (task) =>
+                !task.wakeOnExit ||
+                (task.status !== "completed" && task.status !== "failed")
+            )
+          ),
+          customType: "background-task-status",
+          display: false,
+          role: "custom" as const,
+          timestamp: Date.now(),
+        },
+      ],
+    };
+  });
 
   pi.on("session_start", async (_event, ctx) => {
     shuttingDown = false;
@@ -473,16 +478,25 @@ const backgroundTasksExtension = function backgroundTasksExtension(
 
   pi.on("session_shutdown", async () => {
     shuttingDown = true;
-    activeDashboard?.dispose();
+    const dashboard = activeDashboard;
+    const ctx = currentCtx;
     activeDashboard = undefined;
     if (wakeHandle) {
       clearTimeout(wakeHandle);
       wakeHandle = undefined;
     }
     pendingWake.clear();
-    await manager.shutdown();
-    currentCtx?.ui.setStatus("background-tasks", undefined);
-    currentCtx = undefined;
+
+    try {
+      dashboard?.dispose();
+    } finally {
+      try {
+        await manager.shutdown();
+      } finally {
+        currentCtx = undefined;
+        ctx?.ui.setStatus("background-tasks", undefined);
+      }
+    }
   });
 };
 
