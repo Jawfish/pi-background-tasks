@@ -70,13 +70,20 @@ export interface TaskCompletion {
 
 type StopReason = "user" | "shutdown" | "timeout" | "output_limit";
 
+type ShellOutcome = {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+};
+
 type RuntimeTask = TaskSnapshot & {
   child: ChildProcessByStdio<null, Readable, Readable>;
   stream: WriteStream;
   stopReason?: StopReason;
   outputLimitReached: boolean;
   finalizing: boolean;
+  cleanupPromise?: Promise<string | undefined>;
   finishedOrder?: number;
+  shellOutcome?: ShellOutcome;
   closed: Promise<null>;
   resolveClosed: () => void;
   timeoutHandle?: NodeJS.Timeout;
@@ -408,29 +415,17 @@ export class BackgroundTaskManager {
         void this.#finalize(task, "failed", null, null, error.message);
       });
       child.once("close", (code, signal) => {
-        let cleanupError: string | undefined;
+        task.shellOutcome = { code, signal };
         if (!task.stopReason) {
-          try {
-            // The command shell can exit naturally while redirected children
-            // remain in its group. Explicit stops already signalled the group.
-            BackgroundTaskManager.#signal(task, "SIGTERM");
-          } catch (error) {
-            cleanupError = `Could not clean up the process group: ${error instanceof Error ? error.message : String(error)}`;
-          }
+          void this.#finishNaturalExit(task);
+          return;
         }
         const terminal = BackgroundTaskManager.#terminalState(
           task,
           code,
           signal
         );
-        const terminalStatus =
-          cleanupError && terminal.status === "completed"
-            ? "failed"
-            : terminal.status;
-        const terminalError = cleanupError
-          ? appendError(terminal.error, cleanupError)
-          : terminal.error;
-        void this.#finalize(task, terminalStatus, code, signal, terminalError);
+        void this.#finalize(task, terminal.status, code, signal, terminal.error);
       });
 
       if (timeoutSeconds !== undefined) {
@@ -655,6 +650,118 @@ export class BackgroundTaskManager {
       task.error = `Output exceeded ${String(this.#maxOutputBytes)} bytes`;
       task.stream.write(`\n\n[background task stopped: ${task.error}]\n`);
       this.#beginStop(task, "output_limit");
+    }
+  }
+
+  async #finishNaturalExit(task: RuntimeTask): Promise<void> {
+    if (!isActiveStatus(task.status) || !task.shellOutcome) {
+      return;
+    }
+    task.status = "stopping";
+    if (task.timeoutHandle) {
+      clearTimeout(task.timeoutHandle);
+      task.timeoutHandle = undefined;
+    }
+    this.#notifyChange();
+
+    const cleanupError = await this.#cleanupProcessGroup(task);
+    const { code, signal } = task.shellOutcome;
+    const terminal = BackgroundTaskManager.#terminalState(task, code, signal);
+    const terminalStatus =
+      cleanupError && terminal.status === "completed"
+        ? "failed"
+        : terminal.status;
+    const terminalError = cleanupError
+      ? appendError(terminal.error, cleanupError)
+      : terminal.error;
+    await this.#finalize(
+      task,
+      terminalStatus,
+      code,
+      signal,
+      terminalError
+    );
+  }
+
+  #cleanupProcessGroup(task: RuntimeTask): Promise<string | undefined> {
+    task.cleanupPromise ??= this.#stopProcessGroup(task);
+    return task.cleanupPromise;
+  }
+
+  async #stopProcessGroup(task: RuntimeTask): Promise<string | undefined> {
+    let cleanupError: string | undefined;
+    try {
+      BackgroundTaskManager.#signal(task, "SIGTERM");
+    } catch (error) {
+      cleanupError = `Could not clean up the process group: ${error instanceof Error ? error.message : String(error)}`;
+    }
+
+    try {
+      if (await this.#waitForProcessGroupExit(task, this.#killGraceMs)) {
+        return cleanupError;
+      }
+    } catch (error) {
+      cleanupError = appendError(
+        cleanupError,
+        `Could not inspect the process group: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+
+    try {
+      BackgroundTaskManager.#signal(task, "SIGKILL");
+    } catch (error) {
+      cleanupError = appendError(
+        cleanupError,
+        `SIGKILL failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+
+    try {
+      if (await this.#waitForProcessGroupExit(task, 250)) {
+        return cleanupError;
+      }
+    } catch (error) {
+      return appendError(
+        cleanupError,
+        `Could not confirm process-group cleanup: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+    return appendError(
+      cleanupError,
+      `Process group ${String(task.pid ?? "unknown")} remained after SIGKILL`
+    );
+  }
+
+  async #waitForProcessGroupExit(
+    task: RuntimeTask,
+    timeoutMs: number
+  ): Promise<boolean> {
+    const deadline = Date.now() + Math.max(0, timeoutMs);
+    for (;;) {
+      if (!BackgroundTaskManager.#processGroupExists(task)) {
+        return true;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        return false;
+      }
+      await sleep(Math.min(10, remaining));
+    }
+  }
+
+  static #processGroupExists(task: RuntimeTask): boolean {
+    const { pid } = task.child;
+    if (!pid) {
+      return false;
+    }
+    try {
+      process.kill(-pid, 0);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+        return false;
+      }
+      throw error;
     }
   }
 

@@ -237,29 +237,22 @@ describe("BackgroundTaskManager", () => {
   });
 
   linuxTest(
-    "cleans up redirected children after the command shell exits",
+    "cleans up a TERM-resistant redirected child before completion",
     async () => {
-      const manager = await createManager();
+      const manager = await createManager({ killGraceMs: 25 });
       const started = await manager.start({
-        command: "sleep 30 >/dev/null 2>&1 & printf '%s\\n' \"$!\"",
+        command:
+          "sh -c 'trap \"\" TERM; while :; do sleep 1; done' >/dev/null 2>&1 & printf '%s\\n' \"$!\"",
         cwd: process.cwd(),
       });
 
       const terminal = await waitForTerminal(manager, started.id);
       const logs = await manager.logs(started.id);
       const childPid = Number(/^(?<pid>\d+)$/mu.exec(logs.output)?.groups?.pid);
-      expect(childPid).toBeGreaterThan(0);
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        // Process-group cleanup is asynchronous in the kernel.
-        // oxlint-disable-next-line eslint/no-await-in-loop
-        if (!(await processIsAlive(childPid))) {
-          break;
-        }
-        // oxlint-disable-next-line eslint/no-await-in-loop
-        await sleep(10);
-      }
 
+      expect(childPid).toBeGreaterThan(0);
       expect(terminal.status).toBe("completed");
+      expect(terminal.exitCode).toBe(0);
       expect(await processIsAlive(childPid)).toBe(false);
     }
   );
