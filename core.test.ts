@@ -89,6 +89,31 @@ const waitForLog = async function waitForLog(
   throw new Error(`Task ${taskId} did not log ${expected}`);
 };
 
+const resistantTreeCommand = function resistantTreeCommand(
+  finalCommand = "wait"
+): string {
+  return [
+    `sh -c 'trap "" TERM; while :; do sleep 1; done' >/dev/null 2>&1 &`,
+    "child=$!",
+    `printf 'child=%s\\n' "$child"`,
+    `trap 'exit 0' TERM`,
+    finalCommand,
+  ].join("\n");
+};
+
+const readChildPid = async function readChildPid(
+  manager: BackgroundTaskManager,
+  taskId: string
+): Promise<number> {
+  await waitForLog(manager, taskId, "child=");
+  const logs = await manager.logs(taskId);
+  const childPid = Number(
+    /^child=(?<pid>\d+)$/mu.exec(logs.output)?.groups?.pid
+  );
+  expect(childPid).toBeGreaterThan(0);
+  return childPid;
+};
+
 afterEach(async () => {
   await Promise.all(managers.splice(0).map((manager) => manager.shutdown()));
   await Promise.all(
@@ -257,19 +282,22 @@ describe("BackgroundTaskManager", () => {
     }
   );
 
-  test("stops the whole background process group", async () => {
-    const manager = await createManager();
+  linuxTest("stops the whole background process group", async () => {
+    const manager = await createManager({ killGraceMs: 25 });
     const started = await manager.start({
-      command: "sleep 30 & wait",
+      command: resistantTreeCommand(),
       cwd: process.cwd(),
       name: "Long task",
     });
+    const childPid = await readChildPid(manager, started.id);
 
     const stopping = manager.stop(started.id.slice(0, 4));
     const terminal = await waitForTerminal(manager, started.id);
 
     expect(stopping.status).toBe("stopping");
     expect(terminal.status).toBe("stopped");
+    expect(terminal.exitCode).toBe(0);
+    expect(await processIsAlive(childPid)).toBe(false);
     expect(() => manager.stop(started.id)).toThrow("already stopped");
   });
 
@@ -288,34 +316,100 @@ describe("BackgroundTaskManager", () => {
     expect(terminal.signal).toBe("SIGKILL");
   });
 
-  test("marks a timed-out task as failed even when it traps TERM", async () => {
-    const manager = await createManager();
+  linuxTest(
+    "cleans resistant descendants when a task times out",
+    async () => {
+      const manager = await createManager({ killGraceMs: 25 });
+      const started = await manager.start({
+        command: resistantTreeCommand(),
+        cwd: process.cwd(),
+        timeoutSeconds: 1,
+      });
+      const childPid = await readChildPid(manager, started.id);
+
+      const terminal = await waitForTerminal(manager, started.id);
+
+      expect(terminal.status).toBe("failed");
+      expect(terminal.error).toBe("Timed out after 1s");
+      expect(await processIsAlive(childPid)).toBe(false);
+    }
+  );
+
+  linuxTest(
+    "cleans resistant descendants after the output cap",
+    async () => {
+      const manager = await createManager({
+        killGraceMs: 25,
+        maxOutputBytes: 64,
+      });
+      const started = await manager.start({
+        command: resistantTreeCommand(
+          `while :; do printf '123456789012345678901234567890'; done`
+        ),
+        cwd: process.cwd(),
+      });
+
+      const terminal = await waitForTerminal(manager, started.id);
+      const logs = await manager.logs(started.id);
+      const childPid = Number(
+        /^child=(?<pid>\d+)$/mu.exec(logs.output)?.groups?.pid
+      );
+
+      expect(childPid).toBeGreaterThan(0);
+      expect(terminal.status).toBe("failed");
+      expect(terminal.error).toContain("Output exceeded 64 bytes");
+      expect(logs.totalBytes).toBeGreaterThanOrEqual(64);
+      expect(logs.text).toContain("background task stopped");
+      expect(await processIsAlive(childPid)).toBe(false);
+    }
+  );
+
+  linuxTest("cleans resistant descendants during shutdown", async () => {
+    const manager = await createManager({ killGraceMs: 25 });
     const started = await manager.start({
-      command: "trap 'exit 0' TERM; sleep 30",
+      command: resistantTreeCommand(),
       cwd: process.cwd(),
-      timeoutSeconds: 1,
     });
+    const childPid = await readChildPid(manager, started.id);
 
-    const terminal = await waitForTerminal(manager, started.id);
+    await manager.shutdown();
+    const terminal = await manager.wait(started.id);
 
-    expect(terminal.status).toBe("failed");
-    expect(terminal.error).toBe("Timed out after 1s");
+    expect(terminal.status).toBe("stopped");
+    expect(await processIsAlive(childPid)).toBe(false);
   });
 
-  test("fails and stops a task that exceeds the output cap", async () => {
-    const manager = await createManager({ maxOutputBytes: 16 });
+  linuxTest("retains process-group cleanup errors", async () => {
+    const manager = await createManager({ killGraceMs: 25 });
     const started = await manager.start({
-      command: "printf '123456789012345678901234567890'",
+      command: "sleep 30",
       cwd: process.cwd(),
     });
+    const originalKill = process.kill;
+    process.kill = ((pid: number, signal?: number | NodeJS.Signals) => {
+      if (pid === -(started.pid ?? 0) && signal === 0) {
+        const error = new Error("probe denied") as NodeJS.ErrnoException;
+        error.code = "EACCES";
+        throw error;
+      }
+      return Reflect.apply(
+        originalKill,
+        process,
+        signal === undefined ? [pid] : [pid, signal]
+      ) as boolean;
+    }) as typeof process.kill;
 
-    const terminal = await waitForTerminal(manager, started.id);
-    const logs = await manager.logs(started.id);
+    let terminal: TaskSnapshot;
+    try {
+      manager.stop(started.id);
+      terminal = await waitForTerminal(manager, started.id);
+    } finally {
+      process.kill = originalKill;
+    }
 
-    expect(terminal.status).toBe("failed");
-    expect(terminal.error).toContain("Output exceeded 16 bytes");
-    expect(logs.totalBytes).toBeGreaterThanOrEqual(16);
-    expect(logs.text).toContain("background task stopped");
+    expect(terminal.status).toBe("stopped");
+    expect(terminal.error).toContain("Could not inspect the process group");
+    expect(terminal.error).toContain("Could not confirm process-group cleanup");
   });
 
   test("enforces the active limit across concurrent starts", async () => {

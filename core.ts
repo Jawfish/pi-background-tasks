@@ -82,12 +82,15 @@ type RuntimeTask = TaskSnapshot & {
   outputLimitReached: boolean;
   finalizing: boolean;
   cleanupPromise?: Promise<string | undefined>;
+  completionPromise?: Promise<void>;
   finishedOrder?: number;
+  processError?: string;
+  shellClosed: Promise<null>;
   shellOutcome?: ShellOutcome;
   closed: Promise<null>;
   resolveClosed: () => void;
+  resolveShellClosed: () => void;
   timeoutHandle?: NodeJS.Timeout;
-  killHandle?: NodeJS.Timeout;
 };
 
 export interface BackgroundTaskManagerOptions {
@@ -368,6 +371,7 @@ export class BackgroundTaskManager {
       }
 
       const closed = Promise.withResolvers<null>();
+      const shellClosed = Promise.withResolvers<null>();
       const timeoutSeconds =
         typeof input.timeoutSeconds === "number" &&
         Number.isFinite(input.timeoutSeconds) &&
@@ -387,6 +391,8 @@ export class BackgroundTaskManager {
         outputLimitReached: false,
         pid: child.pid,
         resolveClosed: () => closed.resolve(null),
+        resolveShellClosed: () => shellClosed.resolve(null),
+        shellClosed: shellClosed.promise,
         startedAt: Date.now(),
         status: "running",
         stream,
@@ -412,20 +418,20 @@ export class BackgroundTaskManager {
         this.#writeOutput(task, data, child.stderr);
       });
       child.once("error", (error) => {
-        void this.#finalize(task, "failed", null, null, error.message);
+        task.processError = error.message;
       });
       child.once("close", (code, signal) => {
         task.shellOutcome = { code, signal };
-        if (!task.stopReason) {
-          void this.#finishNaturalExit(task);
-          return;
+        task.resolveShellClosed();
+        if (task.status === "running") {
+          task.status = "stopping";
+          if (task.timeoutHandle) {
+            clearTimeout(task.timeoutHandle);
+            task.timeoutHandle = undefined;
+          }
+          this.#notifyChange();
         }
-        const terminal = BackgroundTaskManager.#terminalState(
-          task,
-          code,
-          signal
-        );
-        void this.#finalize(task, terminal.status, code, signal, terminal.error);
+        void this.#finishAfterCleanup(task);
       });
 
       if (timeoutSeconds !== undefined) {
@@ -534,23 +540,7 @@ export class BackgroundTaskManager {
       this.#beginStop(task, "shutdown");
     }
 
-    await Promise.race([
-      Promise.all(active.map((task) => task.closed)),
-      sleep(this.#killGraceMs + 250),
-    ]);
-
-    const remaining = active.filter((task) => isActiveStatus(task.status));
-    for (const task of remaining) {
-      try {
-        BackgroundTaskManager.#signal(task, "SIGKILL");
-      } catch {
-        // The process can exit between the status check and signal.
-      }
-    }
-    await Promise.race([
-      Promise.all(remaining.map((task) => task.closed)),
-      sleep(250),
-    ]);
+    await Promise.all(active.map((task) => task.closed));
 
     if (this.#ownsRuntimeDir && this.#runtimeDir) {
       await rm(this.#runtimeDir, { force: true, recursive: true });
@@ -653,34 +643,36 @@ export class BackgroundTaskManager {
     }
   }
 
-  async #finishNaturalExit(task: RuntimeTask): Promise<void> {
-    if (!isActiveStatus(task.status) || !task.shellOutcome) {
-      return;
-    }
-    task.status = "stopping";
-    if (task.timeoutHandle) {
-      clearTimeout(task.timeoutHandle);
-      task.timeoutHandle = undefined;
-    }
-    this.#notifyChange();
+  #finishAfterCleanup(task: RuntimeTask): Promise<void> {
+    task.completionPromise ??= this.#completeTask(task);
+    return task.completionPromise;
+  }
 
+  async #completeTask(task: RuntimeTask): Promise<void> {
     const cleanupError = await this.#cleanupProcessGroup(task);
-    const { code, signal } = task.shellOutcome;
+    await Promise.race([task.shellClosed, sleep(250)]);
+    const outcome = task.shellOutcome;
+    const closeError = outcome
+      ? undefined
+      : "Command shell did not close after process-group cleanup";
+    const code = outcome?.code ?? null;
+    const signal = outcome?.signal ?? null;
     const terminal = BackgroundTaskManager.#terminalState(task, code, signal);
-    const terminalStatus =
-      cleanupError && terminal.status === "completed"
+    const finalError = [
+      terminal.error,
+      task.processError,
+      cleanupError,
+      closeError,
+    ].reduce<string | undefined>(
+      (current, error) =>
+        error === undefined ? current : appendError(current, error),
+      undefined
+    );
+    const finalStatus =
+      finalError && terminal.status === "completed"
         ? "failed"
         : terminal.status;
-    const terminalError = cleanupError
-      ? appendError(terminal.error, cleanupError)
-      : terminal.error;
-    await this.#finalize(
-      task,
-      terminalStatus,
-      code,
-      signal,
-      terminalError
-    );
+    await this.#finalize(task, finalStatus, code, signal, finalError);
   }
 
   #cleanupProcessGroup(task: RuntimeTask): Promise<string | undefined> {
@@ -691,9 +683,20 @@ export class BackgroundTaskManager {
   async #stopProcessGroup(task: RuntimeTask): Promise<string | undefined> {
     let cleanupError: string | undefined;
     try {
+      if (!BackgroundTaskManager.#processGroupExists(task)) {
+        return undefined;
+      }
+    } catch (error) {
+      cleanupError = `Could not inspect the process group: ${error instanceof Error ? error.message : String(error)}`;
+    }
+
+    try {
       BackgroundTaskManager.#signal(task, "SIGTERM");
     } catch (error) {
-      cleanupError = `Could not clean up the process group: ${error instanceof Error ? error.message : String(error)}`;
+      cleanupError = appendError(
+        cleanupError,
+        `Could not stop process group: ${error instanceof Error ? error.message : String(error)}`
+      );
     }
 
     try {
@@ -766,10 +769,7 @@ export class BackgroundTaskManager {
   }
 
   #beginStop(task: RuntimeTask, reason: StopReason): void {
-    if (!isActiveStatus(task.status)) {
-      return;
-    }
-    if (task.status === "stopping") {
+    if (!isActiveStatus(task.status) || task.status === "stopping") {
       return;
     }
     task.status = "stopping";
@@ -779,37 +779,7 @@ export class BackgroundTaskManager {
       task.timeoutHandle = undefined;
     }
     this.#notifyChange();
-
-    try {
-      BackgroundTaskManager.#signal(task, "SIGTERM");
-    } catch (error) {
-      void this.#finalize(
-        task,
-        "failed",
-        null,
-        null,
-        appendError(
-          task.error,
-          `Could not stop process: ${error instanceof Error ? error.message : String(error)}`
-        )
-      );
-      return;
-    }
-
-    task.killHandle = setTimeout(() => {
-      if (!isActiveStatus(task.status)) {
-        return;
-      }
-      try {
-        BackgroundTaskManager.#signal(task, "SIGKILL");
-      } catch (error) {
-        task.error = appendError(
-          task.error,
-          `SIGKILL failed: ${error instanceof Error ? error.message : String(error)}`
-        );
-      }
-    }, this.#killGraceMs);
-    task.killHandle.unref();
+    void this.#finishAfterCleanup(task);
   }
 
   static #signal(task: RuntimeTask, signal: NodeJS.Signals): void {
@@ -879,10 +849,6 @@ export class BackgroundTaskManager {
     if (task.timeoutHandle) {
       clearTimeout(task.timeoutHandle);
       task.timeoutHandle = undefined;
-    }
-    if (task.killHandle) {
-      clearTimeout(task.killHandle);
-      task.killHandle = undefined;
     }
 
     let finalStatus = status;
