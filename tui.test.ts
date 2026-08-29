@@ -14,6 +14,7 @@ import {
   renderBackgroundTaskResult,
   renderCompletionMessage,
   TaskDashboardComponent,
+  TaskDashboardReadState,
 } from "./tui.ts";
 
 const components: TaskDashboardComponent[] = [];
@@ -61,6 +62,7 @@ const createTui = function createTui(rows: number, columns = 100) {
 
 const createDashboard = function createDashboard(options: {
   logs?: TaskLogs;
+  readState?: TaskDashboardReadState;
   rows?: number;
   tasks?: TaskSnapshot[];
 }) {
@@ -95,6 +97,7 @@ const createDashboard = function createDashboard(options: {
     keybindings: new KeybindingsManager(TUI_KEYBINDINGS),
     manager,
     onClose() {},
+    readState: options.readState,
     theme,
     tui,
   });
@@ -150,6 +153,7 @@ describe("background task dashboard", () => {
     const selected = task();
     const first = Promise.withResolvers<TaskLogs>();
     const second = Promise.withResolvers<TaskLogs>();
+    const readState = new TaskDashboardReadState();
     let logCalls = 0;
     const manager = {
       list: () => [{ ...selected }],
@@ -164,6 +168,7 @@ describe("background task dashboard", () => {
       keybindings: new KeybindingsManager(TUI_KEYBINDINGS),
       manager,
       onClose() {},
+      readState,
       theme,
       tui,
     });
@@ -173,7 +178,9 @@ describe("background task dashboard", () => {
     component.handleInput("r");
     const makeLogs = (output: string): TaskLogs => ({
       bytesRead: output.length,
+      nextByte: output.length,
       output,
+      startByte: 0,
       task: selected,
       text: output,
       totalBytes: output.length,
@@ -190,6 +197,7 @@ describe("background task dashboard", () => {
     expect(logCalls).toBe(2);
     expect(rendered).toContain("new response");
     expect(rendered).not.toContain("stale response");
+    expect(readState.cursor(selected.id)).toBe("new response".length);
   });
 
   test("ignores a stale log failure after a newer success", async () => {
@@ -237,6 +245,66 @@ describe("background task dashboard", () => {
     expect(rendered).toContain("new response");
     expect(rendered).not.toContain("stale failure");
     expect(rendered).not.toContain("Could not read log");
+  });
+
+  test("preserves read cursors across reopen and releases pruned tasks", async () => {
+    const selected = task({ bytesWritten: 12 });
+    const readState = new TaskDashboardReadState();
+    const requestedCursors: number[] = [];
+    const manager = {
+      list: () => [{ ...selected }],
+      logs: (
+        _id: string,
+        _requestedBytes?: number,
+        afterByte = 0
+      ): Promise<TaskLogs> => {
+        requestedCursors.push(afterByte);
+        return Promise.resolve({
+          bytesRead: selected.bytesWritten - afterByte,
+          nextByte: selected.bytesWritten,
+          output: `bytes after ${String(afterByte)}`,
+          startByte: afterByte,
+          task: { ...selected },
+          text: "unused",
+          totalBytes: selected.bytesWritten,
+          truncated: false,
+        });
+      },
+      stop: () => ({ ...selected, status: "stopping" as const }),
+    };
+    const openDashboard = () => {
+      const { tui } = createTui(30);
+      const component = new TaskDashboardComponent({
+        keybindings: new KeybindingsManager(TUI_KEYBINDINGS),
+        manager,
+        onClose() {},
+        readState,
+        theme,
+        tui,
+      });
+      components.push(component);
+      component.handleInput("\r");
+      return component;
+    };
+
+    const first = openDashboard();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(requestedCursors).toEqual([0]);
+    expect(readState.cursor(selected.id)).toBe(12);
+    first.dispose();
+
+    selected.bytesWritten = 20;
+    const reopened = openDashboard();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(requestedCursors).toEqual([0, 12]);
+    expect(readState.cursor(selected.id)).toBe(20);
+    reopened.dispose();
+
+    const empty = createDashboard({ readState, tasks: [] });
+    expect(empty.component).toBeDefined();
+    expect(readState.cursor(selected.id)).toBe(0);
   });
 
   test("loads a sanitized log tail without rendering terminal controls", async () => {

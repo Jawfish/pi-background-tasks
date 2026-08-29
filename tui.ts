@@ -604,8 +604,38 @@ export const renderCompletionMessage = function renderCompletionMessage(
 
 interface DashboardManager {
   list(): TaskSnapshot[];
-  logs(idOrPrefix: string, requestedBytes?: number): Promise<TaskLogs>;
+  logs(
+    idOrPrefix: string,
+    requestedBytes?: number,
+    afterByte?: number
+  ): Promise<TaskLogs>;
   stop(idOrPrefix: string): TaskSnapshot;
+}
+
+/** User-facing log cursors shared by dashboard instances in one session. */
+export class TaskDashboardReadState {
+  readonly #cursors = new Map<string, number>();
+
+  cursor(taskId: string): number {
+    return this.#cursors.get(taskId) ?? 0;
+  }
+
+  markRead(taskId: string, nextByte: number): void {
+    const cursor = Math.max(0, Math.floor(nextByte));
+    this.#cursors.set(taskId, Math.max(this.cursor(taskId), cursor));
+  }
+
+  retain(taskIds: ReadonlySet<string>): void {
+    for (const taskId of this.#cursors.keys()) {
+      if (!taskIds.has(taskId)) {
+        this.#cursors.delete(taskId);
+      }
+    }
+  }
+
+  unreadBytes(task: TaskSnapshot): number {
+    return Math.max(0, task.bytesWritten - this.cursor(task.id));
+  }
 }
 
 interface DashboardFlash {
@@ -638,6 +668,7 @@ export class TaskDashboardComponent implements Component {
   readonly #tui: TUI;
   readonly #keybindings: KeybindingsManager;
   readonly #onClose: () => void;
+  readonly #readState: TaskDashboardReadState;
   #tasks: TaskSnapshot[] = [];
   #selectedIndex = 0;
   #showLogs = false;
@@ -657,6 +688,7 @@ export class TaskDashboardComponent implements Component {
     keybindings: KeybindingsManager;
     manager: BackgroundTaskManager | DashboardManager;
     onClose: () => void;
+    readState?: TaskDashboardReadState;
     theme: Theme;
     tui: TUI;
   }) {
@@ -665,6 +697,7 @@ export class TaskDashboardComponent implements Component {
     this.#tui = options.tui;
     this.#keybindings = options.keybindings;
     this.#onClose = options.onClose;
+    this.#readState = options.readState ?? new TaskDashboardReadState();
     this.refresh();
     this.#interval = setInterval(() => this.refresh(), DASHBOARD_REFRESH_MS);
     this.#interval.unref();
@@ -677,6 +710,7 @@ export class TaskDashboardComponent implements Component {
     const selectedId = this.#tasks[this.#selectedIndex]?.id;
     try {
       this.#tasks = this.#manager.list();
+      this.#readState.retain(new Set(this.#tasks.map((task) => task.id)));
       if (selectedId) {
         const nextIndex = this.#tasks.findIndex((task) => task.id === selectedId);
         this.#selectedIndex = nextIndex >= 0 ? nextIndex : this.#selectedIndex;
@@ -1118,7 +1152,11 @@ export class TaskDashboardComponent implements Component {
     this.#activeLogRequests += 1;
     this.#loadingLogs = true;
     try {
-      const logs = await this.#manager.logs(taskId, 16 * 1024);
+      const logs = await this.#manager.logs(
+        taskId,
+        16 * 1024,
+        this.#readState.cursor(taskId)
+      );
       if (
         this.#disposed ||
         requestSequence !== this.#logRequestSequence ||
@@ -1128,6 +1166,7 @@ export class TaskDashboardComponent implements Component {
       }
       this.#logs = logs;
       this.#logsTaskId = taskId;
+      this.#readState.markRead(taskId, logs.nextByte ?? logs.totalBytes);
     } catch (error) {
       if (
         this.#disposed ||
