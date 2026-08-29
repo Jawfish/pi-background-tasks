@@ -335,6 +335,80 @@ describe("background tasks extension", () => {
     await harness.emit("session_shutdown");
   });
 
+  test("wakes once when a committed output watch fires", async () => {
+    const harness = createHarness();
+    await harness.emit("session_start");
+    const started = await harness.execute({
+      action: "start",
+      command: "sleep 0.05; printf ready; sleep 30",
+      name: "Ready server",
+    });
+    const watched = await harness.execute({
+      action: "watch",
+      condition: "output",
+      pattern: "ready",
+      taskId: started.details.task?.id,
+      wake: true,
+    });
+    await waitForCompletion();
+
+    expect(harness.sentMessages).toHaveLength(1);
+    expect(harness.sentMessages[0]?.options).toEqual({
+      deliverAs: "steer",
+      triggerTurn: true,
+    });
+    expect(harness.sentMessages[0]?.message).toMatchObject({
+      customType: "background-task-watch",
+      display: false,
+    });
+    const message = harness.sentMessages[0]?.message as {
+      content?: string;
+      details?: {
+        deliveryIds?: string[];
+        watches?: {
+          condition?: string;
+          deliveryId?: string;
+          id?: string;
+          nextByte?: number;
+          output?: string;
+          startByte?: number;
+          status?: string;
+          taskId?: string;
+        }[];
+      };
+    };
+    expect(message.details?.deliveryIds?.[0]).toStartWith("watch:");
+    expect(message.details?.watches?.[0]).toEqual({
+      condition: "output",
+      deliveryId: message.details?.deliveryIds?.[0],
+      id: watched.details.watch?.id,
+      nextByte: 5,
+      output: "ready",
+      startByte: 0,
+      status: "fired",
+      taskId: started.details.task?.id,
+    });
+    expect(message.content).toContain("<background-task-watch-events>");
+    expect(message.content).toContain('<range start-byte="0" next-byte="5"');
+
+    const context = (await harness.emit("context", {
+      messages: [harness.sentMessages[0]?.message],
+    })) as { messages: { customType?: string }[] };
+    expect(
+      context.messages.some(
+        (entry) => entry.customType === "background-task-watch-fallback"
+      )
+    ).toBe(false);
+
+    await harness.execute({
+      action: "stop",
+      taskId: started.details.task?.id,
+    });
+    await waitForCompletion();
+    expect(harness.sentMessages).toHaveLength(1);
+    await harness.emit("session_shutdown");
+  });
+
   test("returns incremental log cursor metadata", async () => {
     const harness = createHarness();
     await harness.emit("session_start");

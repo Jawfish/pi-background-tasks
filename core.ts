@@ -43,6 +43,15 @@ export interface TaskWatchSnapshot {
   endedAt?: number;
   startByte?: number;
   nextByte?: number;
+  matchedOutput?: string;
+}
+
+export interface TaskWatchEvent {
+  task: TaskSnapshot;
+  watch: TaskWatchSnapshot;
+  output?: string;
+  startByte?: number;
+  nextByte?: number;
 }
 
 export interface CreateTaskWatchInput {
@@ -106,7 +115,9 @@ type ShellOutcome = {
   signal: NodeJS.Signals | null;
 };
 
-type RuntimeWatch = TaskWatchSnapshot;
+type RuntimeWatch = TaskWatchSnapshot & {
+  outputOverlap?: Buffer;
+};
 
 type RuntimeTask = TaskSnapshot & {
   acceptedBytes: number;
@@ -145,6 +156,7 @@ export interface BackgroundTaskManagerOptions {
   ) => boolean;
   onChange?: () => void;
   onFinished?: (completion: TaskCompletion) => void;
+  onWatchFired?: (event: TaskWatchEvent) => void;
 }
 
 const isActiveStatus = function isActiveStatus(status: TaskStatus): boolean {
@@ -290,6 +302,7 @@ export class BackgroundTaskManager {
   ) => boolean;
   readonly #onChange: (() => void) | undefined;
   readonly #onFinished: ((completion: TaskCompletion) => void) | undefined;
+  readonly #onWatchFired: ((event: TaskWatchEvent) => void) | undefined;
   readonly #ownsRuntimeDir: boolean;
   #runtimeDir: string | undefined;
   #initializePromise: Promise<string> | undefined;
@@ -318,6 +331,7 @@ export class BackgroundTaskManager {
       ((stream, data, callback) => stream.write(data, callback));
     this.#onChange = options.onChange;
     this.#onFinished = options.onFinished;
+    this.#onWatchFired = options.onWatchFired;
   }
 
   async initialize(): Promise<string> {
@@ -435,6 +449,8 @@ export class BackgroundTaskManager {
       createdAt: Date.now(),
       id,
       inactivitySeconds,
+      outputOverlap:
+        input.condition === "output" ? Buffer.alloc(0) : undefined,
       pattern,
       status: "active",
       taskId: task.id,
@@ -888,6 +904,7 @@ export class BackgroundTaskManager {
       endedAt: watch.endedAt,
       id: watch.id,
       inactivitySeconds: watch.inactivitySeconds,
+      matchedOutput: watch.matchedOutput,
       nextByte: watch.nextByte,
       pattern: watch.pattern,
       startByte: watch.startByte,
@@ -935,7 +952,7 @@ export class BackgroundTaskManager {
     if (accepted.length > 0) {
       task.acceptedBytes += accepted.length;
       task.lastOutputAt = Date.now();
-      const canContinue = this.#writeLog(task, accepted);
+      const canContinue = this.#writeLog(task, accepted, true);
       if (!canContinue && "pause" in source && "resume" in source) {
         source.pause();
         task.stream.once("drain", () => source.resume());
@@ -953,12 +970,20 @@ export class BackgroundTaskManager {
     }
   }
 
-  #writeLog(task: RuntimeTask, data: Buffer): boolean {
+  #writeLog(
+    task: RuntimeTask,
+    data: Buffer,
+    matchOutput = false
+  ): boolean {
     const settled = Promise.withResolvers<void>();
     task.pendingLogWrites.add(settled.promise);
     const callback = (error?: Error | null): void => {
       if (!error) {
+        const startByte = task.bytesWritten;
         task.bytesWritten += data.length;
+        if (matchOutput) {
+          this.#matchOutputWatches(task, data, startByte);
+        }
       }
       task.pendingLogWrites.delete(settled.promise);
       settled.resolve();
@@ -968,6 +993,58 @@ export class BackgroundTaskManager {
     } catch (error) {
       callback(error instanceof Error ? error : new Error(String(error)));
       throw error;
+    }
+  }
+
+  #matchOutputWatches(
+    task: RuntimeTask,
+    data: Buffer,
+    startByte: number
+  ): void {
+    for (const watch of task.watchState.values()) {
+      if (
+        watch.status !== "active" ||
+        watch.condition !== "output" ||
+        !watch.pattern
+      ) {
+        continue;
+      }
+      const pattern = Buffer.from(watch.pattern, "utf-8");
+      const overlap = watch.outputOverlap ?? Buffer.alloc(0);
+      const combined = Buffer.concat([overlap, data]);
+      const combinedStart = startByte - overlap.length;
+      const matchIndex = combined.indexOf(pattern);
+      if (matchIndex >= 0) {
+        watch.startByte = combinedStart + matchIndex;
+        watch.nextByte = watch.startByte + pattern.length;
+        watch.matchedOutput = watch.pattern;
+        this.#fireWatch(task, watch, watch.pattern);
+        continue;
+      }
+      const overlapBytes = Math.min(pattern.length - 1, combined.length);
+      watch.outputOverlap = combined.subarray(combined.length - overlapBytes);
+    }
+  }
+
+  #fireWatch(task: RuntimeTask, watch: RuntimeWatch, output?: string): void {
+    if (watch.status !== "active") {
+      return;
+    }
+    watch.status = "fired";
+    watch.endedAt = Date.now();
+    watch.outputOverlap = undefined;
+    const event: TaskWatchEvent = {
+      nextByte: watch.nextByte,
+      output,
+      startByte: watch.startByte,
+      task: BackgroundTaskManager.#snapshot(task),
+      watch: BackgroundTaskManager.#watchSnapshot(watch),
+    };
+    this.#notifyChange();
+    try {
+      this.#onWatchFired?.(event);
+    } catch {
+      // A watch callback failure must not change task state.
     }
   }
 

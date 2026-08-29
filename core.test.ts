@@ -15,6 +15,7 @@ import type {
   BackgroundTaskManagerOptions,
   TaskCompletion,
   TaskSnapshot,
+  TaskWatchEvent,
 } from "./core.ts";
 
 const managers: BackgroundTaskManager[] = [];
@@ -517,6 +518,54 @@ describe("BackgroundTaskManager", () => {
     expect(() =>
       manager.watch(started.id, { condition: "exit" })
     ).toThrow("because it is stopped");
+  });
+
+  test("fires an output watch once across committed chunks", async () => {
+    const events: TaskWatchEvent[] = [];
+    const fired = Promise.withResolvers<TaskWatchEvent>();
+    let logsAtFire: Promise<Awaited<ReturnType<BackgroundTaskManager["logs"]>>>;
+    const manager = await createManager({
+      onWatchFired(event) {
+        events.push(event);
+        logsAtFire = manager.logs(event.task.id, 32, event.startByte);
+        fired.resolve(event);
+      },
+    });
+    const started = await manager.start({
+      command:
+        "sleep 0.05; printf rea; sleep 0.05; printf 'dy🙂'; printf 'ready🙂'; sleep 30",
+      cwd: process.cwd(),
+    });
+    const watch = manager.watch(started.id, {
+      condition: "output",
+      pattern: "ready🙂",
+      wake: true,
+    });
+
+    const event = await Promise.race([
+      fired.promise,
+      sleep(2000).then(() => {
+        throw new Error("Output watch did not fire");
+      }),
+    ]);
+    const logs = await logsAtFire!;
+    await sleep(100);
+
+    expect(event.watch).toMatchObject({
+      id: watch.id,
+      matchedOutput: "ready🙂",
+      nextByte: 9,
+      startByte: 0,
+      status: "fired",
+    });
+    expect(event.task.status).toBe("running");
+    expect(event.output).toBe("ready🙂");
+    expect(logs.output).toContain("ready🙂");
+    expect(events).toHaveLength(1);
+    expect(manager.watchStatus(started.id)[0]?.status).toBe("fired");
+
+    manager.stop(started.id);
+    await waitForTerminal(manager, started.id);
   });
 
   test("rejects invalid watch conditions", async () => {
