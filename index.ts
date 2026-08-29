@@ -74,10 +74,125 @@ const Parameters = Type.Object({
   ),
 });
 
+export type CompletionDeliveryState = "pending" | "enqueued" | "observed";
+
+export interface CompletionDeliveryRecord {
+  completion: TaskCompletion;
+  deliveryId: string;
+  state: CompletionDeliveryState;
+  wakeAttempted: boolean;
+}
+
+export class CompletionDeliveryLedger {
+  readonly #records = new Map<string, CompletionDeliveryRecord>();
+  readonly #taskDeliveries = new Map<string, string>();
+  #sequence = 0;
+
+  add(completion: TaskCompletion): CompletionDeliveryRecord {
+    const existingId = this.#taskDeliveries.get(completion.task.id);
+    if (existingId) {
+      const existing = this.#records.get(existingId);
+      if (existing) {
+        return existing;
+      }
+    }
+    this.#sequence += 1;
+    const deliveryId = `completion:${completion.task.id}:${String(this.#sequence)}`;
+    const record: CompletionDeliveryRecord = {
+      completion,
+      deliveryId,
+      state: "pending",
+      wakeAttempted: false,
+    };
+    this.#records.set(deliveryId, record);
+    this.#taskDeliveries.set(completion.task.id, deliveryId);
+    return record;
+  }
+
+  list(): CompletionDeliveryRecord[] {
+    return [...this.#records.values()];
+  }
+
+  unobserved(): CompletionDeliveryRecord[] {
+    return this.list().filter((record) => record.state !== "observed");
+  }
+
+  wakeCandidates(): CompletionDeliveryRecord[] {
+    return this.list().filter(
+      (record) => record.state === "pending" && !record.wakeAttempted
+    );
+  }
+
+  markWakeAttempted(records: readonly CompletionDeliveryRecord[]): void {
+    for (const record of records) {
+      const stored = this.#records.get(record.deliveryId);
+      if (stored?.state === "pending") {
+        stored.wakeAttempted = true;
+      }
+    }
+  }
+
+  markEnqueued(records: readonly CompletionDeliveryRecord[]): void {
+    for (const record of records) {
+      const stored = this.#records.get(record.deliveryId);
+      if (stored?.state === "pending") {
+        stored.state = "enqueued";
+      }
+    }
+  }
+
+  markObservedByDeliveryId(deliveryIds: readonly string[]): void {
+    for (const deliveryId of deliveryIds) {
+      const record = this.#records.get(deliveryId);
+      if (record) {
+        record.state = "observed";
+      }
+    }
+  }
+
+  markObservedByTaskId(taskIds: readonly string[]): void {
+    for (const taskId of taskIds) {
+      const deliveryId = this.#taskDeliveries.get(taskId);
+      if (deliveryId) {
+        this.markObservedByDeliveryId([deliveryId]);
+      }
+    }
+  }
+}
+
 interface BoundedXml {
   text: string;
   truncated: boolean;
 }
+
+const deliveryIdsInMessages = function deliveryIdsInMessages(
+  messages: readonly unknown[]
+): string[] {
+  const deliveryIds: string[] = [];
+  for (const message of messages) {
+    if (!message || typeof message !== "object") {
+      continue;
+    }
+    const custom = message as { customType?: unknown; details?: unknown };
+    if (
+      custom.customType !== "background-task-completion" &&
+      custom.customType !== "background-task-completion-fallback"
+    ) {
+      continue;
+    }
+    if (!custom.details || typeof custom.details !== "object") {
+      continue;
+    }
+    const ids = (custom.details as { deliveryIds?: unknown }).deliveryIds;
+    if (!Array.isArray(ids)) {
+      continue;
+    }
+    deliveryIds.push(
+      ...ids.filter((value): value is string => typeof value === "string")
+    );
+  }
+  return deliveryIds;
+};
 
 const escapeXmlWithinBytes = function escapeXmlWithinBytes(
   value: string,
@@ -123,15 +238,20 @@ const escapeXmlTailWithinBytes = function escapeXmlTailWithinBytes(
 };
 
 export const completionMessage = function completionMessage(
-  completions: readonly TaskCompletion[]
+  completions: readonly TaskCompletion[],
+  deliveryIds: readonly string[] = []
 ): string {
   const lines = ["<background-task-completion>"];
   const selected = completions.slice(0, MAX_COMPLETION_TASKS);
-  for (const completion of selected) {
+  for (const [index, completion] of selected.entries()) {
     const { task } = completion;
     const name = escapeXmlWithinBytes(task.name, MAX_COMPLETION_NAME_BYTES);
+    const deliveryId = deliveryIds[index];
+    const deliveryAttribute = deliveryId
+      ? ` delivery-id="${escapeXml(deliveryId)}"`
+      : "";
     lines.push(
-      `  <task id="${escapeXml(task.id)}">`,
+      `  <task id="${escapeXml(task.id)}"${deliveryAttribute}>`,
       `    <name truncated="${String(name.truncated)}">${name.text}</name>`,
       `    <status>${task.status}</status>`
     );
@@ -198,7 +318,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
   let shuttingDown = false;
   let wakeHandle: NodeJS.Timeout | undefined;
   let activeDashboard: TaskDashboardComponent | undefined;
-  const pendingWake = new Map<string, TaskCompletion>();
+  const deliveryLedger = new CompletionDeliveryLedger();
   // Callbacks close over the manager, so initialization follows their definitions.
   // oxlint-disable-next-line eslint/prefer-const
   let manager: BackgroundTaskManager;
@@ -225,45 +345,71 @@ const backgroundTasksExtension = function backgroundTasksExtension(
 
   const flushWake = (): void => {
     wakeHandle = undefined;
-    if (shuttingDown || pendingWake.size === 0) {
-      pendingWake.clear();
+    if (shuttingDown) {
       return;
     }
-    const completions = [...pendingWake.values()];
-    pendingWake.clear();
-    const included = completions.slice(0, MAX_COMPLETION_TASKS);
-    try {
-      pi.sendMessage(
-        {
-          content: completionMessage(completions),
-          customType: "background-task-completion",
-          details: {
-            omitted: completions.length - included.length,
-            tasks: included.map((completion) => ({
-              error: completion.task.error,
-              exitCode: completion.task.exitCode,
-              id: completion.task.id,
-              name: completion.task.name,
-              output: completion.output,
-              outputError: completion.outputError,
-              outputTruncated: completion.outputTruncated,
-              signal: completion.task.signal,
-              status: completion.task.status,
-            })),
+    const candidates = deliveryLedger.wakeCandidates();
+    let wakeRequested = false;
+    for (
+      let offset = 0;
+      offset < candidates.length;
+      offset += MAX_COMPLETION_TASKS
+    ) {
+      if (shuttingDown) {
+        return;
+      }
+      const records = candidates.slice(offset, offset + MAX_COMPLETION_TASKS);
+      deliveryLedger.markWakeAttempted(records);
+      const completions = records.map((record) => record.completion);
+      const triggerTurn: boolean = !wakeRequested;
+      try {
+        pi.sendMessage(
+          {
+            content: completionMessage(
+              completions,
+              records.map((record) => record.deliveryId)
+            ),
+            customType: "background-task-completion",
+            details: {
+              deliveryIds: records.map((record) => record.deliveryId),
+              omitted: 0,
+              tasks: records.map(({ completion, deliveryId }) => ({
+                deliveryId,
+                error: completion.task.error,
+                exitCode: completion.task.exitCode,
+                id: completion.task.id,
+                name: completion.task.name,
+                output: completion.output,
+                outputError: completion.outputError,
+                outputTruncated: completion.outputTruncated,
+                signal: completion.task.signal,
+                status: completion.task.status,
+              })),
+            },
+            display: true,
           },
-          display: true,
-        },
-        { deliverAs: "steer", triggerTurn: true }
-      );
-    } catch (error) {
-      console.error(
-        `[background-tasks] automatic continuation failed: ${error instanceof Error ? error.message : String(error)}`
-      );
+          { deliverAs: "steer", triggerTurn }
+        );
+        deliveryLedger.markEnqueued(records);
+        wakeRequested ||= triggerTurn;
+      } catch (error) {
+        console.error(
+          `[background-tasks] automatic continuation failed: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
     }
   };
 
   const handleFinished = (completion: TaskCompletion): void => {
     const { task } = completion;
+    const shouldWake =
+      !shuttingDown &&
+      task.wakeOnExit &&
+      (task.status === "completed" || task.status === "failed");
+    if (shouldWake) {
+      deliveryLedger.add(completion);
+    }
+
     const ctx = currentCtx;
     if (!shuttingDown && ctx?.hasUI) {
       const duration = formatUiDuration(
@@ -275,20 +421,18 @@ const backgroundTasksExtension = function backgroundTasksExtension(
           : task.signal
             ? `, ${task.signal}`
             : "";
-      ctx.ui.notify(
-        `${sanitizeUiInline(task.name)} ${task.status} after ${duration} (${task.id}${terminal}).`,
-        task.status === "failed" ? "error" : "info"
-      );
+      try {
+        ctx.ui.notify(
+          `${sanitizeUiInline(task.name)} ${task.status} after ${duration} (${task.id}${terminal}).`,
+          task.status === "failed" ? "error" : "info"
+        );
+      } catch (error) {
+        console.error(
+          `[background-tasks] completion notification failed: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
     }
-    if (
-      shuttingDown ||
-      !task.wakeOnExit ||
-      (task.status !== "completed" && task.status !== "failed")
-    ) {
-      return;
-    }
-    pendingWake.set(task.id, completion);
-    if (!wakeHandle) {
+    if (shouldWake && !wakeHandle) {
       wakeHandle = setTimeout(flushWake, WAKE_BATCH_MS);
       wakeHandle.unref();
     }
@@ -346,6 +490,14 @@ const backgroundTasksExtension = function backgroundTasksExtension(
         }
         case "status": {
           const tasks = manager.status(params.taskId);
+          deliveryLedger.markObservedByTaskId(
+            tasks
+              .filter(
+                (task) =>
+                  task.status === "completed" || task.status === "failed"
+              )
+              .map((task) => task.id)
+          );
           return {
             content: [{ text: formatTaskList(tasks), type: "text" as const }],
             details: { tasks },
@@ -356,6 +508,12 @@ const backgroundTasksExtension = function backgroundTasksExtension(
             throw new Error("taskId is required for action=logs");
           }
           const logs = await manager.logs(params.taskId, params.maxBytes);
+          if (
+            logs.task.status === "completed" ||
+            logs.task.status === "failed"
+          ) {
+            deliveryLedger.markObservedByTaskId([logs.task.id]);
+          }
           return {
             content: [{ text: logs.text, type: "text" as const }],
             details: logs,
@@ -449,24 +607,47 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     if (shuttingDown) {
       return { messages: event.messages };
     }
-    return {
-      messages: [
-        ...event.messages,
-        {
-          content: formatModelContext(
-            manager.list().filter(
-              (task) =>
-                !task.wakeOnExit ||
-                (task.status !== "completed" && task.status !== "failed")
-            )
-          ),
-          customType: "background-task-status",
-          display: false,
-          role: "custom" as const,
-          timestamp: Date.now(),
+    deliveryLedger.markObservedByDeliveryId(
+      deliveryIdsInMessages(event.messages)
+    );
+    const fallback = deliveryLedger
+      .unobserved()
+      .slice(0, MAX_COMPLETION_TASKS);
+    const messages = [
+      ...event.messages,
+      {
+        content: formatModelContext(
+          manager.list().filter(
+            (task) =>
+              !task.wakeOnExit ||
+              (task.status !== "completed" && task.status !== "failed")
+          )
+        ),
+        customType: "background-task-status",
+        display: false,
+        role: "custom" as const,
+        timestamp: Date.now(),
+      },
+    ];
+    if (fallback.length > 0) {
+      messages.push({
+        content: completionMessage(
+          fallback.map((record) => record.completion),
+          fallback.map((record) => record.deliveryId)
+        ),
+        customType: "background-task-completion-fallback",
+        details: {
+          deliveryIds: fallback.map((record) => record.deliveryId),
         },
-      ],
-    };
+        display: false,
+        role: "custom" as const,
+        timestamp: Date.now(),
+      });
+      deliveryLedger.markObservedByDeliveryId(
+        fallback.map((record) => record.deliveryId)
+      );
+    }
+    return { messages };
   });
 
   pi.on("session_start", async (_event, ctx) => {
@@ -485,7 +666,6 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       clearTimeout(wakeHandle);
       wakeHandle = undefined;
     }
-    pendingWake.clear();
 
     try {
       dashboard?.dispose();
