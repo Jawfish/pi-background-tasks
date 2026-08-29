@@ -626,7 +626,9 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     }
 
     const ctx = currentCtx;
-    if (!shuttingDown && ctx?.hasUI) {
+    const shouldNotify =
+      !shuttingDown && task.completionPolicy !== "silent";
+    if (shouldNotify && ctx?.hasUI) {
       const duration = formatUiDuration(
         (task.endedAt ?? Date.now()) - task.startedAt
       );

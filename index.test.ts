@@ -74,6 +74,7 @@ type EventHandler = (
 ) => unknown | Promise<unknown>;
 
 interface HarnessOptions {
+  hasUI?: boolean;
   notificationError?: Error;
   sendMessageError?: Error;
 }
@@ -114,7 +115,7 @@ const createHarness = function createHarness(options: HarnessOptions = {}) {
 
   const ctx = {
     cwd: process.cwd(),
-    hasUI: true,
+    hasUI: options.hasUI ?? true,
     ui: {
       notify(message: string) {
         if (options.notificationError) {
@@ -342,6 +343,43 @@ describe("background tasks extension", () => {
     );
     expect(started.content[0]?.text).toContain(`cwd: ${process.cwd()}`);
     await harness.emit("session_shutdown");
+  });
+
+  test("applies silent, notify, and wake completion delivery", async () => {
+    const cases = [
+      { policy: "silent", notifications: 0, messages: 0 },
+      { policy: "notify", notifications: 1, messages: 0 },
+      { policy: "wake", notifications: 1, messages: 1 },
+    ] as const;
+
+    for (const expected of cases) {
+      const harness = createHarness();
+      await harness.emit("session_start");
+      await harness.execute({
+        action: "start",
+        command: "true",
+        completionPolicy: expected.policy,
+        name: `${expected.policy} completion`,
+      });
+      await waitForCompletion();
+
+      expect(harness.notifications).toHaveLength(expected.notifications);
+      expect(harness.sentMessages).toHaveLength(expected.messages);
+      await harness.emit("session_shutdown");
+    }
+
+    const headless = createHarness({ hasUI: false });
+    await headless.emit("session_start");
+    await headless.execute({
+      action: "start",
+      command: "true",
+      completionPolicy: "notify",
+      name: "Headless notify",
+    });
+    await waitForCompletion();
+    expect(headless.notifications).toHaveLength(0);
+    expect(headless.sentMessages).toHaveLength(0);
+    await headless.emit("session_shutdown");
   });
 
   test("registers current task state in every model context", async () => {
