@@ -1,35 +1,60 @@
-# Background tasks
+# Background tasks for Pi
 
-This Pi extension runs POSIX shell commands without blocking the agent. It gives the model a current task list before every model call. Commands use `sh -c` from `PATH` by default, not the user's interactive login shell.
+Run session-owned POSIX shell commands without blocking Pi. The extension gives
+the model task status before each model call. It can notify or continue the
+model when work finishes.
 
-Task commands run from Pi's current working directory and inherit Pi's environment. The extension passes the command to the configured shell with `-c` without rewriting shell quoting or command escapes. Put quote-heavy or multiline programs in a file or a quoted heredoc. Do not use literal `\uXXXX` sequences as substitutes for shell quotes.
+## Install the extension
 
-## Tool
+Install the package for your Pi user:
 
-The extension adds one `background_task` tool with six actions.
+```sh
+pi install npm:@jawfish/pi-background-tasks
+```
 
-Start a task:
+Try it for one Pi run without changing your settings:
+
+```sh
+pi -e npm:@jawfish/pi-background-tasks
+```
+
+Update or remove it with Pi's package commands:
+
+```sh
+pi update npm:@jawfish/pi-background-tasks
+pi remove npm:@jawfish/pi-background-tasks
+```
+
+The package requires Node.js 22 or later. It supports POSIX systems such as
+Linux and macOS. It does not support Windows.
+
+## Start and manage tasks
+
+The extension adds one `background_task` tool. The tool has six actions:
+`start`, `status`, `logs`, `stop`, `watch`, and `unwatch`.
+
+Start a task with a name, working directory, timeout, and completion policy:
 
 ```json
 {
   "action": "start",
-  "name": "Typecheck",
-  "command": "bun run typecheck",
+  "command": "bun test",
+  "name": "API tests",
+  "cwd": "packages/api",
+  "timeoutSeconds": 900,
   "completionPolicy": "wake"
 }
 ```
 
-Inspect one task or all tasks:
+A relative `cwd` starts from Pi's current working directory. The directory must
+exist when the task starts. `timeoutSeconds` must be an integer from 1 through
+86400.
+
+List all tasks or inspect one task:
 
 ```json
 {"action":"status"}
 {"action":"status","taskId":"a12bc34d"}
-```
-
-Read the bounded tail of a task log:
-
-```json
-{"action":"logs","taskId":"a12bc34d","maxBytes":16000}
 ```
 
 Stop a task:
@@ -38,102 +63,167 @@ Stop a task:
 {"action":"stop","taskId":"a12bc34d"}
 ```
 
-Register or cancel a one-shot task watch:
+A task ID and watch ID can be a full ID or a unique prefix. The tool rejects an
+ambiguous prefix.
+
+## Read logs with byte cursors
+
+Read at most 32 KiB in one call. A call without `afterByte` returns a bounded
+log tail:
+
+```json
+{"action":"logs","taskId":"a12bc34d","maxBytes":16000}
+```
+
+For a forward read, start at byte zero and use the returned `nextByte` in the
+next call:
+
+```json
+{"action":"logs","taskId":"a12bc34d","afterByte":0,"maxBytes":8192}
+{"action":"logs","taskId":"a12bc34d","afterByte":8192,"maxBytes":8192}
+```
+
+Do not assume that the second cursor is always 8192. Use the `nextByte` value
+from the first result. Results also include `startByte`, `bytesRead`,
+`totalBytes`, and `truncated`. A read never returns a split UTF-8 prefix. If a
+requested cursor points inside a UTF-8 character, `droppedBytes` reports the
+skipped continuation bytes.
+
+Task output becomes visible only after the log writer commits it. This rule
+keeps cursor reads and watches on the same byte sequence.
+
+## Watch task events
+
+Watches are one-shot conditions. Use them instead of polling `status` or
+`logs`. One task can have at most eight watches.
+
+An output watch matches literal UTF-8 text in committed output. It can match
+across output chunks. The pattern limit is 512 bytes.
+
+```json
+{
+  "action": "watch",
+  "taskId": "a12bc34d",
+  "condition": "output",
+  "pattern": "Listening on",
+  "wake": true
+}
+```
+
+An exit watch fires when the task reaches a terminal state:
 
 ```json
 {"action":"watch","taskId":"a12bc34d","condition":"exit","wake":true}
+```
+
+An inactivity watch resets after each accepted output chunk. The quiet period
+must be an integer from 1 through 86400 seconds.
+
+```json
+{
+  "action": "watch",
+  "taskId": "a12bc34d",
+  "condition": "inactivity",
+  "inactivitySeconds": 60,
+  "wake": false
+}
+```
+
+Set `wake` to `true` when the model must continue after the watch fires. Pi can
+still show a UI notification when `wake` is false.
+
+Cancel an active watch with its watch ID:
+
+```json
 {"action":"unwatch","watchId":"d45ef678"}
 ```
 
-`taskId` and `watchId` accept a full ID or a unique prefix.
+## Choose a completion policy
 
-## Shell configuration
+`completionPolicy` controls what happens when a task ends:
 
-Set `PI_BACKGROUND_TASK_SHELL` to use another POSIX shell. Optional shell
-arguments come from `PI_BACKGROUND_TASK_SHELL_ARGS`, which must be a JSON array
-of strings. The extension passes each item as one argument before `-c`; it does
-not split arguments on whitespace.
+- `silent` omits the automatic notification and model continuation.
+- `notify` alerts the user in supported UI modes. It does not start a model
+  turn. This is the default.
+- `wake` alerts the user and sends one model continuation after a completed or
+  failed task.
 
-For example, use Bash without profile or startup files:
+A wake message steers the current agent run when Pi is active. It starts a new
+turn when Pi is idle. Completions within 100 milliseconds share one
+continuation. A manual stop does not cause a continuation. Session shutdown
+also suppresses new continuations.
+
+A wake message contains a bounded output tail from before log pruning. The
+model-facing message is at most 32 KiB and describes at most 16 tasks. The
+extension keeps a failed task or an undelivered event in temporary context until
+the model or a tool call observes it.
+
+Saved tool calls that use the old `wakeOnExit` field remain valid. `true` maps
+to `wake`, and `false` maps to `notify`. New calls must use
+`completionPolicy`. A call cannot set both fields.
+
+## Understand shell execution
+
+The default launch vector is `sh -c <command>`, with `sh` resolved from
+`PATH`, instead of the interactive login shell. The extension passes quoting,
+escapes, pipelines, and redirection to that shell without changes.
+
+Tasks inherit Pi's environment and user permissions. Each task also receives
+fresh Pi session metadata when the value exists:
+
+- `PI_SESSION_ID`
+- `PI_SESSION_FILE`
+- `PI_PROVIDER`
+- `PI_MODEL`
+- `PI_REASONING_LEVEL`
+
+Set `PI_BACKGROUND_TASK_SHELL` to select another POSIX shell. Set
+`PI_BACKGROUND_TASK_SHELL_ARGS` to a JSON array of arguments that must appear
+before `-c`.
+
+Run Bash without profile or startup files:
 
 ```sh
 export PI_BACKGROUND_TASK_SHELL=bash
 export PI_BACKGROUND_TASK_SHELL_ARGS='["--noprofile","--norc"]'
 ```
 
-With no overrides, the launch vector is `sh -c <command>`. The extension does
-not load interactive shell profiles.
+Put quote-heavy or multiline programs in a script file or a quoted heredoc.
+Do not use literal `\uXXXX` text as a replacement for shell quoting.
 
-## Interactive monitor
+## Monitor tasks in the TUI
 
-Run `/background-tasks` in Pi's TUI to open an auto-refreshing task monitor. It
-adapts to narrow and short terminals and shows task state, elapsed time,
-commands, process details, and a bounded log tail.
+Run `/background-tasks` to open the task monitor. It shows task state, elapsed
+time, process details, watches, and a bounded log tail.
 
 - Use the configured up and down keys, or `j` and `k`, to select a task.
 - Press Enter or `l` to switch between task details and its log tail.
-- Press `r` to refresh immediately.
-- Press `x` twice to stop a running task. The second press prevents accidental
-  stops.
+- Press `r` to refresh.
+- Press `x` twice to stop a running task.
 - Press Escape or the configured cancel key to close the monitor.
 
-The footer shows a compact running and stopping count. Tool calls, tool results,
-and automatic completions use themed, expandable summaries instead of raw task
-data. Terminal control sequences from commands and logs are removed before
-custom TUI rendering.
+The TUI keeps read cursors when it closes and reopens. It removes terminal
+control sequences from command text and logs before it renders them.
 
-## Completion policy
+## Know what survives a session change
 
-`completionPolicy` controls what happens when a task ends:
+`/reload` keeps live tasks for the same Pi session. The replacement extension
+adopts the manager, logs, watches, delivery state, failures, and dashboard
+cursors. The replacement delivers a task that finishes during reload once.
 
-- `silent` sends no automatic user notification or model continuation.
-- `notify` alerts the user in supported UI modes without starting a model turn.
-  This is the default.
-- `wake` alerts the user and delivers one automatic model continuation for a
-  completed or failed task.
+The old instance grants a 15-second handoff lease. If no replacement claims the
+manager before the lease ends, the old instance stops all managed process
+groups and deletes the log directory. Set
+`PI_BACKGROUND_TASK_HANDOFF_LEASE_MS` to change the lease in milliseconds.
 
-Stored calls that use the old `wakeOnExit` Boolean remain compatible: `true`
-maps to `wake`, while `false` maps to `notify`. New calls must use
-`completionPolicy`.
+All other session replacement events stop tasks. This rule includes `new`,
+`resume`, `fork`, and `quit`. Tasks do not survive a Pi process restart. The
+extension does not store task state for a later Pi process.
 
-A wake continuation steers the next model call when the agent is active or
-starts a turn when it is idle. Completions within 100 milliseconds share one
-continuation. The continuation includes bounded output tails captured before
-log pruning. Its model-facing message is capped at 32 KiB and includes details
-for at most 16 tasks. Command output is marked as untrusted data. A manual stop
-does not start a continuation. Pi also suppresses continuations during session
-shutdown.
+## Share the manager with another extension
 
-## Status context
-
-Before a model call, the extension adds ephemeral context only when there are
-active tasks, unobserved task events, or unacknowledged failures. The context is
-not stored in the session, omits temporary log paths and routine successful
-history, and disappears after acknowledgement. Empty task state does not add a
-message or timestamp.
-
-The model does not need to poll `status` or `logs` while it waits. It can use
-`logs` when it needs command output.
-
-## Reload
-
-`/reload` keeps running tasks alive. The old extension instance stops receiving
-callbacks and hands its manager, logs, watches, delivery state, and dashboard
-read cursors to the new instance for the same session. A task that finishes
-during the handoff is delivered once after the new instance adopts it.
-
-If no new instance claims the handoff within 15 seconds, the extension stops
-every managed process group and deletes the log directory. Set
-`PI_BACKGROUND_TASK_HANDOFF_LEASE_MS` to change that lease. Every other
-shutdown reason, including quit, new, resume, and fork, stops all tasks
-immediately.
-
-## Extension service
-
-Other Pi extensions can share this manager instead of spawning their own
-processes. The contract lives in `service.ts` and is versioned as `v1`. Listen
-for announcements before emitting discovery so either extension load order
-works:
+Other Pi extensions can use the session's manager through the versioned `v1`
+event-bus service. The public types live in `service.ts`.
 
 ```typescript
 import {
@@ -149,54 +239,76 @@ let tasks: BackgroundTaskService | undefined;
 const accept = (service: BackgroundTaskService): void => {
   tasks = service;
 };
-const unsubscribe = pi.events.on(BACKGROUND_TASK_SERVICE_CHANNEL, (data) => {
-  if (isBackgroundTaskServiceAnnouncement(data)) {
-    accept(data.service);
+const stopAnnouncements = pi.events.on(
+  BACKGROUND_TASK_SERVICE_CHANNEL,
+  (data) => {
+    if (isBackgroundTaskServiceAnnouncement(data)) {
+      accept(data.service);
+    }
   }
-});
+);
 pi.events.emit(BACKGROUND_TASK_DISCOVERY_CHANNEL, { onService: accept });
 ```
 
-The service supports start, list, status, logs, stop, watch, and unwatch. Its
-`subscribe` method emits `started`, `output-committed`, `watch-fired`, and
-`finished` events. Call the returned unsubscribe functions when the consumer
-shuts down. A service becomes unavailable when its session ends or its provider
-reloads; discover the replacement instead of retaining a stale service.
+The service supports start, list, status, logs, stop, watch, unwatch, and watch
+status. `subscribe` emits immutable `started`, `output-committed`,
+`watch-fired`, and `finished` events. It does not expose child processes, file
+handles, or Pi objects.
 
-- Channel names, the `version` value, and existing field meanings stay fixed
-  while `v1` is published.
-- New optional request fields, response fields, and lifecycle event types may
-  appear, so consumers must ignore unknown event types.
-- A breaking change ships as a new `v2` channel set, published next to `v1` for
-  at least one minor release before `v1` is removed.
-- The service returns immutable snapshots only. It never exposes child
-  processes, file handles, or Pi-internal objects.
+Call returned unsubscribe functions during consumer shutdown. A service becomes
+unavailable when its provider reloads or its session ends. Discover the
+replacement instead of keeping a stale service.
 
-## Testing
+The `v1` channel names, version value, and current field meanings are stable.
+Consumers must ignore unknown optional fields and event types. A breaking
+change uses a new `v2` channel set. The package will publish `v1` and `v2`
+together for at least one minor release before it removes `v1`.
 
-Run the unit and real Pi integration suites with:
+## Treat commands and output as untrusted
+
+This extension does not sandbox commands. Tasks have Pi's file, network,
+environment, and process permissions, so they can read the same secrets.
+
+Treat command output as untrusted data. Model messages mark it as untrusted,
+and custom TUI views remove terminal control sequences. These
+steps do not make hostile output safe or prevent prompt injection.
+
+The extension stops the process group that it creates. A command that starts a
+new process session or fully daemonizes can escape that group. Such a command
+must manage its own shutdown.
+
+## Limits and non-goals
+
+- At most 16 tasks can run at one time.
+- Each task can write at most 64 MiB. The extension stops that task at the
+  limit.
+- The 64 MiB limit is per task. No aggregate output quota applies across tasks.
+- One log read returns at most 32 KiB.
+- One task can have at most eight active watches.
+- An output watch pattern can contain at most 512 UTF-8 bytes.
+- Logs use a temporary session directory. Pruning removes old logs, and normal
+  session shutdown removes the directory.
+- The extension supports POSIX commands and process groups only.
+- The extension does not provide a PTY or send input to a running process.
+- The extension is not a terminal multiplexer, process supervisor, or sandbox.
+- The extension does not replace Bash or the user's shell configuration.
+- The extension does not create subagents.
+- The extension does not put ordinary Pi tool calls in the background
+  automatically. The model must call `background_task`.
+- The extension does not preserve tasks across Pi restarts.
+
+## Run release checks
+
+Run the same gates as CI:
 
 ```sh
-bun run test
-bun run test:integration
+bun install --frozen-lockfile
+bun run test:unit
 bun run typecheck
+bun run test:integration
+bun run verify:package
 ```
 
-The integration suite loads this package through Pi's public extension path and
-uses Pi's local faux provider. It needs no provider credentials or external
-network access. It covers wake and steering delivery, context fallback, log
-cursors, watches, reload and session replacement, process cleanup, print mode,
-and RPC mode.
-
-## Limits
-
-- POSIX systems only
-- 16 tasks can run at once
-- Logs are stored under the system temporary directory
-- Pruned logs are deleted, and the session log directory is removed at shutdown
-- Each task can write up to 64 MiB before the extension stops it
-- One log read returns at most 32 KiB and does not return a split UTF-8 prefix
-- Tracked process groups stop when the Pi session shuts down or is replaced
-- Tasks survive `/reload` but not a Pi restart
-
-Background commands run with the same user permissions and environment as Pi. This extension does not sandbox them. A command that deliberately creates a new process session or fully daemonizes can escape process-group cleanup and must manage its own shutdown.
+`verify:package` checks the exact npm archive file list, extracts the archive,
+and loads it through Pi in offline mode. CI runs these gates on Linux and
+macOS.
