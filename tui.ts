@@ -242,6 +242,38 @@ const effectiveCompletionPolicy = function effectiveCompletionPolicy(
   return fallback;
 };
 
+const WATCH_STATUS_COLOR: Record<
+  TaskWatchSnapshot["status"],
+  "accent" | "dim" | "success" | "warning"
+> = {
+  active: "accent",
+  cancelled: "dim",
+  expired: "warning",
+  fired: "success",
+};
+
+const formatDashboardWatch = function formatDashboardWatch(
+  watch: TaskWatchSnapshot,
+  theme: Theme
+): string {
+  let condition: string;
+  if (watch.condition === "output") {
+    const pattern = truncateToWidth(
+      cleanInline(watch.pattern ?? ""),
+      64,
+      "…",
+      true
+    );
+    condition = pattern ? `output “${pattern}”` : "output";
+  } else if (watch.condition === "inactivity") {
+    condition = `inactivity ${String(watch.inactivitySeconds ?? 0)}s`;
+  } else {
+    condition = "exit";
+  }
+  const wake = watch.wake ? " · wake model" : "";
+  return ` ${theme.fg(WATCH_STATUS_COLOR[watch.status], watch.status)} watch ${theme.fg("accent", watch.id)}${wake} · ${condition}`;
+};
+
 const renderTaskRow = function renderTaskRow(
   task: TaskSnapshot,
   theme: Theme,
@@ -822,7 +854,7 @@ export class TaskDashboardComponent implements Component {
     );
     const detailRows = Math.max(
       2,
-      Math.min(this.#showLogs ? 8 : 5, usableRows - listRows)
+      Math.min(this.#showLogs ? 8 : 10, usableRows - listRows)
     );
     this.#lastListRows = listRows;
 
@@ -976,6 +1008,14 @@ export class TaskDashboardComponent implements Component {
               `+${formatUiBytes(unreadBytes)} unread`
             )
           : "";
+      const watchCount = task.watches?.length ?? 0;
+      const watches =
+        watchCount > 0
+          ? this.#theme.fg(
+              "accent",
+              `${String(watchCount)} ${watchCount === 1 ? "watch" : "watches"}`
+            )
+          : "";
       const content = [
         selected ? this.#theme.fg("accent", " ›") : "  ",
         styledStatus(task.status, this.#theme, false),
@@ -984,6 +1024,7 @@ export class TaskDashboardComponent implements Component {
         this.#theme.fg("text", cleanInline(task.name)),
         terminal ? this.#theme.fg("muted", `(${terminal})`) : "",
         unread,
+        watches,
         policy,
       ]
         .filter(Boolean)
@@ -1035,10 +1076,14 @@ export class TaskDashboardComponent implements Component {
           ? undefined
           : `timeout ${formatUiDuration(task.timeoutSeconds * 1000)}`,
       ].filter((value): value is string => value !== undefined);
+      const watchDetails = (task.watches ?? []).map((watch) =>
+        formatDashboardWatch(watch, this.#theme)
+      );
       details = [
         task.error ? ` ${this.#theme.fg("error", cleanInline(task.error))}` : undefined,
         ` ${this.#theme.fg("dim", "Command")}  ${cleanInline(task.command)}`,
         ` ${this.#theme.fg("dim", "Process")}  ${metadata.join(" · ")}`,
+        ...watchDetails,
         ` ${this.#theme.fg("dim", "Folder")}   ${cleanInline(task.cwd)}`,
         ` ${this.#theme.fg("dim", "Log")}      ${cleanInline(task.logPath)}`,
       ].filter((value): value is string => value !== undefined);

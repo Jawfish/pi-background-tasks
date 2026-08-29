@@ -8,7 +8,11 @@ import {
   visibleWidth,
 } from "@earendil-works/pi-tui";
 
-import type { TaskLogs, TaskSnapshot } from "./core.ts";
+import type {
+  TaskLogs,
+  TaskSnapshot,
+  TaskWatchSnapshot,
+} from "./core.ts";
 import {
   renderBackgroundTaskCall,
   renderBackgroundTaskResult,
@@ -385,6 +389,75 @@ describe("background task dashboard", () => {
     ]);
     expect(readState.cursor(first.id)).toBe(18);
     expect(readState.cursor(second.id)).toBe(20);
+  });
+
+  test("renders bounded active and historical watch state", () => {
+    const now = Date.now();
+    const watches: TaskWatchSnapshot[] = [
+      {
+        condition: "output",
+        createdAt: now,
+        id: "watch001",
+        pattern: `ready-${"x".repeat(160)}\u001b]2;owned\u0007`,
+        status: "active",
+        taskId: "watched1",
+        wake: true,
+      },
+      {
+        condition: "exit",
+        createdAt: now - 1,
+        endedAt: now,
+        id: "watch002",
+        status: "fired",
+        taskId: "watched1",
+        wake: false,
+      },
+      {
+        condition: "inactivity",
+        createdAt: now - 2,
+        endedAt: now,
+        id: "watch003",
+        inactivitySeconds: 30,
+        status: "cancelled",
+        taskId: "watched1",
+        wake: false,
+      },
+      {
+        condition: "output",
+        createdAt: now - 3,
+        endedAt: now,
+        id: "watch004",
+        pattern: "timeout",
+        status: "expired",
+        taskId: "watched1",
+        wake: false,
+      },
+    ];
+    const watched = task({
+      bytesWritten: 0,
+      id: "watched1",
+      watches,
+    });
+    const dashboard = createDashboard({ rows: 50, tasks: [watched] });
+
+    for (const width of [44, 100]) {
+      const lines = dashboard.component.render(width);
+      expect(lines.every((line) => visibleWidth(line) === width)).toBe(true);
+      const rendered = stripTerminalSequences(lines.join("\n"));
+      if (width === 100) {
+        expect(rendered).toContain("4 watches");
+      } else {
+        expect(rendered).toContain("● run");
+      }
+      for (const status of ["active", "fired", "cancelled", "expired"]) {
+        expect(rendered).toContain(`${status} watch`);
+      }
+      if (width === 100) {
+        expect(rendered).toContain("wake model");
+      }
+      expect(rendered).not.toContain("owned");
+      expect(rendered).not.toContain("x".repeat(100));
+    }
   });
 
   test("loads a sanitized log tail without rendering terminal controls", async () => {

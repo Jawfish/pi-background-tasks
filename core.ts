@@ -293,8 +293,10 @@ export const formatModelContext = function formatModelContext(
     lines.push("Active:");
     for (const task of active) {
       const policy = `, completion policy ${task.completionPolicy}`;
-      const watches = task.watches?.length
-        ? `, ${String(task.watches.length)} active ${task.watches.length === 1 ? "watch" : "watches"}`
+      const activeWatches =
+        task.watches?.filter((watch) => watch.status === "active").length ?? 0;
+      const watches = activeWatches
+        ? `, ${String(activeWatches)} active ${activeWatches === 1 ? "watch" : "watches"}`
         : "";
       lines.push(
         `- ${task.id} [${task.status}${policy}${watches}] ${escapeXml(task.name)}`
@@ -1012,7 +1014,19 @@ export class BackgroundTaskManager {
       timeoutSeconds: task.timeoutSeconds,
       completionPolicy: task.completionPolicy,
       watches: [...task.watchState.values()]
-        .filter((watch) => watch.status === "active")
+        .toSorted((left, right) => {
+          if (left.status === "active" && right.status !== "active") {
+            return -1;
+          }
+          if (left.status !== "active" && right.status === "active") {
+            return 1;
+          }
+          return (
+            (right.endedAt ?? right.createdAt) -
+            (left.endedAt ?? left.createdAt)
+          );
+        })
+        .slice(0, MAX_WATCHES_PER_TASK)
         .map((watch) => BackgroundTaskManager.#watchSnapshot(watch)),
     };
   }
