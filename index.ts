@@ -1,4 +1,6 @@
 import { StringEnum } from "@earendil-works/pi-ai";
+import { stat } from "node:fs/promises";
+import path from "node:path";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -65,6 +67,29 @@ const buildTaskEnvironment = function buildTaskEnvironment(
   return environment;
 };
 
+const resolveTaskCwd = async function resolveTaskCwd(
+  baseCwd: string,
+  requestedCwd?: string
+): Promise<string> {
+  const resolved = path.resolve(baseCwd, requestedCwd ?? ".");
+  let info;
+  try {
+    info = await stat(resolved);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new Error(`Task working directory does not exist: ${resolved}`);
+    }
+    throw new Error(
+      `Could not inspect task working directory ${resolved}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error }
+    );
+  }
+  if (!info.isDirectory()) {
+    throw new Error(`Task working directory is not a directory: ${resolved}`);
+  }
+  return resolved;
+};
+
 const Parameters = Type.Object({
   action: StringEnum(
     ["start", "status", "logs", "stop", "watch", "unwatch"] as const,
@@ -90,6 +115,12 @@ const Parameters = Type.Object({
     StringEnum(["silent", "notify", "wake"] as const, {
       description:
         "For action=start: silent sends nothing, notify alerts the user, and wake also continues the model. Default: notify.",
+    })
+  ),
+  cwd: Type.Optional(
+    Type.String({
+      description:
+        "Working directory for action=start. Relative paths resolve from Pi's current working directory.",
     })
   ),
   condition: Type.Optional(
@@ -744,7 +775,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
           }
           const task = await manager.start({
             command: params.command,
-            cwd: ctx.cwd,
+            cwd: await resolveTaskCwd(ctx.cwd, params.cwd),
             environment: buildTaskEnvironment(ctx),
             name: params.name,
             completionPolicy: params.completionPolicy,

@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
 import type {
   ExtensionAPI,
@@ -18,6 +21,7 @@ interface ToolParams {
   afterByte?: number;
   command?: string;
   condition?: "output" | "exit" | "inactivity";
+  cwd?: string;
   inactivitySeconds?: number;
   maxBytes?: number;
   name?: string;
@@ -40,6 +44,7 @@ interface ToolResult {
     startByte?: number;
     task?: {
       completionPolicy?: "silent" | "notify" | "wake";
+      cwd?: string;
       id: string;
       status: string;
       watches?: { id: string; status: string }[];
@@ -415,6 +420,63 @@ describe("background tasks extension", () => {
     );
 
     await harness.emit("session_shutdown");
+  });
+
+  test("resolves and validates task working directories", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "background-task-cwd-"));
+    const nested = path.join(root, "nested");
+    const regularFile = path.join(root, "file.txt");
+    await mkdir(nested);
+    await writeFile(regularFile, "not a directory");
+    const harness = createHarness();
+    await harness.emit("session_start");
+
+    try {
+      const relative = await harness.execute({
+        action: "start",
+        command: "pwd",
+        cwd: path.relative(process.cwd(), nested),
+        name: "Relative cwd",
+      });
+      expect(relative.details.task?.cwd).toBe(nested);
+      expect(relative.content[0]?.text).toContain(`cwd: ${nested}`);
+      await waitForNotificationCount(harness.notifications, 1);
+      const relativeLogs = await harness.execute({
+        action: "logs",
+        taskId: relative.details.task?.id,
+      });
+      expect(relativeLogs.content[0]?.text).toContain(nested);
+
+      const absolute = await harness.execute({
+        action: "start",
+        command: "pwd",
+        cwd: root,
+        name: "Absolute cwd",
+      });
+      expect(absolute.details.task?.cwd).toBe(root);
+      await waitForNotificationCount(harness.notifications, 2);
+
+      await expect(
+        harness.execute({
+          action: "start",
+          command: "true",
+          cwd: path.join(root, "missing"),
+        })
+      ).rejects.toThrow("does not exist");
+      await expect(
+        harness.execute({
+          action: "start",
+          command: "true",
+          cwd: regularFile,
+        })
+      ).rejects.toThrow("not a directory");
+
+      const status = await harness.execute({ action: "status" });
+      expect(status.details.tasks).toHaveLength(2);
+    } finally {
+      await harness.emit("session_shutdown");
+      await rm(root, { force: true, recursive: true });
+    }
   });
 
   test("applies silent, notify, and wake completion delivery", async () => {
