@@ -20,8 +20,12 @@ import {
   BACKGROUND_TASK_DISCOVERY_CHANNEL,
   BACKGROUND_TASK_SERVICE_CHANNEL,
   isBackgroundTaskServiceAnnouncement,
+  MAX_SERVICE_PREVIEW_BYTES,
 } from "./service.ts";
-import type { BackgroundTaskService } from "./service.ts";
+import type {
+  BackgroundTaskLifecycleEvent,
+  BackgroundTaskService,
+} from "./service.ts";
 
 const isProcessGroupAlive = function isProcessGroupAlive(pid: number): boolean {
   try {
@@ -1307,6 +1311,19 @@ describe("background tasks extension", () => {
 
     events.emit(BACKGROUND_TASK_DISCOVERY_CHANNEL, { onService: "not callable" });
     expect(discovered).toHaveLength(1);
+    expect(() =>
+      events.emit(BACKGROUND_TASK_DISCOVERY_CHANNEL, {
+        onService: () => {
+          throw new Error("consumer callback failed");
+        },
+      })
+    ).not.toThrow();
+    events.emit(BACKGROUND_TASK_DISCOVERY_CHANNEL, {
+      onService: (value: BackgroundTaskService) => {
+        discovered.push(value);
+      },
+    });
+    expect(discovered).toHaveLength(2);
 
     await harness.emit("session_shutdown");
   });
@@ -1372,6 +1389,7 @@ describe("background tasks extension", () => {
     const stale = services[0]!;
     expect(stale.isAvailable()).toBe(false);
     expect(() => stale.list()).toThrow("no longer available");
+    expect(() => stale.subscribe(() => {})).toThrow("no longer available");
     await expect(stale.start({ command: "true" })).rejects.toThrow(
       "no longer available"
     );
@@ -1382,6 +1400,8 @@ describe("background tasks extension", () => {
     const current = services[1]!;
     expect(current).not.toBe(stale);
     expect(current.isAvailable()).toBe(true);
+    expect(stale.isAvailable()).toBe(false);
+    expect(() => stale.list()).toThrow("no longer available");
 
     const discovered: BackgroundTaskService[] = [];
     events.emit(BACKGROUND_TASK_DISCOVERY_CHANNEL, {
@@ -1393,6 +1413,126 @@ describe("background tasks extension", () => {
 
     await after.emit("session_shutdown");
     expect(current.isAvailable()).toBe(false);
+  });
+
+  test("broadcasts immutable bounded lifecycle events", async () => {
+    const events = createEventBus();
+    let service: BackgroundTaskService | undefined;
+    events.on(BACKGROUND_TASK_SERVICE_CHANNEL, (data) => {
+      if (isBackgroundTaskServiceAnnouncement(data)) {
+        service = data.service;
+      }
+    });
+    const harness = createHarness({ events });
+    await harness.emit("session_start");
+
+    const received: BackgroundTaskLifecycleEvent[] = [];
+    service!.subscribe(() => {
+      throw new Error("subscriber failure");
+    });
+    service!.subscribe((event) => {
+      received.push(event);
+    });
+
+    const task = await service!.start({
+      command:
+        "sleep 0.05; printf 'abcdefghijklmnopqrstuvwxyz%.0s' 1 2 3 4 5 6 7 8 9 10 11; printf MATCH",
+      completionPolicy: "silent",
+      name: "Lifecycle events",
+    });
+    service!.watch(task.id, {
+      condition: "output",
+      pattern: "MATCH",
+      wake: false,
+    });
+    await waitForCompletion();
+
+    expect(service!.status(task.id)[0]?.status).toBe("completed");
+    const started = received.filter((event) => event.type === "started");
+    const output = received.filter(
+      (event) => event.type === "output-committed"
+    );
+    const fired = received.filter((event) => event.type === "watch-fired");
+    const finished = received.filter((event) => event.type === "finished");
+    expect(started).toHaveLength(1);
+    expect(output.length).toBeGreaterThan(0);
+    expect(fired).toHaveLength(1);
+    expect(finished).toHaveLength(1);
+
+    const outputEvent = output[0]!;
+    if (outputEvent.type !== "output-committed") {
+      throw new Error("Expected an output event");
+    }
+    expect(Buffer.byteLength(outputEvent.preview)).toBeLessThanOrEqual(
+      MAX_SERVICE_PREVIEW_BYTES
+    );
+    expect(outputEvent.nextByte).toBeGreaterThan(outputEvent.startByte);
+    expect(output.some((event) => event.previewTruncated)).toBe(true);
+    expect(Object.isFrozen(outputEvent)).toBe(true);
+    expect(Object.isFrozen(outputEvent.task)).toBe(true);
+    expect(() => {
+      (outputEvent.task as { name: string }).name = "mutated";
+    }).toThrow();
+    expect(service!.status(task.id)[0]?.name).toBe("Lifecycle events");
+
+    const list = service!.list();
+    expect(Object.isFrozen(list)).toBe(true);
+    expect(Object.isFrozen(list[0])).toBe(true);
+    const logs = await service!.logs({ taskId: task.id });
+    expect(Object.isFrozen(logs)).toBe(true);
+    expect(Object.isFrozen(logs.task)).toBe(true);
+
+    await harness.emit("session_shutdown");
+  });
+
+  test("does not duplicate lifecycle events across reload", async () => {
+    const events = createEventBus();
+    const services: BackgroundTaskService[] = [];
+    events.on(BACKGROUND_TASK_SERVICE_CHANNEL, (data) => {
+      if (isBackgroundTaskServiceAnnouncement(data)) {
+        services.push(data.service);
+      }
+    });
+    const sessionId = `lifecycle-reload-${crypto.randomUUID()}`;
+    const before = createHarness({ events, sessionId });
+    await before.emit("session_start");
+    const beforeEvents: BackgroundTaskLifecycleEvent[] = [];
+    services[0]!.subscribe((event) => {
+      beforeEvents.push(event);
+    });
+    const task = await services[0]!.start({
+      command: "sleep 0.15; printf reload-output",
+      completionPolicy: "silent",
+      name: "Reload lifecycle",
+    });
+    await before.emit("session_shutdown", { reason: "reload" });
+
+    const after = createHarness({ events, sessionId });
+    await after.emit("session_start");
+    const afterEvents: BackgroundTaskLifecycleEvent[] = [];
+    services[1]!.subscribe((event) => {
+      afterEvents.push(event);
+    });
+    await Bun.sleep(400);
+
+    expect(beforeEvents.filter((event) => event.type === "started")).toHaveLength(
+      1
+    );
+    expect(
+      beforeEvents.filter((event) => event.type === "output-committed")
+    ).toHaveLength(0);
+    expect(beforeEvents.filter((event) => event.type === "finished")).toHaveLength(
+      0
+    );
+    expect(
+      afterEvents.filter((event) => event.type === "output-committed")
+    ).toHaveLength(1);
+    expect(afterEvents.filter((event) => event.type === "finished")).toHaveLength(
+      1
+    );
+    expect(services[1]!.status(task.id)[0]?.status).toBe("completed");
+
+    await after.emit("session_shutdown");
   });
 
   test("cancels a queued automatic continuation during shutdown", async () => {

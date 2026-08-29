@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 
-import type { TaskSnapshot } from "./core.ts";
 import {
   BACKGROUND_TASK_DISCOVERY_CHANNEL,
   BACKGROUND_TASK_SERVICE_CHANNEL,
@@ -12,9 +11,10 @@ import {
 import type {
   BackgroundTaskLifecycleEvent,
   BackgroundTaskService,
+  BackgroundTaskSnapshot,
 } from "./service.ts";
 
-const snapshot = function snapshot(): TaskSnapshot {
+const snapshot = function snapshot(): BackgroundTaskSnapshot {
   return {
     bytesWritten: 0,
     command: "true",

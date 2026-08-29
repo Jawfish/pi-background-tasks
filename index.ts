@@ -17,7 +17,14 @@ import {
   MAX_LOG_READ_BYTES,
   MAX_WATCH_PATTERN_BYTES,
 } from "./core.ts";
-import type { TaskCompletion, TaskSnapshot, TaskWatchEvent } from "./core.ts";
+import type {
+  TaskCompletion,
+  TaskLogs,
+  TaskOutputEvent,
+  TaskSnapshot,
+  TaskWatchEvent,
+  TaskWatchSnapshot,
+} from "./core.ts";
 import {
   formatUiDuration,
   renderBackgroundTaskCall,
@@ -41,7 +48,9 @@ import type {
   BackgroundTaskLifecycleEvent,
   BackgroundTaskLogRequest,
   BackgroundTaskService,
+  BackgroundTaskSnapshot,
   BackgroundTaskStartRequest,
+  BackgroundTaskWatchSnapshot,
 } from "./service.ts";
 
 const WAKE_BATCH_MS = 100;
@@ -644,6 +653,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
   >();
   let service: BackgroundTaskService | undefined;
   let serviceAvailable = false;
+  let serviceEpoch = 0;
   let discoverySubscription: (() => void) | undefined;
   // Callbacks close over the manager, so initialization follows their definitions.
   let manager: BackgroundTaskManager;
@@ -821,70 +831,162 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     if (shouldWake) {
       scheduleWake();
     }
+    publishServiceEvent({
+      output: completion.output,
+      outputError: completion.outputError,
+      outputTruncated: completion.outputTruncated,
+      task,
+      type: "finished",
+    });
   };
 
-  const requireService = (): void => {
-    if (!serviceAvailable) {
+  const freezeServiceWatch = (
+    watch: TaskWatchSnapshot | BackgroundTaskWatchSnapshot
+  ): BackgroundTaskWatchSnapshot => Object.freeze({ ...watch });
+
+  const freezeServiceTask = (
+    task: TaskSnapshot | BackgroundTaskSnapshot
+  ): BackgroundTaskSnapshot =>
+    Object.freeze({
+      ...task,
+      watches: task.watches
+        ? Object.freeze(task.watches.map(freezeServiceWatch))
+        : undefined,
+    });
+
+  const freezeServiceTasks = (
+    tasks: TaskSnapshot[]
+  ): readonly BackgroundTaskSnapshot[] =>
+    Object.freeze(tasks.map(freezeServiceTask));
+
+  const freezeServiceLogs = (logs: TaskLogs) =>
+    Object.freeze({ ...logs, task: freezeServiceTask(logs.task) });
+
+  const freezeServiceEvent = (
+    event: BackgroundTaskLifecycleEvent
+  ): BackgroundTaskLifecycleEvent => {
+    if (event.type === "watch-fired") {
+      return Object.freeze({
+        ...event,
+        task: freezeServiceTask(event.task),
+        watch: freezeServiceWatch(event.watch),
+      });
+    }
+    return Object.freeze({
+      ...event,
+      task: freezeServiceTask(event.task),
+    });
+  };
+
+  const publishServiceEvent = (event: BackgroundTaskLifecycleEvent): void => {
+    const immutableEvent = freezeServiceEvent(event);
+    for (const listener of [...serviceListeners]) {
+      try {
+        listener(immutableEvent);
+      } catch (error) {
+        console.error(
+          `[background-tasks] service subscriber failed: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
+  };
+
+  const handleStarted = (task: TaskSnapshot): void => {
+    publishServiceEvent({ task, type: "started" });
+  };
+
+  const handleOutput = (event: TaskOutputEvent): void => {
+    publishServiceEvent({
+      nextByte: event.nextByte,
+      preview: event.preview,
+      previewTruncated: event.previewTruncated,
+      startByte: event.startByte,
+      task: event.task,
+      type: "output-committed",
+    });
+  };
+
+  const requireService = (epoch: number): void => {
+    if (!serviceAvailable || epoch !== serviceEpoch) {
       throw new Error(
         "The background task service is no longer available for this session"
       );
     }
   };
 
-  const createService = (ctx: ExtensionContext): BackgroundTaskService => ({
-    isAvailable: () => serviceAvailable,
-    list: () => {
-      requireService();
-      return manager.list();
-    },
-    logs: async (request: BackgroundTaskLogRequest) => {
-      requireService();
-      return await manager.logs(
-        request.taskId,
-        request.maxBytes,
-        request.afterByte
-      );
-    },
-    sessionId: ctx.sessionManager?.getSessionId(),
-    start: async (request: BackgroundTaskStartRequest) => {
-      requireService();
-      return await manager.start({
-        command: request.command,
-        completionPolicy: request.completionPolicy,
-        cwd: await resolveTaskCwd(ctx.cwd, request.cwd),
-        environment: buildTaskEnvironment(ctx),
-        name: request.name,
-        timeoutSeconds: request.timeoutSeconds,
-      });
-    },
-    status: (taskIdOrPrefix?: string) => {
-      requireService();
-      return manager.status(taskIdOrPrefix);
-    },
-    stop: (taskIdOrPrefix: string) => {
-      requireService();
-      return manager.stop(taskIdOrPrefix);
-    },
-    subscribe: (listener) => {
-      serviceListeners.add(listener);
-      return () => {
-        serviceListeners.delete(listener);
-      };
-    },
-    unwatch: (watchIdOrPrefix: string) => {
-      requireService();
-      return manager.unwatch(watchIdOrPrefix);
-    },
-    version: BACKGROUND_TASK_SERVICE_VERSION,
-    watch: (taskIdOrPrefix, input) => {
-      requireService();
-      return manager.watch(taskIdOrPrefix, input);
-    },
-    watchStatus: (taskIdOrPrefix?: string) => {
-      requireService();
-      return manager.watchStatus(taskIdOrPrefix);
-    },
-  });
+  const createService = (ctx: ExtensionContext): BackgroundTaskService => {
+    const epoch = ++serviceEpoch;
+    const requireCurrentService = (): void => {
+      requireService(epoch);
+    };
+    return Object.freeze<BackgroundTaskService>({
+      isAvailable: () => serviceAvailable && epoch === serviceEpoch,
+      list: () => {
+        requireCurrentService();
+        return freezeServiceTasks(manager.list());
+      },
+      logs: async (request: BackgroundTaskLogRequest) => {
+        requireCurrentService();
+        const logs = await manager.logs(
+          request.taskId,
+          request.maxBytes,
+          request.afterByte
+        );
+        requireCurrentService();
+        return freezeServiceLogs(logs);
+      },
+      sessionId: ctx.sessionManager?.getSessionId(),
+      start: async (request: BackgroundTaskStartRequest) => {
+        requireCurrentService();
+        const input = { ...request };
+        const cwd = await resolveTaskCwd(ctx.cwd, input.cwd);
+        requireCurrentService();
+        const task = await manager.start({
+          command: input.command,
+          completionPolicy: input.completionPolicy,
+          cwd,
+          environment: buildTaskEnvironment(ctx),
+          name: input.name,
+          timeoutSeconds: input.timeoutSeconds,
+        });
+        requireCurrentService();
+        return freezeServiceTask(task);
+      },
+      status: (taskIdOrPrefix?: string) => {
+        requireCurrentService();
+        return freezeServiceTasks(manager.status(taskIdOrPrefix));
+      },
+      stop: (taskIdOrPrefix: string) => {
+        requireCurrentService();
+        return freezeServiceTask(manager.stop(taskIdOrPrefix));
+      },
+      subscribe: (listener) => {
+        requireCurrentService();
+        const subscription = (event: BackgroundTaskLifecycleEvent): void => {
+          listener(event);
+        };
+        serviceListeners.add(subscription);
+        return () => {
+          serviceListeners.delete(subscription);
+        };
+      },
+      unwatch: (watchIdOrPrefix: string) => {
+        requireCurrentService();
+        return freezeServiceWatch(manager.unwatch(watchIdOrPrefix));
+      },
+      version: BACKGROUND_TASK_SERVICE_VERSION,
+      watch: (taskIdOrPrefix, input) => {
+        requireCurrentService();
+        return freezeServiceWatch(manager.watch(taskIdOrPrefix, input));
+      },
+      watchStatus: (taskIdOrPrefix?: string) => {
+        requireCurrentService();
+        return Object.freeze(
+          manager.watchStatus(taskIdOrPrefix).map(freezeServiceWatch)
+        );
+      },
+    });
+  };
 
   /** Recover terminal tasks that finished while no instance was bound. */
   const adoptTerminalTasks = async (): Promise<void> => {
@@ -922,6 +1024,14 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       scheduleWake();
     }
     const ctx = currentCtx;
+    publishServiceEvent({
+      nextByte: event.nextByte,
+      output: event.output,
+      startByte: event.startByte,
+      task: event.task,
+      type: "watch-fired",
+      watch: event.watch,
+    });
     if (ctx?.hasUI) {
       try {
         ctx.ui.notify(
@@ -936,11 +1046,15 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     }
   };
 
-  manager = new BackgroundTaskManager({
+  const managerCallbacks = {
     onChange: updateUi,
     onFinished: handleFinished,
+    onOutput: handleOutput,
+    onStarted: handleStarted,
     onWatchFired: handleWatchFired,
-  });
+  };
+
+  manager = new BackgroundTaskManager(managerCallbacks);
 
   pi.registerMessageRenderer<CompletionDisplayDetails>(
     "background-task-completion",
@@ -1257,11 +1371,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       for (const [taskId, task] of adopted.unacknowledgedFailures) {
         unacknowledgedFailures.set(taskId, task);
       }
-      manager.bindCallbacks({
-        onChange: updateUi,
-        onFinished: handleFinished,
-        onWatchFired: handleWatchFired,
-      });
+      manager.bindCallbacks(managerCallbacks);
       try {
         await discarded.shutdown();
       } catch (error) {
@@ -1298,7 +1408,10 @@ const backgroundTasksExtension = function backgroundTasksExtension(
         }
       }
     );
-    pi.events.emit(BACKGROUND_TASK_SERVICE_CHANNEL, { service });
+    pi.events.emit(
+      BACKGROUND_TASK_SERVICE_CHANNEL,
+      Object.freeze({ service })
+    );
   });
 
   pi.on("session_shutdown", async (event) => {
@@ -1315,6 +1428,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       (event as { reason?: unknown } | undefined)?.reason === "reload" &&
       Boolean(sessionId);
     serviceAvailable = false;
+    serviceEpoch += 1;
     service = undefined;
     serviceListeners.clear();
     discoverySubscription?.();

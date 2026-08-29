@@ -1,3 +1,4 @@
+import { MAX_OUTPUT_PREVIEW_BYTES } from "./core.ts";
 import type {
   CompletionPolicy,
   CreateTaskWatchInput,
@@ -30,51 +31,62 @@ export const BACKGROUND_TASK_DISCOVERY_CHANNEL =
 export const BACKGROUND_TASK_SERVICE_CHANNEL = "pi-background-tasks:v1:service";
 
 /** Maximum bytes of committed output carried by one lifecycle event. */
-export const MAX_SERVICE_PREVIEW_BYTES = 256;
+export const MAX_SERVICE_PREVIEW_BYTES = MAX_OUTPUT_PREVIEW_BYTES;
+
+export type BackgroundTaskWatchRequest = Readonly<CreateTaskWatchInput>;
+export type BackgroundTaskWatchSnapshot = Readonly<TaskWatchSnapshot>;
+export type BackgroundTaskSnapshot = Readonly<
+  Omit<TaskSnapshot, "watches"> & {
+    watches?: readonly BackgroundTaskWatchSnapshot[];
+  }
+>;
+export type BackgroundTaskLogs = Readonly<
+  Omit<TaskLogs, "task"> & { task: BackgroundTaskSnapshot }
+>;
 
 export interface BackgroundTaskStartRequest {
-  command: string;
-  completionPolicy?: CompletionPolicy;
-  cwd?: string;
-  name?: string;
-  timeoutSeconds?: number;
+  readonly command: string;
+  readonly completionPolicy?: CompletionPolicy;
+  readonly cwd?: string;
+  readonly name?: string;
+  readonly timeoutSeconds?: number;
 }
 
 export interface BackgroundTaskLogRequest {
-  afterByte?: number;
-  maxBytes?: number;
-  taskId: string;
+  readonly afterByte?: number;
+  readonly maxBytes?: number;
+  readonly taskId: string;
 }
 
 export interface BackgroundTaskStartedEvent {
-  task: TaskSnapshot;
-  type: "started";
+  readonly task: BackgroundTaskSnapshot;
+  readonly type: "started";
 }
 
 export interface BackgroundTaskOutputEvent {
-  nextByte: number;
-  preview: string;
-  previewTruncated: boolean;
-  startByte: number;
-  task: TaskSnapshot;
-  type: "output";
+  readonly nextByte: number;
+  readonly preview: string;
+  readonly previewTruncated: boolean;
+  readonly startByte: number;
+  readonly task: BackgroundTaskSnapshot;
+  readonly type: "output-committed";
 }
 
 export interface BackgroundTaskWatchFiredEvent {
-  nextByte?: number;
-  output?: string;
-  startByte?: number;
-  task: TaskSnapshot;
-  type: "watch-fired";
-  watch: TaskWatchSnapshot;
+  readonly nextByte?: number;
+  readonly output?: string;
+  readonly startByte?: number;
+  readonly task: BackgroundTaskSnapshot;
+  readonly type: "watch-fired";
+  readonly watch: BackgroundTaskWatchSnapshot;
 }
 
 export interface BackgroundTaskFinishedEvent {
-  output?: string;
-  outputError?: string;
-  outputTruncated?: boolean;
-  task: TaskSnapshot;
-  type: "finished";
+  readonly output?: string;
+  readonly outputError?: string;
+  readonly outputTruncated?: boolean;
+  readonly task: BackgroundTaskSnapshot;
+  readonly type: "finished";
 }
 
 export type BackgroundTaskLifecycleEvent =
@@ -88,30 +100,32 @@ export interface BackgroundTaskService {
   readonly sessionId: string | undefined;
   readonly version: typeof BACKGROUND_TASK_SERVICE_VERSION;
   isAvailable(): boolean;
-  list(): TaskSnapshot[];
-  logs(request: BackgroundTaskLogRequest): Promise<TaskLogs>;
-  start(request: BackgroundTaskStartRequest): Promise<TaskSnapshot>;
-  status(taskIdOrPrefix?: string): TaskSnapshot[];
-  stop(taskIdOrPrefix: string): TaskSnapshot;
+  list(): readonly BackgroundTaskSnapshot[];
+  logs(request: BackgroundTaskLogRequest): Promise<BackgroundTaskLogs>;
+  start(request: BackgroundTaskStartRequest): Promise<BackgroundTaskSnapshot>;
+  status(taskIdOrPrefix?: string): readonly BackgroundTaskSnapshot[];
+  stop(taskIdOrPrefix: string): BackgroundTaskSnapshot;
   subscribe(
     listener: (event: BackgroundTaskLifecycleEvent) => void
   ): () => void;
-  unwatch(watchIdOrPrefix: string): TaskWatchSnapshot;
+  unwatch(watchIdOrPrefix: string): BackgroundTaskWatchSnapshot;
   watch(
     taskIdOrPrefix: string,
-    input: CreateTaskWatchInput
-  ): TaskWatchSnapshot;
-  watchStatus(taskIdOrPrefix?: string): TaskWatchSnapshot[];
+    input: BackgroundTaskWatchRequest
+  ): BackgroundTaskWatchSnapshot;
+  watchStatus(
+    taskIdOrPrefix?: string
+  ): readonly BackgroundTaskWatchSnapshot[];
 }
 
 /** Payload a consumer emits on the discovery channel. */
 export interface BackgroundTaskDiscoveryRequest {
-  onService: (service: BackgroundTaskService) => void;
+  readonly onService: (service: BackgroundTaskService) => void;
 }
 
 /** Payload published when a session service becomes available. */
 export interface BackgroundTaskServiceAnnouncement {
-  service: BackgroundTaskService;
+  readonly service: BackgroundTaskService;
 }
 
 export const isBackgroundTaskDiscoveryRequest =
@@ -137,6 +151,11 @@ export const isBackgroundTaskServiceAnnouncement =
       typeof service === "object" &&
       service !== null &&
       (service as { version?: unknown }).version ===
-        BACKGROUND_TASK_SERVICE_VERSION
+        BACKGROUND_TASK_SERVICE_VERSION &&
+      typeof (service as { isAvailable?: unknown }).isAvailable ===
+        "function" &&
+      typeof (service as { list?: unknown }).list === "function" &&
+      typeof (service as { start?: unknown }).start === "function" &&
+      typeof (service as { subscribe?: unknown }).subscribe === "function"
     );
   };

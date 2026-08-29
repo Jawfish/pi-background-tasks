@@ -17,6 +17,7 @@ export const MAX_COMPLETION_LOG_BYTES = 2 * 1024;
 export const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 export const KILL_GRACE_MS = 1000;
 export const MAX_WATCHES_PER_TASK = 8;
+export const MAX_OUTPUT_PREVIEW_BYTES = 256;
 export const MAX_WATCH_PATTERN_BYTES = 512;
 export const WATCH_REARM_COOLDOWN_MS = 1000;
 export const DEFAULT_SHELL = "sh";
@@ -47,6 +48,14 @@ export interface TaskWatchSnapshot {
   startByte?: number;
   nextByte?: number;
   matchedOutput?: string;
+}
+
+export interface TaskOutputEvent {
+  task: TaskSnapshot;
+  startByte: number;
+  nextByte: number;
+  preview: string;
+  previewTruncated: boolean;
 }
 
 export interface TaskWatchEvent {
@@ -164,6 +173,8 @@ export interface BackgroundTaskManagerOptions {
   ) => boolean;
   onChange?: () => void;
   onFinished?: (completion: TaskCompletion) => void;
+  onOutput?: (event: TaskOutputEvent) => void;
+  onStarted?: (task: TaskSnapshot) => void;
   onWatchFired?: (event: TaskWatchEvent) => void;
 }
 
@@ -171,6 +182,8 @@ export interface BackgroundTaskManagerOptions {
 export interface BackgroundTaskCallbacks {
   onChange?: () => void;
   onFinished?: (completion: TaskCompletion) => void;
+  onOutput?: (event: TaskOutputEvent) => void;
+  onStarted?: (task: TaskSnapshot) => void;
   onWatchFired?: (event: TaskWatchEvent) => void;
 }
 
@@ -390,6 +403,8 @@ export class BackgroundTaskManager {
     this.#callbacks = {
       onChange: options.onChange,
       onFinished: options.onFinished,
+      onOutput: options.onOutput,
+      onStarted: options.onStarted,
       onWatchFired: options.onWatchFired,
     };
   }
@@ -708,7 +723,13 @@ export class BackgroundTaskManager {
       }
 
       this.#notifyChange();
-      return BackgroundTaskManager.#snapshot(task);
+      const snapshot = BackgroundTaskManager.#snapshot(task);
+      try {
+        this.#callbacks.onStarted?.(snapshot);
+      } catch {
+        // A start observer failure must not change task state.
+      }
+      return snapshot;
     } finally {
       this.#pendingStarts -= 1;
     }
@@ -1094,6 +1115,7 @@ export class BackgroundTaskManager {
         task.bytesWritten += data.length;
         if (matchOutput) {
           this.#matchOutputWatches(task, data, startByte);
+          this.#notifyOutput(task, data, startByte);
         }
       }
       task.pendingLogWrites.delete(settled.promise);
@@ -1104,6 +1126,37 @@ export class BackgroundTaskManager {
     } catch (error) {
       callback(error instanceof Error ? error : new Error(String(error)));
       throw error;
+    }
+  }
+
+  #notifyOutput(task: RuntimeTask, data: Buffer, startByte: number): void {
+    if (!this.#callbacks.onOutput) {
+      return;
+    }
+    const previewBytes = BackgroundTaskManager.#completeUtf8PrefixLength(
+      data,
+      MAX_OUTPUT_PREVIEW_BYTES
+    );
+    const decodedPreview = data.subarray(0, previewBytes).toString("utf-8");
+    const encodedPreview = Buffer.from(decodedPreview, "utf-8");
+    const boundedPreviewBytes =
+      BackgroundTaskManager.#completeUtf8PrefixLength(
+        encodedPreview,
+        MAX_OUTPUT_PREVIEW_BYTES
+      );
+    try {
+      this.#callbacks.onOutput({
+        nextByte: startByte + data.length,
+        preview: encodedPreview
+          .subarray(0, boundedPreviewBytes)
+          .toString("utf-8"),
+        previewTruncated:
+          previewBytes < data.length || boundedPreviewBytes < encodedPreview.length,
+        startByte,
+        task: BackgroundTaskManager.#snapshot(task),
+      });
+    } catch {
+      // An output observer failure must not change task state.
     }
   }
 
