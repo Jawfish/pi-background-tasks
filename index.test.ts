@@ -14,14 +14,19 @@ import backgroundTasksExtension, {
 } from "./index.ts";
 
 interface ToolParams {
-  action: "start" | "status" | "logs" | "stop";
+  action: "start" | "status" | "logs" | "stop" | "watch" | "unwatch";
   afterByte?: number;
   command?: string;
+  condition?: "output" | "exit" | "inactivity";
+  inactivitySeconds?: number;
   maxBytes?: number;
   name?: string;
+  pattern?: string;
   taskId?: string;
   timeoutSeconds?: number;
+  wake?: boolean;
   wakeOnExit?: boolean;
+  watchId?: string;
 }
 
 interface ToolResult {
@@ -32,9 +37,18 @@ interface ToolResult {
     nextByte?: number;
     output?: string;
     startByte?: number;
-    task?: { id: string; status: string };
-    tasks?: unknown[];
+    task?: {
+      id: string;
+      status: string;
+      watches?: { id: string; status: string }[];
+    };
+    tasks?: {
+      id: string;
+      status: string;
+      watches?: { id: string; status: string }[];
+    }[];
     totalBytes?: number;
+    watch?: { id: string; status: string; taskId: string };
   };
 }
 
@@ -277,6 +291,46 @@ describe("background tasks extension", () => {
     expect(active.messages.at(-1)?.content).toContain(`${id} [running]`);
 
     await harness.execute({ action: "stop", taskId: id });
+    await waitForCompletion();
+    await harness.emit("session_shutdown");
+  });
+
+  test("registers and cancels task watches", async () => {
+    const harness = createHarness();
+    await harness.emit("session_start");
+    const started = await harness.execute({
+      action: "start",
+      command: "sleep 30",
+      name: "Watched task",
+    });
+    const watched = await harness.execute({
+      action: "watch",
+      condition: "output",
+      pattern: "ready",
+      taskId: started.details.task?.id,
+      wake: true,
+    });
+
+    expect(watched.details.watch).toMatchObject({
+      status: "active",
+      taskId: started.details.task?.id,
+    });
+    const status = await harness.execute({
+      action: "status",
+      taskId: started.details.task?.id,
+    });
+    expect(status.details.tasks?.[0]?.watches).toHaveLength(1);
+
+    const cancelled = await harness.execute({
+      action: "unwatch",
+      watchId: watched.details.watch?.id.slice(0, 4),
+    });
+    expect(cancelled.details.watch?.status).toBe("cancelled");
+
+    await harness.execute({
+      action: "stop",
+      taskId: started.details.task?.id,
+    });
     await waitForCompletion();
     await harness.emit("session_shutdown");
   });

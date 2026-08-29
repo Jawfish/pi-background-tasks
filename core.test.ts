@@ -469,6 +469,86 @@ describe("BackgroundTaskManager", () => {
     expect(terminal.error).toContain("Could not confirm process-group cleanup");
   });
 
+  test("registers, inspects, and cancels bounded task watches", async () => {
+    const manager = await createManager({ maxWatchesPerTask: 3 });
+    const started = await manager.start({
+      command: "sleep 30",
+      cwd: process.cwd(),
+    });
+    const output = manager.watch(started.id, {
+      condition: "output",
+      pattern: "ready",
+      wake: true,
+    });
+    expect(() =>
+      manager.watch(started.id, {
+        condition: "output",
+        pattern: "ready",
+      })
+    ).toThrow("identical watch");
+    const exit = manager.watch(started.id, { condition: "exit" });
+    const inactivity = manager.watch(started.id, {
+      condition: "inactivity",
+      inactivitySeconds: 5,
+    });
+
+    expect(manager.status(started.id)[0]?.watches).toHaveLength(3);
+    expect(manager.watchStatus(started.id.slice(0, 4))).toHaveLength(3);
+    expect(() =>
+      manager.watch(started.id, {
+        condition: "output",
+        pattern: "another",
+      })
+    ).toThrow("At most 3 watches");
+
+    const cancelled = manager.unwatch(output.id.slice(0, 4));
+    expect(cancelled.status).toBe("cancelled");
+    expect(manager.status(started.id)[0]?.watches).toHaveLength(2);
+    expect(() => manager.unwatch(output.id)).toThrow("already cancelled");
+
+    manager.stop(started.id);
+    await waitForTerminal(manager, started.id);
+    expect(manager.watchStatus(started.id)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: exit.id, status: "expired" }),
+        expect.objectContaining({ id: inactivity.id, status: "expired" }),
+      ])
+    );
+    expect(() =>
+      manager.watch(started.id, { condition: "exit" })
+    ).toThrow("because it is stopped");
+  });
+
+  test("rejects invalid watch conditions", async () => {
+    const manager = await createManager();
+    const started = await manager.start({
+      command: "sleep 30",
+      cwd: process.cwd(),
+    });
+
+    expect(() =>
+      manager.watch(started.id, { condition: "output", pattern: "" })
+    ).toThrow("pattern is required");
+    expect(() =>
+      manager.watch(started.id, {
+        condition: "output",
+        pattern: "x".repeat(513),
+      })
+    ).toThrow("limited to 512 bytes");
+    expect(() =>
+      manager.watch(started.id, {
+        condition: "inactivity",
+        inactivitySeconds: 0,
+      })
+    ).toThrow("positive number");
+    expect(() =>
+      manager.watch(started.id, { condition: "exit", pattern: "bad" })
+    ).toThrow("do not accept");
+
+    manager.stop(started.id);
+    await waitForTerminal(manager, started.id);
+  });
+
   test("enforces the active limit across concurrent starts", async () => {
     const manager = await createManager({ maxActiveTasks: 2 });
     const attempts = await Promise.allSettled(

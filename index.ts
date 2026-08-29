@@ -11,6 +11,7 @@ import {
   formatModelContext,
   formatTaskList,
   MAX_LOG_READ_BYTES,
+  MAX_WATCH_PATTERN_BYTES,
 } from "./core.ts";
 import type { TaskCompletion } from "./core.ts";
 import {
@@ -34,9 +35,12 @@ const MAX_COMPLETION_OUTPUT_BYTES = 768;
 export const MAX_COMPLETION_MESSAGE_BYTES = 32 * 1024;
 
 const Parameters = Type.Object({
-  action: StringEnum(["start", "status", "logs", "stop"] as const, {
-    description: "Operation to perform",
-  }),
+  action: StringEnum(
+    ["start", "status", "logs", "stop", "watch", "unwatch"] as const,
+    {
+      description: "Operation to perform",
+    }
+  ),
   afterByte: Type.Optional(
     Type.Integer({
       description:
@@ -47,6 +51,18 @@ const Parameters = Type.Object({
   ),
   command: Type.Optional(
     Type.String({ description: "Shell command for action=start" })
+  ),
+  condition: Type.Optional(
+    StringEnum(["output", "exit", "inactivity"] as const, {
+      description: "Condition for action=watch",
+    })
+  ),
+  inactivitySeconds: Type.Optional(
+    Type.Integer({
+      description: "Quiet period for an inactivity watch",
+      maximum: 86_400,
+      minimum: 1,
+    })
   ),
   maxBytes: Type.Optional(
     Type.Integer({
@@ -61,10 +77,27 @@ const Parameters = Type.Object({
       maxLength: 60,
     })
   ),
+  pattern: Type.Optional(
+    Type.String({
+      description: "Literal UTF-8 text for an output watch",
+      maxLength: MAX_WATCH_PATTERN_BYTES,
+      minLength: 1,
+    })
+  ),
   taskId: Type.Optional(
     Type.String({
       description:
         "Task ID or unique prefix for status, logs, or stop. Omit for status to list all tasks.",
+    })
+  ),
+  watchId: Type.Optional(
+    Type.String({
+      description: "Watch ID or unique prefix for action=unwatch",
+    })
+  ),
+  wake: Type.Optional(
+    Type.Boolean({
+      description: "For action=watch, wake the model when the watch fires",
     })
   ),
   timeoutSeconds: Type.Optional(
@@ -460,7 +493,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
   pi.registerTool<typeof Parameters, BackgroundTaskToolDetails>({
     description: [
       "Manage session-scoped background shell tasks.",
-      "Actions: start, status, logs, stop.",
+      "Actions: start, status, logs, stop, watch, unwatch.",
       "Task status is injected before every model call, so status and logs are not polling tools.",
       `Log reads are capped at ${String(MAX_LOG_READ_BYTES)} bytes. Reuse nextByte as afterByte for incremental reads.`,
     ].join(" "),
@@ -546,6 +579,44 @@ const backgroundTasksExtension = function backgroundTasksExtension(
             details: { task },
           };
         }
+        case "watch": {
+          if (!params.taskId) {
+            throw new Error("taskId is required for action=watch");
+          }
+          if (!params.condition) {
+            throw new Error("condition is required for action=watch");
+          }
+          const watch = manager.watch(params.taskId, {
+            condition: params.condition,
+            inactivitySeconds: params.inactivitySeconds,
+            pattern: params.pattern,
+            wake: params.wake,
+          });
+          return {
+            content: [
+              {
+                text: `Watching ${watch.taskId} for ${watch.condition} (${watch.id}).`,
+                type: "text" as const,
+              },
+            ],
+            details: { watch },
+          };
+        }
+        case "unwatch": {
+          if (!params.watchId) {
+            throw new Error("watchId is required for action=unwatch");
+          }
+          const watch = manager.unwatch(params.watchId);
+          return {
+            content: [
+              {
+                text: `Cancelled ${watch.condition} watch ${watch.id}.`,
+                type: "text" as const,
+              },
+            ],
+            details: { watch },
+          };
+        }
         default: {
           const unsupported: never = params.action;
           throw new Error(
@@ -568,6 +639,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       "Set background_task wakeOnExit=true only when the agent must continue automatically after that task completes or fails.",
       "Do not poll background_task status or logs merely to wait. Current active status is injected before every model call, and wakeOnExit steers completion into the next model call or starts a turn when idle.",
       "Use background_task logs only when task output is needed. Keep maxBytes modest to protect model context, and reuse a returned nextByte as afterByte for incremental reads.",
+      "Use one-shot watches for output, exit, or inactivity conditions instead of polling. Cancel an active watch with action=unwatch.",
     ],
     promptSnippet:
       "Start, inspect, read, or stop session-scoped background shell tasks",
