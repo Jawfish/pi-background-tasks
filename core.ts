@@ -18,6 +18,7 @@ export const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 export const KILL_GRACE_MS = 1000;
 export const MAX_WATCHES_PER_TASK = 8;
 export const MAX_WATCH_PATTERN_BYTES = 512;
+export const WATCH_REARM_COOLDOWN_MS = 1000;
 export const DEFAULT_SHELL = "sh";
 export const BACKGROUND_TASK_SHELL_ENV = "PI_BACKGROUND_TASK_SHELL";
 
@@ -116,7 +117,9 @@ type ShellOutcome = {
 };
 
 type RuntimeWatch = TaskWatchSnapshot & {
+  inactivityHandle?: NodeJS.Timeout;
   outputOverlap?: Buffer;
+  signature: string;
 };
 
 type RuntimeTask = TaskSnapshot & {
@@ -147,6 +150,7 @@ export interface BackgroundTaskManagerOptions {
   maxRetainedTasks?: number;
   maxOutputBytes?: number;
   maxWatchesPerTask?: number;
+  watchRearmCooldownMs?: number;
   killGraceMs?: number;
   shell?: string;
   writeLogChunk?: (
@@ -288,11 +292,13 @@ export const formatModelContext = function formatModelContext(
 export class BackgroundTaskManager {
   readonly #tasks = new Map<string, RuntimeTask>();
   readonly #watches = new Map<string, RuntimeWatch>();
+  readonly #watchCooldowns = new Map<string, number>();
   readonly #maxActiveTasks: number;
   readonly #maxRecentTasks: number;
   readonly #maxRetainedTasks: number;
   readonly #maxOutputBytes: number;
   readonly #maxWatchesPerTask: number;
+  readonly #watchRearmCooldownMs: number;
   readonly #killGraceMs: number;
   readonly #shell: string;
   readonly #writeLogChunk: (
@@ -322,6 +328,8 @@ export class BackgroundTaskManager {
     this.#maxOutputBytes = options.maxOutputBytes ?? MAX_OUTPUT_BYTES;
     this.#maxWatchesPerTask =
       options.maxWatchesPerTask ?? MAX_WATCHES_PER_TASK;
+    this.#watchRearmCooldownMs =
+      options.watchRearmCooldownMs ?? WATCH_REARM_COOLDOWN_MS;
     this.#killGraceMs = options.killGraceMs ?? KILL_GRACE_MS;
     this.#shell =
       options.shell ??
@@ -442,6 +450,14 @@ export class BackgroundTaskManager {
     ) {
       throw new Error("An identical watch is already active for this task");
     }
+    const signature = BackgroundTaskManager.#watchSignature(task.id, input);
+    const lastFiredAt = this.#watchCooldowns.get(signature);
+    if (
+      lastFiredAt !== undefined &&
+      Date.now() - lastFiredAt < this.#watchRearmCooldownMs
+    ) {
+      throw new Error("An identical watch is still in its rearm cooldown");
+    }
 
     const id = this.#newWatchId();
     const watch: RuntimeWatch = {
@@ -452,12 +468,16 @@ export class BackgroundTaskManager {
       outputOverlap:
         input.condition === "output" ? Buffer.alloc(0) : undefined,
       pattern,
+      signature,
       status: "active",
       taskId: task.id,
       wake: input.wake ?? false,
     };
     task.watchState.set(id, watch);
     this.#watches.set(id, watch);
+    if (watch.condition === "inactivity") {
+      this.#scheduleInactivityWatch(task, watch);
+    }
     this.#notifyChange();
     return BackgroundTaskManager.#watchSnapshot(watch);
   }
@@ -466,6 +486,10 @@ export class BackgroundTaskManager {
     const watch = this.#resolveWatch(idOrPrefix);
     if (watch.status !== "active") {
       throw new Error(`Watch ${watch.id} is already ${watch.status}`);
+    }
+    if (watch.inactivityHandle) {
+      clearTimeout(watch.inactivityHandle);
+      watch.inactivityHandle = undefined;
     }
     watch.status = "cancelled";
     watch.endedAt = Date.now();
@@ -781,6 +805,18 @@ export class BackgroundTaskManager {
     }
   }
 
+  static #watchSignature(
+    taskId: string,
+    input: CreateTaskWatchInput
+  ): string {
+    return JSON.stringify([
+      taskId,
+      input.condition,
+      input.pattern ?? null,
+      input.inactivitySeconds ?? null,
+    ]);
+  }
+
   #newWatchId(): string {
     for (;;) {
       const id = randomBytes(4).toString("hex");
@@ -952,6 +988,7 @@ export class BackgroundTaskManager {
     if (accepted.length > 0) {
       task.acceptedBytes += accepted.length;
       task.lastOutputAt = Date.now();
+      this.#resetInactivityWatches(task);
       const canContinue = this.#writeLog(task, accepted, true);
       if (!canContinue && "pause" in source && "resume" in source) {
         source.pause();
@@ -1030,9 +1067,14 @@ export class BackgroundTaskManager {
     if (watch.status !== "active") {
       return;
     }
+    if (watch.inactivityHandle) {
+      clearTimeout(watch.inactivityHandle);
+      watch.inactivityHandle = undefined;
+    }
     watch.status = "fired";
     watch.endedAt = Date.now();
     watch.outputOverlap = undefined;
+    this.#watchCooldowns.set(watch.signature, watch.endedAt);
     const event: TaskWatchEvent = {
       nextByte: watch.nextByte,
       output,
@@ -1046,6 +1088,58 @@ export class BackgroundTaskManager {
     } catch {
       // A watch callback failure must not change task state.
     }
+  }
+
+  #resetInactivityWatches(task: RuntimeTask): void {
+    if (task.status !== "running") {
+      return;
+    }
+    for (const watch of task.watchState.values()) {
+      if (watch.status === "active" && watch.condition === "inactivity") {
+        this.#scheduleInactivityWatch(task, watch);
+      }
+    }
+  }
+
+  #scheduleInactivityWatch(
+    task: RuntimeTask,
+    watch: RuntimeWatch
+  ): void {
+    if (watch.inactivityHandle) {
+      clearTimeout(watch.inactivityHandle);
+    }
+    const quietSince = task.lastOutputAt ?? watch.createdAt;
+    const durationMs = (watch.inactivitySeconds ?? 0) * 1000;
+    const delay = Math.max(0, quietSince + durationMs - Date.now());
+    watch.inactivityHandle = setTimeout(() => {
+      watch.inactivityHandle = undefined;
+      if (watch.status !== "active") {
+        return;
+      }
+      if (this.#shuttingDown || task.status !== "running") {
+        this.#expireWatch(watch);
+        return;
+      }
+      const latestOutput = task.lastOutputAt ?? watch.createdAt;
+      if (latestOutput + durationMs > Date.now()) {
+        this.#scheduleInactivityWatch(task, watch);
+        return;
+      }
+      watch.startByte = task.bytesWritten;
+      watch.nextByte = task.bytesWritten;
+      this.#fireWatch(task, watch);
+    }, delay);
+    watch.inactivityHandle.unref();
+  }
+
+  #expireWatch(watch: RuntimeWatch, endedAt = Date.now()): void {
+    if (watch.inactivityHandle) {
+      clearTimeout(watch.inactivityHandle);
+      watch.inactivityHandle = undefined;
+    }
+    watch.outputOverlap = undefined;
+    watch.status = "expired";
+    watch.endedAt = endedAt;
   }
 
   #finishAfterCleanup(task: RuntimeTask): Promise<void> {
@@ -1270,19 +1364,23 @@ export class BackgroundTaskManager {
       );
     }
 
-    const watchEndedAt = Date.now();
-    for (const watch of task.watchState.values()) {
-      if (watch.status === "active") {
-        watch.status = "expired";
-        watch.endedAt = watchEndedAt;
-      }
-    }
-
     task.status = finalStatus;
     task.exitCode = code;
     task.signal = signal;
     task.error = finalError;
     task.endedAt = Date.now();
+    for (const watch of task.watchState.values()) {
+      if (watch.status !== "active") {
+        continue;
+      }
+      if (watch.condition === "exit") {
+        watch.startByte = task.bytesWritten;
+        watch.nextByte = task.bytesWritten;
+        this.#fireWatch(task, watch);
+      } else {
+        this.#expireWatch(watch, task.endedAt);
+      }
+    }
     this.#finishedSequence += 1;
     task.finishedOrder = this.#finishedSequence;
 
@@ -1321,6 +1419,7 @@ export class BackgroundTaskManager {
       this.#tasks.delete(task.id);
       for (const watch of task.watchState.values()) {
         this.#watches.delete(watch.id);
+        this.#watchCooldowns.delete(watch.signature);
       }
       try {
         rmSync(task.logPath, { force: true });

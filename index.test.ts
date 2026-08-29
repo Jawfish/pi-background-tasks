@@ -409,6 +409,68 @@ describe("background tasks extension", () => {
     await harness.emit("session_shutdown");
   });
 
+  test("delivers exit watches with terminal cursor metadata", async () => {
+    const harness = createHarness();
+    await harness.emit("session_start");
+    const started = await harness.execute({
+      action: "start",
+      command: "sleep 0.05; printf done",
+      name: "Finite watch",
+    });
+    const watched = await harness.execute({
+      action: "watch",
+      condition: "exit",
+      taskId: started.details.task?.id,
+      wake: true,
+    });
+    await waitForCompletion();
+
+    expect(harness.sentMessages).toHaveLength(1);
+    const message = harness.sentMessages[0]?.message as {
+      customType?: string;
+      details?: {
+        watches?: {
+          condition?: string;
+          id?: string;
+          nextByte?: number;
+          startByte?: number;
+          status?: string;
+        }[];
+      };
+    };
+    expect(message.customType).toBe("background-task-watch");
+    expect(message.details?.watches?.[0]).toMatchObject({
+      condition: "exit",
+      id: watched.details.watch?.id,
+      nextByte: 4,
+      startByte: 4,
+      status: "fired",
+    });
+
+    await harness.emit("session_shutdown");
+  });
+
+  test("suppresses exit-watch delivery during shutdown", async () => {
+    const harness = createHarness();
+    await harness.emit("session_start");
+    const started = await harness.execute({
+      action: "start",
+      command: "sleep 30",
+      name: "Shutdown watch",
+    });
+    await harness.execute({
+      action: "watch",
+      condition: "exit",
+      taskId: started.details.task?.id,
+      wake: true,
+    });
+
+    await harness.emit("session_shutdown");
+    await waitForCompletion();
+
+    expect(harness.sentMessages).toHaveLength(0);
+  });
+
   test("returns incremental log cursor metadata", async () => {
     const harness = createHarness();
     await harness.emit("session_start");

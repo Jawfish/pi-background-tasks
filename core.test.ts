@@ -511,7 +511,12 @@ describe("BackgroundTaskManager", () => {
     await waitForTerminal(manager, started.id);
     expect(manager.watchStatus(started.id)).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ id: exit.id, status: "expired" }),
+        expect.objectContaining({
+          id: exit.id,
+          nextByte: 0,
+          startByte: 0,
+          status: "fired",
+        }),
         expect.objectContaining({ id: inactivity.id, status: "expired" }),
       ])
     );
@@ -563,6 +568,116 @@ describe("BackgroundTaskManager", () => {
     expect(logs.output).toContain("ready🙂");
     expect(events).toHaveLength(1);
     expect(manager.watchStatus(started.id)[0]?.status).toBe("fired");
+
+    manager.stop(started.id);
+    await waitForTerminal(manager, started.id);
+  });
+
+  test("resets inactivity watches when new output arrives", async () => {
+    const fired = Promise.withResolvers<TaskWatchEvent>();
+    const manager = await createManager({
+      onWatchFired: (event) => fired.resolve(event),
+    });
+    const started = await manager.start({
+      command: "sleep 0.04; printf a; sleep 0.04; printf b; sleep 30",
+      cwd: process.cwd(),
+    });
+    const watch = manager.watch(started.id, {
+      condition: "inactivity",
+      inactivitySeconds: 0.08,
+      wake: true,
+    });
+
+    const event = await Promise.race([
+      fired.promise,
+      sleep(2000).then(() => {
+        throw new Error("Inactivity watch did not fire");
+      }),
+    ]);
+
+    expect(event.watch).toMatchObject({
+      id: watch.id,
+      nextByte: 2,
+      startByte: 2,
+      status: "fired",
+    });
+    expect(event.task.status).toBe("running");
+    expect(event.task.lastOutputAt).toBeGreaterThan(watch.createdAt);
+
+    manager.stop(started.id);
+    await waitForTerminal(manager, started.id);
+  });
+
+  test("fires exit watches and expires impossible watches", async () => {
+    const events: TaskWatchEvent[] = [];
+    const manager = await createManager({
+      onWatchFired: (event) => events.push(event),
+    });
+    const started = await manager.start({
+      command: "sleep 0.05; printf done",
+      cwd: process.cwd(),
+    });
+    const exit = manager.watch(started.id, {
+      condition: "exit",
+      wake: true,
+    });
+    const output = manager.watch(started.id, {
+      condition: "output",
+      pattern: "never",
+    });
+    const inactivity = manager.watch(started.id, {
+      condition: "inactivity",
+      inactivitySeconds: 30,
+    });
+
+    const terminal = await waitForTerminal(manager, started.id);
+    const watches = manager.watchStatus(started.id);
+
+    expect(terminal.status).toBe("completed");
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      nextByte: 4,
+      startByte: 4,
+      task: { status: "completed" },
+      watch: { id: exit.id, status: "fired" },
+    });
+    expect(watches).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: output.id, status: "expired" }),
+        expect.objectContaining({ id: inactivity.id, status: "expired" }),
+      ])
+    );
+  });
+
+  test("enforces cooldown before rearming a fired watch", async () => {
+    const fired = Promise.withResolvers<TaskWatchEvent>();
+    const manager = await createManager({
+      onWatchFired: (event) => fired.resolve(event),
+      watchRearmCooldownMs: 25,
+    });
+    const started = await manager.start({
+      command: "sleep 0.05; printf ready; sleep 30",
+      cwd: process.cwd(),
+    });
+    const first = manager.watch(started.id, {
+      condition: "output",
+      pattern: "ready",
+    });
+    await fired.promise;
+
+    expect(() =>
+      manager.watch(started.id, {
+        condition: "output",
+        pattern: "ready",
+      })
+    ).toThrow("rearm cooldown");
+    await sleep(30);
+    const rearmed = manager.watch(started.id, {
+      condition: "output",
+      pattern: "ready",
+    });
+    expect(rearmed.id).not.toBe(first.id);
+    manager.unwatch(rearmed.id);
 
     manager.stop(started.id);
     await waitForTerminal(manager, started.id);
