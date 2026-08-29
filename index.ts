@@ -24,6 +24,7 @@ import {
   renderCompletionMessage,
   sanitizeUiInline,
   TaskDashboardComponent,
+  TaskDashboardReadState,
 } from "./tui.ts";
 import type {
   BackgroundTaskToolDetails,
@@ -541,6 +542,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
   let shuttingDown = false;
   let wakeHandle: NodeJS.Timeout | undefined;
   let activeDashboard: TaskDashboardComponent | undefined;
+  const dashboardReadState = new TaskDashboardReadState();
   const deliveryLedger = new CompletionDeliveryLedger();
   const unacknowledgedFailures = new Map<string, TaskSnapshot>();
   // Callbacks close over the manager, so initialization follows their definitions.
@@ -939,6 +941,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
               keybindings,
               manager,
               onClose: () => done(),
+              readState: dashboardReadState,
               theme,
               tui,
             });

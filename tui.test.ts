@@ -8,12 +8,17 @@ import {
   visibleWidth,
 } from "@earendil-works/pi-tui";
 
-import type { TaskLogs, TaskSnapshot } from "./core.ts";
+import type {
+  TaskLogs,
+  TaskSnapshot,
+  TaskWatchSnapshot,
+} from "./core.ts";
 import {
   renderBackgroundTaskCall,
   renderBackgroundTaskResult,
   renderCompletionMessage,
   TaskDashboardComponent,
+  TaskDashboardReadState,
 } from "./tui.ts";
 
 const components: TaskDashboardComponent[] = [];
@@ -61,6 +66,7 @@ const createTui = function createTui(rows: number, columns = 100) {
 
 const createDashboard = function createDashboard(options: {
   logs?: TaskLogs;
+  readState?: TaskDashboardReadState;
   rows?: number;
   tasks?: TaskSnapshot[];
 }) {
@@ -95,6 +101,7 @@ const createDashboard = function createDashboard(options: {
     keybindings: new KeybindingsManager(TUI_KEYBINDINGS),
     manager,
     onClose() {},
+    readState: options.readState,
     theme,
     tui,
   });
@@ -150,6 +157,7 @@ describe("background task dashboard", () => {
     const selected = task();
     const first = Promise.withResolvers<TaskLogs>();
     const second = Promise.withResolvers<TaskLogs>();
+    const readState = new TaskDashboardReadState();
     let logCalls = 0;
     const manager = {
       list: () => [{ ...selected }],
@@ -164,6 +172,7 @@ describe("background task dashboard", () => {
       keybindings: new KeybindingsManager(TUI_KEYBINDINGS),
       manager,
       onClose() {},
+      readState,
       theme,
       tui,
     });
@@ -173,7 +182,9 @@ describe("background task dashboard", () => {
     component.handleInput("r");
     const makeLogs = (output: string): TaskLogs => ({
       bytesRead: output.length,
+      nextByte: output.length,
       output,
+      startByte: 0,
       task: selected,
       text: output,
       totalBytes: output.length,
@@ -190,6 +201,7 @@ describe("background task dashboard", () => {
     expect(logCalls).toBe(2);
     expect(rendered).toContain("new response");
     expect(rendered).not.toContain("stale response");
+    expect(readState.cursor(selected.id)).toBe("new response".length);
   });
 
   test("ignores a stale log failure after a newer success", async () => {
@@ -237,6 +249,215 @@ describe("background task dashboard", () => {
     expect(rendered).toContain("new response");
     expect(rendered).not.toContain("stale failure");
     expect(rendered).not.toContain("Could not read log");
+  });
+
+  test("preserves read cursors across reopen and releases pruned tasks", async () => {
+    const selected = task({ bytesWritten: 12 });
+    const readState = new TaskDashboardReadState();
+    const requestedCursors: number[] = [];
+    const manager = {
+      list: () => [{ ...selected }],
+      logs: (
+        _id: string,
+        _requestedBytes?: number,
+        afterByte = 0
+      ): Promise<TaskLogs> => {
+        requestedCursors.push(afterByte);
+        return Promise.resolve({
+          bytesRead: selected.bytesWritten - afterByte,
+          nextByte: selected.bytesWritten,
+          output: `bytes after ${String(afterByte)}`,
+          startByte: afterByte,
+          task: { ...selected },
+          text: "unused",
+          totalBytes: selected.bytesWritten,
+          truncated: false,
+        });
+      },
+      stop: () => ({ ...selected, status: "stopping" as const }),
+    };
+    const openDashboard = () => {
+      const { tui } = createTui(30);
+      const component = new TaskDashboardComponent({
+        keybindings: new KeybindingsManager(TUI_KEYBINDINGS),
+        manager,
+        onClose() {},
+        readState,
+        theme,
+        tui,
+      });
+      components.push(component);
+      component.handleInput("\r");
+      return component;
+    };
+
+    const first = openDashboard();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(requestedCursors).toEqual([0]);
+    expect(readState.cursor(selected.id)).toBe(12);
+    first.dispose();
+
+    selected.bytesWritten = 20;
+    const reopened = openDashboard();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(requestedCursors).toEqual([0, 12]);
+    expect(readState.cursor(selected.id)).toBe(20);
+    reopened.dispose();
+
+    const empty = createDashboard({ readState, tasks: [] });
+    expect(empty.component).toBeDefined();
+    expect(readState.cursor(selected.id)).toBe(0);
+  });
+
+  test("updates unread counts for open, closed, and switched tasks", async () => {
+    const first = task({ bytesWritten: 12, id: "first001" });
+    const second = task({
+      bytesWritten: 20,
+      id: "second02",
+      status: "completed",
+    });
+    const source = [first, second];
+    const readState = new TaskDashboardReadState();
+    readState.markRead(first.id, 4);
+    readState.markRead(second.id, 5);
+    const requests: { afterByte: number; taskId: string }[] = [];
+    const manager = {
+      list: () => source.map((item) => ({ ...item })),
+      logs: (
+        taskId: string,
+        _requestedBytes?: number,
+        afterByte = 0
+      ): Promise<TaskLogs> => {
+        const selected = source.find((item) => item.id === taskId)!;
+        requests.push({ afterByte, taskId });
+        return Promise.resolve({
+          bytesRead: selected.bytesWritten - afterByte,
+          nextByte: selected.bytesWritten,
+          output: `new ${taskId}`,
+          startByte: afterByte,
+          task: { ...selected },
+          text: "unused",
+          totalBytes: selected.bytesWritten,
+          truncated: false,
+        });
+      },
+      stop: (taskId: string) =>
+        ({ ...source.find((item) => item.id === taskId)! }),
+    };
+    const { tui } = createTui(30);
+    const component = new TaskDashboardComponent({
+      keybindings: new KeybindingsManager(TUI_KEYBINDINGS),
+      manager,
+      onClose() {},
+      readState,
+      theme,
+      tui,
+    });
+    components.push(component);
+
+    let rendered = stripTerminalSequences(component.render(100).join("\n"));
+    expect(rendered).toContain("+8 B unread");
+    expect(rendered).toContain("+15 B unread");
+
+    component.handleInput("\r");
+    await Promise.resolve();
+    await Promise.resolve();
+    rendered = stripTerminalSequences(component.render(100).join("\n"));
+    expect(rendered).toContain("read through byte 12 of 12");
+    expect(readState.cursor(first.id)).toBe(12);
+    expect(readState.cursor(second.id)).toBe(5);
+
+    component.handleInput("\r");
+    first.bytesWritten = 18;
+    component.refresh();
+    rendered = stripTerminalSequences(component.render(100).join("\n"));
+    expect(rendered).toContain("+6 B unread");
+
+    component.handleInput("\r");
+    await Promise.resolve();
+    await Promise.resolve();
+    component.handleInput("j");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(requests).toEqual([
+      { afterByte: 4, taskId: first.id },
+      { afterByte: 12, taskId: first.id },
+      { afterByte: 5, taskId: second.id },
+    ]);
+    expect(readState.cursor(first.id)).toBe(18);
+    expect(readState.cursor(second.id)).toBe(20);
+  });
+
+  test("renders bounded active and historical watch state", () => {
+    const now = Date.now();
+    const watches: TaskWatchSnapshot[] = [
+      {
+        condition: "output",
+        createdAt: now,
+        id: "watch001",
+        pattern: `ready-${"x".repeat(160)}\u001b]2;owned\u0007`,
+        status: "active",
+        taskId: "watched1",
+        wake: true,
+      },
+      {
+        condition: "exit",
+        createdAt: now - 1,
+        endedAt: now,
+        id: "watch002",
+        status: "fired",
+        taskId: "watched1",
+        wake: false,
+      },
+      {
+        condition: "inactivity",
+        createdAt: now - 2,
+        endedAt: now,
+        id: "watch003",
+        inactivitySeconds: 30,
+        status: "cancelled",
+        taskId: "watched1",
+        wake: false,
+      },
+      {
+        condition: "output",
+        createdAt: now - 3,
+        endedAt: now,
+        id: "watch004",
+        pattern: "timeout",
+        status: "expired",
+        taskId: "watched1",
+        wake: false,
+      },
+    ];
+    const watched = task({
+      bytesWritten: 0,
+      id: "watched1",
+      watches,
+    });
+    const dashboard = createDashboard({ rows: 50, tasks: [watched] });
+
+    for (const width of [44, 100]) {
+      const lines = dashboard.component.render(width);
+      expect(lines.every((line) => visibleWidth(line) === width)).toBe(true);
+      const rendered = stripTerminalSequences(lines.join("\n"));
+      if (width === 100) {
+        expect(rendered).toContain("4 watches");
+      } else {
+        expect(rendered).toContain("● run");
+      }
+      for (const status of ["active", "fired", "cancelled", "expired"]) {
+        expect(rendered).toContain(`${status} watch`);
+      }
+      if (width === 100) {
+        expect(rendered).toContain("wake model");
+      }
+      expect(rendered).not.toContain("owned");
+      expect(rendered).not.toContain("x".repeat(100));
+    }
   });
 
   test("loads a sanitized log tail without rendering terminal controls", async () => {

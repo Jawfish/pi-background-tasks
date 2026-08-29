@@ -242,6 +242,38 @@ const effectiveCompletionPolicy = function effectiveCompletionPolicy(
   return fallback;
 };
 
+const WATCH_STATUS_COLOR: Record<
+  TaskWatchSnapshot["status"],
+  "accent" | "dim" | "success" | "warning"
+> = {
+  active: "accent",
+  cancelled: "dim",
+  expired: "warning",
+  fired: "success",
+};
+
+const formatDashboardWatch = function formatDashboardWatch(
+  watch: TaskWatchSnapshot,
+  theme: Theme
+): string {
+  let condition: string;
+  if (watch.condition === "output") {
+    const pattern = truncateToWidth(
+      cleanInline(watch.pattern ?? ""),
+      64,
+      "…",
+      true
+    );
+    condition = pattern ? `output “${pattern}”` : "output";
+  } else if (watch.condition === "inactivity") {
+    condition = `inactivity ${String(watch.inactivitySeconds ?? 0)}s`;
+  } else {
+    condition = "exit";
+  }
+  const wake = watch.wake ? " · wake model" : "";
+  return ` ${theme.fg(WATCH_STATUS_COLOR[watch.status], watch.status)} watch ${theme.fg("accent", watch.id)}${wake} · ${condition}`;
+};
+
 const renderTaskRow = function renderTaskRow(
   task: TaskSnapshot,
   theme: Theme,
@@ -604,8 +636,38 @@ export const renderCompletionMessage = function renderCompletionMessage(
 
 interface DashboardManager {
   list(): TaskSnapshot[];
-  logs(idOrPrefix: string, requestedBytes?: number): Promise<TaskLogs>;
+  logs(
+    idOrPrefix: string,
+    requestedBytes?: number,
+    afterByte?: number
+  ): Promise<TaskLogs>;
   stop(idOrPrefix: string): TaskSnapshot;
+}
+
+/** User-facing log cursors shared by dashboard instances in one session. */
+export class TaskDashboardReadState {
+  readonly #cursors = new Map<string, number>();
+
+  cursor(taskId: string): number {
+    return this.#cursors.get(taskId) ?? 0;
+  }
+
+  markRead(taskId: string, nextByte: number): void {
+    const cursor = Math.max(0, Math.floor(nextByte));
+    this.#cursors.set(taskId, Math.max(this.cursor(taskId), cursor));
+  }
+
+  retain(taskIds: ReadonlySet<string>): void {
+    for (const taskId of this.#cursors.keys()) {
+      if (!taskIds.has(taskId)) {
+        this.#cursors.delete(taskId);
+      }
+    }
+  }
+
+  unreadBytes(task: TaskSnapshot, committedBytes = task.bytesWritten): number {
+    return Math.max(0, committedBytes - this.cursor(task.id));
+  }
 }
 
 interface DashboardFlash {
@@ -638,6 +700,7 @@ export class TaskDashboardComponent implements Component {
   readonly #tui: TUI;
   readonly #keybindings: KeybindingsManager;
   readonly #onClose: () => void;
+  readonly #readState: TaskDashboardReadState;
   #tasks: TaskSnapshot[] = [];
   #selectedIndex = 0;
   #showLogs = false;
@@ -657,6 +720,7 @@ export class TaskDashboardComponent implements Component {
     keybindings: KeybindingsManager;
     manager: BackgroundTaskManager | DashboardManager;
     onClose: () => void;
+    readState?: TaskDashboardReadState;
     theme: Theme;
     tui: TUI;
   }) {
@@ -665,6 +729,7 @@ export class TaskDashboardComponent implements Component {
     this.#tui = options.tui;
     this.#keybindings = options.keybindings;
     this.#onClose = options.onClose;
+    this.#readState = options.readState ?? new TaskDashboardReadState();
     this.refresh();
     this.#interval = setInterval(() => this.refresh(), DASHBOARD_REFRESH_MS);
     this.#interval.unref();
@@ -677,6 +742,7 @@ export class TaskDashboardComponent implements Component {
     const selectedId = this.#tasks[this.#selectedIndex]?.id;
     try {
       this.#tasks = this.#manager.list();
+      this.#readState.retain(new Set(this.#tasks.map((task) => task.id)));
       if (selectedId) {
         const nextIndex = this.#tasks.findIndex((task) => task.id === selectedId);
         this.#selectedIndex = nextIndex >= 0 ? nextIndex : this.#selectedIndex;
@@ -788,7 +854,7 @@ export class TaskDashboardComponent implements Component {
     );
     const detailRows = Math.max(
       2,
-      Math.min(this.#showLogs ? 8 : 5, usableRows - listRows)
+      Math.min(this.#showLogs ? 8 : 10, usableRows - listRows)
     );
     this.#lastListRows = listRows;
 
@@ -934,6 +1000,22 @@ export class TaskDashboardComponent implements Component {
           ? this.#theme.fg("accent", " ↻")
           : "";
       const terminal = terminalSummary(task);
+      const unreadBytes = this.#readState.unreadBytes(task);
+      const unread =
+        unreadBytes > 0
+          ? this.#theme.fg(
+              "warning",
+              `+${formatUiBytes(unreadBytes)} unread`
+            )
+          : "";
+      const watchCount = task.watches?.length ?? 0;
+      const watches =
+        watchCount > 0
+          ? this.#theme.fg(
+              "accent",
+              `${String(watchCount)} ${watchCount === 1 ? "watch" : "watches"}`
+            )
+          : "";
       const content = [
         selected ? this.#theme.fg("accent", " ›") : "  ",
         styledStatus(task.status, this.#theme, false),
@@ -941,6 +1023,8 @@ export class TaskDashboardComponent implements Component {
         this.#theme.fg("accent", task.id),
         this.#theme.fg("text", cleanInline(task.name)),
         terminal ? this.#theme.fg("muted", `(${terminal})`) : "",
+        unread,
+        watches,
         policy,
       ]
         .filter(Boolean)
@@ -959,13 +1043,19 @@ export class TaskDashboardComponent implements Component {
       return ` ${this.#theme.fg("dim", "Task details")}`;
     }
     if (this.#showLogs) {
-      const counts =
-        this.#logs?.bytesRead === undefined
-          ? ""
-          : this.#logs.truncated
-            ? ` · tail ${formatUiBytes(this.#logs.bytesRead)} of ${formatUiBytes(this.#logs.totalBytes)}`
-            : ` · ${formatUiBytes(this.#logs.totalBytes)}`;
-      return ` ${this.#theme.fg("accent", this.#theme.bold("Log tail"))} · ${this.#theme.fg("text", cleanInline(task.name))}${this.#theme.fg("dim", counts)}`;
+      const committedBytes = Math.max(
+        task.bytesWritten,
+        this.#logsTaskId === task.id ? (this.#logs?.totalBytes ?? 0) : 0
+      );
+      const cursor = Math.min(
+        committedBytes,
+        this.#readState.cursor(task.id)
+      );
+      const unreadBytes = this.#readState.unreadBytes(task, committedBytes);
+      const range = ` · read through byte ${String(cursor)} of ${String(committedBytes)}`;
+      const unread =
+        unreadBytes > 0 ? ` · ${formatUiBytes(unreadBytes)} unread` : "";
+      return ` ${this.#theme.fg("accent", this.#theme.bold("Task log"))} · ${this.#theme.fg("text", cleanInline(task.name))}${this.#theme.fg("dim", `${range}${unread}`)}`;
     }
     return ` ${styledStatus(task.status, this.#theme)} · ${this.#theme.fg("text", this.#theme.bold(cleanInline(task.name)))}`;
   }
@@ -986,10 +1076,14 @@ export class TaskDashboardComponent implements Component {
           ? undefined
           : `timeout ${formatUiDuration(task.timeoutSeconds * 1000)}`,
       ].filter((value): value is string => value !== undefined);
+      const watchDetails = (task.watches ?? []).map((watch) =>
+        formatDashboardWatch(watch, this.#theme)
+      );
       details = [
         task.error ? ` ${this.#theme.fg("error", cleanInline(task.error))}` : undefined,
         ` ${this.#theme.fg("dim", "Command")}  ${cleanInline(task.command)}`,
         ` ${this.#theme.fg("dim", "Process")}  ${metadata.join(" · ")}`,
+        ...watchDetails,
         ` ${this.#theme.fg("dim", "Folder")}   ${cleanInline(task.cwd)}`,
         ` ${this.#theme.fg("dim", "Log")}      ${cleanInline(task.logPath)}`,
       ].filter((value): value is string => value !== undefined);
@@ -1118,7 +1212,11 @@ export class TaskDashboardComponent implements Component {
     this.#activeLogRequests += 1;
     this.#loadingLogs = true;
     try {
-      const logs = await this.#manager.logs(taskId, 16 * 1024);
+      const logs = await this.#manager.logs(
+        taskId,
+        16 * 1024,
+        this.#readState.cursor(taskId)
+      );
       if (
         this.#disposed ||
         requestSequence !== this.#logRequestSequence ||
@@ -1128,6 +1226,14 @@ export class TaskDashboardComponent implements Component {
       }
       this.#logs = logs;
       this.#logsTaskId = taskId;
+      this.#readState.markRead(taskId, logs.nextByte ?? logs.totalBytes);
+      const current = this.#tasks[this.#selectedIndex];
+      if (current) {
+        this.#tasks[this.#selectedIndex] = {
+          ...current,
+          bytesWritten: Math.max(current.bytesWritten, logs.totalBytes),
+        };
+      }
     } catch (error) {
       if (
         this.#disposed ||

@@ -585,11 +585,18 @@ describe("BackgroundTaskManager", () => {
 
     const cancelled = manager.unwatch(output.id.slice(0, 4));
     expect(cancelled.status).toBe("cancelled");
-    expect(manager.status(started.id)[0]?.watches).toHaveLength(2);
+    expect(manager.status(started.id)[0]?.watches).toHaveLength(3);
     expect(() => manager.unwatch(output.id)).toThrow("already cancelled");
 
     manager.stop(started.id);
-    await waitForTerminal(manager, started.id);
+    const terminal = await waitForTerminal(manager, started.id);
+    expect(terminal.watches).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: output.id, status: "cancelled" }),
+        expect.objectContaining({ id: exit.id, status: "fired" }),
+        expect.objectContaining({ id: inactivity.id, status: "expired" }),
+      ])
+    );
     expect(manager.watchStatus(started.id)).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
