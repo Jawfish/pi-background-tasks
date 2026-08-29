@@ -15,6 +15,7 @@ import type {
   BackgroundTaskManagerOptions,
   TaskCompletion,
   TaskSnapshot,
+  TaskWatchEvent,
 } from "./core.ts";
 
 const managers: BackgroundTaskManager[] = [];
@@ -467,6 +468,249 @@ describe("BackgroundTaskManager", () => {
     expect(terminal.status).toBe("stopped");
     expect(terminal.error).toContain("Could not inspect the process group");
     expect(terminal.error).toContain("Could not confirm process-group cleanup");
+  });
+
+  test("registers, inspects, and cancels bounded task watches", async () => {
+    const manager = await createManager({ maxWatchesPerTask: 3 });
+    const started = await manager.start({
+      command: "sleep 30",
+      cwd: process.cwd(),
+    });
+    const output = manager.watch(started.id, {
+      condition: "output",
+      pattern: "ready",
+      wake: true,
+    });
+    expect(() =>
+      manager.watch(started.id, {
+        condition: "output",
+        pattern: "ready",
+      })
+    ).toThrow("identical watch");
+    const exit = manager.watch(started.id, { condition: "exit" });
+    const inactivity = manager.watch(started.id, {
+      condition: "inactivity",
+      inactivitySeconds: 5,
+    });
+
+    expect(manager.status(started.id)[0]?.watches).toHaveLength(3);
+    expect(manager.watchStatus(started.id.slice(0, 4))).toHaveLength(3);
+    expect(() =>
+      manager.watch(started.id, {
+        condition: "output",
+        pattern: "another",
+      })
+    ).toThrow("At most 3 watches");
+
+    const cancelled = manager.unwatch(output.id.slice(0, 4));
+    expect(cancelled.status).toBe("cancelled");
+    expect(manager.status(started.id)[0]?.watches).toHaveLength(2);
+    expect(() => manager.unwatch(output.id)).toThrow("already cancelled");
+
+    manager.stop(started.id);
+    await waitForTerminal(manager, started.id);
+    expect(manager.watchStatus(started.id)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: exit.id,
+          nextByte: 0,
+          startByte: 0,
+          status: "fired",
+        }),
+        expect.objectContaining({ id: inactivity.id, status: "expired" }),
+      ])
+    );
+    expect(() =>
+      manager.watch(started.id, { condition: "exit" })
+    ).toThrow("because it is stopped");
+  });
+
+  test("fires an output watch once across committed chunks", async () => {
+    const events: TaskWatchEvent[] = [];
+    const fired = Promise.withResolvers<TaskWatchEvent>();
+    let logsAtFire: Promise<Awaited<ReturnType<BackgroundTaskManager["logs"]>>>;
+    const manager = await createManager({
+      onWatchFired(event) {
+        events.push(event);
+        logsAtFire = manager.logs(event.task.id, 32, event.startByte);
+        fired.resolve(event);
+      },
+    });
+    const started = await manager.start({
+      command:
+        "sleep 0.05; printf rea; sleep 0.05; printf 'dy🙂'; printf 'ready🙂'; sleep 30",
+      cwd: process.cwd(),
+    });
+    const watch = manager.watch(started.id, {
+      condition: "output",
+      pattern: "ready🙂",
+      wake: true,
+    });
+
+    const event = await Promise.race([
+      fired.promise,
+      sleep(2000).then(() => {
+        throw new Error("Output watch did not fire");
+      }),
+    ]);
+    const logs = await logsAtFire!;
+    await sleep(100);
+
+    expect(event.watch).toMatchObject({
+      id: watch.id,
+      matchedOutput: "ready🙂",
+      nextByte: 9,
+      startByte: 0,
+      status: "fired",
+    });
+    expect(event.task.status).toBe("running");
+    expect(event.output).toBe("ready🙂");
+    expect(logs.output).toContain("ready🙂");
+    expect(events).toHaveLength(1);
+    expect(manager.watchStatus(started.id)[0]?.status).toBe("fired");
+
+    manager.stop(started.id);
+    await waitForTerminal(manager, started.id);
+  });
+
+  test("resets inactivity watches when new output arrives", async () => {
+    const fired = Promise.withResolvers<TaskWatchEvent>();
+    const manager = await createManager({
+      onWatchFired: (event) => fired.resolve(event),
+    });
+    const started = await manager.start({
+      command: "sleep 0.04; printf a; sleep 0.04; printf b; sleep 30",
+      cwd: process.cwd(),
+    });
+    const watch = manager.watch(started.id, {
+      condition: "inactivity",
+      inactivitySeconds: 0.08,
+      wake: true,
+    });
+
+    const event = await Promise.race([
+      fired.promise,
+      sleep(2000).then(() => {
+        throw new Error("Inactivity watch did not fire");
+      }),
+    ]);
+
+    expect(event.watch).toMatchObject({
+      id: watch.id,
+      nextByte: 2,
+      startByte: 2,
+      status: "fired",
+    });
+    expect(event.task.status).toBe("running");
+    expect(event.task.lastOutputAt).toBeGreaterThan(watch.createdAt);
+
+    manager.stop(started.id);
+    await waitForTerminal(manager, started.id);
+  });
+
+  test("fires exit watches and expires impossible watches", async () => {
+    const events: TaskWatchEvent[] = [];
+    const manager = await createManager({
+      onWatchFired: (event) => events.push(event),
+    });
+    const started = await manager.start({
+      command: "sleep 0.05; printf done",
+      cwd: process.cwd(),
+    });
+    const exit = manager.watch(started.id, {
+      condition: "exit",
+      wake: true,
+    });
+    const output = manager.watch(started.id, {
+      condition: "output",
+      pattern: "never",
+    });
+    const inactivity = manager.watch(started.id, {
+      condition: "inactivity",
+      inactivitySeconds: 30,
+    });
+
+    const terminal = await waitForTerminal(manager, started.id);
+    const watches = manager.watchStatus(started.id);
+
+    expect(terminal.status).toBe("completed");
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      nextByte: 4,
+      startByte: 4,
+      task: { status: "completed" },
+      watch: { id: exit.id, status: "fired" },
+    });
+    expect(watches).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: output.id, status: "expired" }),
+        expect.objectContaining({ id: inactivity.id, status: "expired" }),
+      ])
+    );
+  });
+
+  test("enforces cooldown before rearming a fired watch", async () => {
+    const fired = Promise.withResolvers<TaskWatchEvent>();
+    const manager = await createManager({
+      onWatchFired: (event) => fired.resolve(event),
+      watchRearmCooldownMs: 25,
+    });
+    const started = await manager.start({
+      command: "sleep 0.05; printf ready; sleep 30",
+      cwd: process.cwd(),
+    });
+    const first = manager.watch(started.id, {
+      condition: "output",
+      pattern: "ready",
+    });
+    await fired.promise;
+
+    expect(() =>
+      manager.watch(started.id, {
+        condition: "output",
+        pattern: "ready",
+      })
+    ).toThrow("rearm cooldown");
+    await sleep(30);
+    const rearmed = manager.watch(started.id, {
+      condition: "output",
+      pattern: "ready",
+    });
+    expect(rearmed.id).not.toBe(first.id);
+    manager.unwatch(rearmed.id);
+
+    manager.stop(started.id);
+    await waitForTerminal(manager, started.id);
+  });
+
+  test("rejects invalid watch conditions", async () => {
+    const manager = await createManager();
+    const started = await manager.start({
+      command: "sleep 30",
+      cwd: process.cwd(),
+    });
+
+    expect(() =>
+      manager.watch(started.id, { condition: "output", pattern: "" })
+    ).toThrow("pattern is required");
+    expect(() =>
+      manager.watch(started.id, {
+        condition: "output",
+        pattern: "x".repeat(513),
+      })
+    ).toThrow("limited to 512 bytes");
+    expect(() =>
+      manager.watch(started.id, {
+        condition: "inactivity",
+        inactivitySeconds: 0,
+      })
+    ).toThrow("positive number");
+    expect(() =>
+      manager.watch(started.id, { condition: "exit", pattern: "bad" })
+    ).toThrow("do not accept");
+
+    manager.stop(started.id);
+    await waitForTerminal(manager, started.id);
   });
 
   test("enforces the active limit across concurrent starts", async () => {

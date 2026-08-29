@@ -11,8 +11,9 @@ import {
   formatModelContext,
   formatTaskList,
   MAX_LOG_READ_BYTES,
+  MAX_WATCH_PATTERN_BYTES,
 } from "./core.ts";
-import type { TaskCompletion } from "./core.ts";
+import type { TaskCompletion, TaskWatchEvent } from "./core.ts";
 import {
   formatUiDuration,
   renderBackgroundTaskCall,
@@ -34,9 +35,12 @@ const MAX_COMPLETION_OUTPUT_BYTES = 768;
 export const MAX_COMPLETION_MESSAGE_BYTES = 32 * 1024;
 
 const Parameters = Type.Object({
-  action: StringEnum(["start", "status", "logs", "stop"] as const, {
-    description: "Operation to perform",
-  }),
+  action: StringEnum(
+    ["start", "status", "logs", "stop", "watch", "unwatch"] as const,
+    {
+      description: "Operation to perform",
+    }
+  ),
   afterByte: Type.Optional(
     Type.Integer({
       description:
@@ -47,6 +51,18 @@ const Parameters = Type.Object({
   ),
   command: Type.Optional(
     Type.String({ description: "Shell command for action=start" })
+  ),
+  condition: Type.Optional(
+    StringEnum(["output", "exit", "inactivity"] as const, {
+      description: "Condition for action=watch",
+    })
+  ),
+  inactivitySeconds: Type.Optional(
+    Type.Integer({
+      description: "Quiet period for an inactivity watch",
+      maximum: 86_400,
+      minimum: 1,
+    })
   ),
   maxBytes: Type.Optional(
     Type.Integer({
@@ -61,10 +77,27 @@ const Parameters = Type.Object({
       maxLength: 60,
     })
   ),
+  pattern: Type.Optional(
+    Type.String({
+      description: "Literal UTF-8 text for an output watch",
+      maxLength: MAX_WATCH_PATTERN_BYTES,
+      minLength: 1,
+    })
+  ),
   taskId: Type.Optional(
     Type.String({
       description:
         "Task ID or unique prefix for status, logs, or stop. Omit for status to list all tasks.",
+    })
+  ),
+  watchId: Type.Optional(
+    Type.String({
+      description: "Watch ID or unique prefix for action=unwatch",
+    })
+  ),
+  wake: Type.Optional(
+    Type.Boolean({
+      description: "For action=watch, wake the model when the watch fires",
     })
   ),
   timeoutSeconds: Type.Optional(
@@ -84,36 +117,76 @@ const Parameters = Type.Object({
 
 export type CompletionDeliveryState = "pending" | "enqueued" | "observed";
 
-export interface CompletionDeliveryRecord {
-  completion: TaskCompletion;
+type DeliveryRecordBase = {
   deliveryId: string;
   state: CompletionDeliveryState;
+  taskId: string;
   wakeAttempted: boolean;
-}
+};
+
+export type CompletionDeliveryRecord = DeliveryRecordBase &
+  (
+    | { completion: TaskCompletion; kind: "completion" }
+    | { kind: "watch"; watchEvent: TaskWatchEvent }
+  );
 
 export class CompletionDeliveryLedger {
   readonly #records = new Map<string, CompletionDeliveryRecord>();
-  readonly #taskDeliveries = new Map<string, string>();
+  readonly #completionDeliveries = new Map<string, string>();
+  readonly #watchDeliveries = new Map<string, string>();
+  readonly #taskDeliveries = new Map<string, Set<string>>();
   #sequence = 0;
 
   add(completion: TaskCompletion): CompletionDeliveryRecord {
-    const existingId = this.#taskDeliveries.get(completion.task.id);
+    const existingId = this.#completionDeliveries.get(completion.task.id);
     if (existingId) {
       const existing = this.#records.get(existingId);
       if (existing) {
         return existing;
       }
     }
+    const record = this.#addRecord({ completion, kind: "completion" });
+    this.#completionDeliveries.set(completion.task.id, record.deliveryId);
+    return record;
+  }
+
+  addWatch(watchEvent: TaskWatchEvent): CompletionDeliveryRecord {
+    const existingId = this.#watchDeliveries.get(watchEvent.watch.id);
+    if (existingId) {
+      const existing = this.#records.get(existingId);
+      if (existing) {
+        return existing;
+      }
+    }
+    const record = this.#addRecord({ kind: "watch", watchEvent });
+    this.#watchDeliveries.set(watchEvent.watch.id, record.deliveryId);
+    return record;
+  }
+
+  #addRecord(
+    payload:
+      | { completion: TaskCompletion; kind: "completion" }
+      | { kind: "watch"; watchEvent: TaskWatchEvent }
+  ): CompletionDeliveryRecord {
     this.#sequence += 1;
-    const deliveryId = `completion:${completion.task.id}:${String(this.#sequence)}`;
+    const taskId =
+      payload.kind === "completion"
+        ? payload.completion.task.id
+        : payload.watchEvent.task.id;
+    const eventId =
+      payload.kind === "completion" ? taskId : payload.watchEvent.watch.id;
+    const deliveryId = `${payload.kind}:${eventId}:${String(this.#sequence)}`;
     const record: CompletionDeliveryRecord = {
-      completion,
+      ...payload,
       deliveryId,
       state: "pending",
+      taskId,
       wakeAttempted: false,
     };
     this.#records.set(deliveryId, record);
-    this.#taskDeliveries.set(completion.task.id, deliveryId);
+    const taskRecords = this.#taskDeliveries.get(taskId) ?? new Set<string>();
+    taskRecords.add(deliveryId);
+    this.#taskDeliveries.set(taskId, taskRecords);
     return record;
   }
 
@@ -160,10 +233,9 @@ export class CompletionDeliveryLedger {
 
   markObservedByTaskId(taskIds: readonly string[]): void {
     for (const taskId of taskIds) {
-      const deliveryId = this.#taskDeliveries.get(taskId);
-      if (deliveryId) {
-        this.markObservedByDeliveryId([deliveryId]);
-      }
+      this.markObservedByDeliveryId([
+        ...(this.#taskDeliveries.get(taskId) ?? []),
+      ]);
     }
   }
 }
@@ -184,7 +256,9 @@ const deliveryIdsInMessages = function deliveryIdsInMessages(
     const custom = message as { customType?: unknown; details?: unknown };
     if (
       custom.customType !== "background-task-completion" &&
-      custom.customType !== "background-task-completion-fallback"
+      custom.customType !== "background-task-completion-fallback" &&
+      custom.customType !== "background-task-watch" &&
+      custom.customType !== "background-task-watch-fallback"
     ) {
       continue;
     }
@@ -243,6 +317,49 @@ const escapeXmlTailWithinBytes = function escapeXmlTailWithinBytes(
   }
   parts.reverse();
   return { text: parts.join(""), truncated: false };
+};
+
+export const watchMessage = function watchMessage(
+  events: readonly TaskWatchEvent[],
+  deliveryIds: readonly string[] = []
+): string {
+  const lines = ["<background-task-watch-events>"];
+  for (const [index, event] of events.entries()) {
+    const deliveryId = deliveryIds[index];
+    const output = escapeXmlWithinBytes(
+      event.output ?? "",
+      MAX_COMPLETION_OUTPUT_BYTES
+    );
+    lines.push(
+      `  <watch id="${escapeXml(event.watch.id)}" task-id="${escapeXml(event.task.id)}"${deliveryId ? ` delivery-id="${escapeXml(deliveryId)}"` : ""}>`,
+      `    <condition>${event.watch.condition}</condition>`,
+      `    <task-status>${event.task.status}</task-status>`
+    );
+    if (event.startByte !== undefined && event.nextByte !== undefined) {
+      lines.push(
+        `    <range start-byte="${String(event.startByte)}" next-byte="${String(event.nextByte)}" />`
+      );
+    }
+    if (event.output !== undefined) {
+      lines.push(
+        `    <match truncated="${String(output.truncated)}">${output.text}</match>`
+      );
+    }
+    lines.push("  </watch>");
+  }
+  lines.push(
+    "  <guidance>Each listed one-shot watch has fired. Continue from the reported task state and log cursor without polling.</guidance>",
+    "</background-task-watch-events>"
+  );
+  const message = lines.join("\n");
+  if (Buffer.byteLength(message) <= MAX_COMPLETION_MESSAGE_BYTES) {
+    return message;
+  }
+  return [
+    "<background-task-watch-events>",
+    `  <omitted count="${String(events.length)}">Watch details exceeded the message byte limit.</omitted>`,
+    "</background-task-watch-events>",
+  ].join("\n");
 };
 
 export const completionMessage = function completionMessage(
@@ -356,48 +473,97 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     if (shuttingDown) {
       return;
     }
-    const candidates = deliveryLedger.wakeCandidates();
+    const batches: CompletionDeliveryRecord[][] = [];
+    for (const candidate of deliveryLedger.wakeCandidates()) {
+      const current = batches.at(-1);
+      if (
+        !current ||
+        current.length >= MAX_COMPLETION_TASKS ||
+        current[0]?.kind !== candidate.kind
+      ) {
+        batches.push([candidate]);
+      } else {
+        current.push(candidate);
+      }
+    }
+
     let wakeRequested = false;
-    for (
-      let offset = 0;
-      offset < candidates.length;
-      offset += MAX_COMPLETION_TASKS
-    ) {
+    for (const records of batches) {
       if (shuttingDown) {
         return;
       }
-      const records = candidates.slice(offset, offset + MAX_COMPLETION_TASKS);
       deliveryLedger.markWakeAttempted(records);
-      const completions = records.map((record) => record.completion);
+      const deliveryIds = records.map((record) => record.deliveryId);
       const triggerTurn: boolean = !wakeRequested;
+      const completionRecords = records.filter(
+        (record): record is Extract<
+          CompletionDeliveryRecord,
+          { kind: "completion" }
+        > => record.kind === "completion"
+      );
+      const watchRecords = records.filter(
+        (record): record is Extract<
+          CompletionDeliveryRecord,
+          { kind: "watch" }
+        > => record.kind === "watch"
+      );
       try {
-        pi.sendMessage(
-          {
-            content: completionMessage(
-              completions,
-              records.map((record) => record.deliveryId)
-            ),
-            customType: "background-task-completion",
-            details: {
-              deliveryIds: records.map((record) => record.deliveryId),
-              omitted: 0,
-              tasks: records.map(({ completion, deliveryId }) => ({
-                deliveryId,
-                error: completion.task.error,
-                exitCode: completion.task.exitCode,
-                id: completion.task.id,
-                name: completion.task.name,
-                output: completion.output,
-                outputError: completion.outputError,
-                outputTruncated: completion.outputTruncated,
-                signal: completion.task.signal,
-                status: completion.task.status,
-              })),
+        if (completionRecords.length > 0) {
+          pi.sendMessage(
+            {
+              content: completionMessage(
+                completionRecords.map((record) => record.completion),
+                deliveryIds
+              ),
+              customType: "background-task-completion",
+              details: {
+                deliveryIds,
+                omitted: 0,
+                tasks: completionRecords.map(
+                  ({ completion, deliveryId }) => ({
+                    deliveryId,
+                    error: completion.task.error,
+                    exitCode: completion.task.exitCode,
+                    id: completion.task.id,
+                    name: completion.task.name,
+                    output: completion.output,
+                    outputError: completion.outputError,
+                    outputTruncated: completion.outputTruncated,
+                    signal: completion.task.signal,
+                    status: completion.task.status,
+                  })
+                ),
+              },
+              display: true,
             },
-            display: true,
-          },
-          { deliverAs: "steer", triggerTurn }
-        );
+            { deliverAs: "steer", triggerTurn }
+          );
+        } else {
+          pi.sendMessage(
+            {
+              content: watchMessage(
+                watchRecords.map((record) => record.watchEvent),
+                deliveryIds
+              ),
+              customType: "background-task-watch",
+              details: {
+                deliveryIds,
+                watches: watchRecords.map(({ deliveryId, watchEvent }) => ({
+                  condition: watchEvent.watch.condition,
+                  deliveryId,
+                  id: watchEvent.watch.id,
+                  nextByte: watchEvent.nextByte,
+                  output: watchEvent.output,
+                  startByte: watchEvent.startByte,
+                  status: watchEvent.watch.status,
+                  taskId: watchEvent.task.id,
+                })),
+              },
+              display: false,
+            },
+            { deliverAs: "steer", triggerTurn }
+          );
+        }
         deliveryLedger.markEnqueued(records);
         wakeRequested ||= triggerTurn;
       } catch (error) {
@@ -405,6 +571,13 @@ const backgroundTasksExtension = function backgroundTasksExtension(
           `[background-tasks] automatic continuation failed: ${error instanceof Error ? error.message : String(error)}`
         );
       }
+    }
+  };
+
+  const scheduleWake = (): void => {
+    if (!wakeHandle) {
+      wakeHandle = setTimeout(flushWake, WAKE_BATCH_MS);
+      wakeHandle.unref();
     }
   };
 
@@ -440,15 +613,38 @@ const backgroundTasksExtension = function backgroundTasksExtension(
         );
       }
     }
-    if (shouldWake && !wakeHandle) {
-      wakeHandle = setTimeout(flushWake, WAKE_BATCH_MS);
-      wakeHandle.unref();
+    if (shouldWake) {
+      scheduleWake();
+    }
+  };
+
+  const handleWatchFired = (event: TaskWatchEvent): void => {
+    if (shuttingDown) {
+      return;
+    }
+    if (event.watch.wake) {
+      deliveryLedger.addWatch(event);
+      scheduleWake();
+    }
+    const ctx = currentCtx;
+    if (ctx?.hasUI) {
+      try {
+        ctx.ui.notify(
+          `${event.watch.condition} watch ${event.watch.id} fired for ${sanitizeUiInline(event.task.name)} (${event.task.id}).`,
+          "info"
+        );
+      } catch (error) {
+        console.error(
+          `[background-tasks] watch notification failed: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
     }
   };
 
   manager = new BackgroundTaskManager({
     onChange: updateUi,
     onFinished: handleFinished,
+    onWatchFired: handleWatchFired,
   });
 
   pi.registerMessageRenderer<CompletionDisplayDetails>(
@@ -460,7 +656,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
   pi.registerTool<typeof Parameters, BackgroundTaskToolDetails>({
     description: [
       "Manage session-scoped background shell tasks.",
-      "Actions: start, status, logs, stop.",
+      "Actions: start, status, logs, stop, watch, unwatch.",
       "Task status is injected before every model call, so status and logs are not polling tools.",
       `Log reads are capped at ${String(MAX_LOG_READ_BYTES)} bytes. Reuse nextByte as afterByte for incremental reads.`,
     ].join(" "),
@@ -546,6 +742,44 @@ const backgroundTasksExtension = function backgroundTasksExtension(
             details: { task },
           };
         }
+        case "watch": {
+          if (!params.taskId) {
+            throw new Error("taskId is required for action=watch");
+          }
+          if (!params.condition) {
+            throw new Error("condition is required for action=watch");
+          }
+          const watch = manager.watch(params.taskId, {
+            condition: params.condition,
+            inactivitySeconds: params.inactivitySeconds,
+            pattern: params.pattern,
+            wake: params.wake,
+          });
+          return {
+            content: [
+              {
+                text: `Watching ${watch.taskId} for ${watch.condition} (${watch.id}).`,
+                type: "text" as const,
+              },
+            ],
+            details: { watch },
+          };
+        }
+        case "unwatch": {
+          if (!params.watchId) {
+            throw new Error("watchId is required for action=unwatch");
+          }
+          const watch = manager.unwatch(params.watchId);
+          return {
+            content: [
+              {
+                text: `Cancelled ${watch.condition} watch ${watch.id}.`,
+                type: "text" as const,
+              },
+            ],
+            details: { watch },
+          };
+        }
         default: {
           const unsupported: never = params.action;
           throw new Error(
@@ -568,6 +802,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       "Set background_task wakeOnExit=true only when the agent must continue automatically after that task completes or fails.",
       "Do not poll background_task status or logs merely to wait. Current active status is injected before every model call, and wakeOnExit steers completion into the next model call or starts a turn when idle.",
       "Use background_task logs only when task output is needed. Keep maxBytes modest to protect model context, and reuse a returned nextByte as afterByte for incremental reads.",
+      "Use one-shot watches for output, exit, or inactivity conditions instead of polling. Cancel an active watch with action=unwatch.",
     ],
     promptSnippet:
       "Start, inspect, read, or stop session-scoped background shell tasks",
@@ -622,8 +857,10 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     deliveryLedger.markObservedByDeliveryId(
       deliveryIdsInMessages(event.messages)
     );
-    const fallback = deliveryLedger
-      .unobserved()
+    const unobserved = deliveryLedger.unobserved();
+    const fallbackKind = unobserved[0]?.kind;
+    const fallback = unobserved
+      .filter((record) => record.kind === fallbackKind)
       .slice(0, MAX_COMPLETION_TASKS);
     const messages = [
       ...event.messages,
@@ -642,22 +879,40 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       },
     ];
     if (fallback.length > 0) {
+      const deliveryIds = fallback.map((record) => record.deliveryId);
+      const completionRecords = fallback.filter(
+        (record): record is Extract<
+          CompletionDeliveryRecord,
+          { kind: "completion" }
+        > => record.kind === "completion"
+      );
+      const watchRecords = fallback.filter(
+        (record): record is Extract<
+          CompletionDeliveryRecord,
+          { kind: "watch" }
+        > => record.kind === "watch"
+      );
       messages.push({
-        content: completionMessage(
-          fallback.map((record) => record.completion),
-          fallback.map((record) => record.deliveryId)
-        ),
-        customType: "background-task-completion-fallback",
-        details: {
-          deliveryIds: fallback.map((record) => record.deliveryId),
-        },
+        content:
+          completionRecords.length > 0
+            ? completionMessage(
+                completionRecords.map((record) => record.completion),
+                deliveryIds
+              )
+            : watchMessage(
+                watchRecords.map((record) => record.watchEvent),
+                deliveryIds
+              ),
+        customType:
+          completionRecords.length > 0
+            ? "background-task-completion-fallback"
+            : "background-task-watch-fallback",
+        details: { deliveryIds },
         display: false,
         role: "custom" as const,
         timestamp: Date.now(),
       });
-      deliveryLedger.markObservedByDeliveryId(
-        fallback.map((record) => record.deliveryId)
-      );
+      deliveryLedger.markObservedByDeliveryId(deliveryIds);
     }
     return { messages };
   });

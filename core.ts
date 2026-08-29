@@ -16,6 +16,9 @@ export const MAX_LOG_READ_BYTES = 32 * 1024;
 export const MAX_COMPLETION_LOG_BYTES = 2 * 1024;
 export const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 export const KILL_GRACE_MS = 1000;
+export const MAX_WATCHES_PER_TASK = 8;
+export const MAX_WATCH_PATTERN_BYTES = 512;
+export const WATCH_REARM_COOLDOWN_MS = 1000;
 export const DEFAULT_SHELL = "sh";
 export const BACKGROUND_TASK_SHELL_ENV = "PI_BACKGROUND_TASK_SHELL";
 
@@ -25,6 +28,39 @@ export type TaskStatus =
   | "completed"
   | "failed"
   | "stopped";
+
+export type TaskWatchCondition = "output" | "exit" | "inactivity";
+export type TaskWatchStatus = "active" | "fired" | "cancelled" | "expired";
+
+export interface TaskWatchSnapshot {
+  id: string;
+  taskId: string;
+  condition: TaskWatchCondition;
+  status: TaskWatchStatus;
+  createdAt: number;
+  wake: boolean;
+  pattern?: string;
+  inactivitySeconds?: number;
+  endedAt?: number;
+  startByte?: number;
+  nextByte?: number;
+  matchedOutput?: string;
+}
+
+export interface TaskWatchEvent {
+  task: TaskSnapshot;
+  watch: TaskWatchSnapshot;
+  output?: string;
+  startByte?: number;
+  nextByte?: number;
+}
+
+export interface CreateTaskWatchInput {
+  condition: TaskWatchCondition;
+  pattern?: string;
+  inactivitySeconds?: number;
+  wake?: boolean;
+}
 
 export interface TaskSnapshot {
   id: string;
@@ -43,6 +79,7 @@ export interface TaskSnapshot {
   lastOutputAt?: number;
   wakeOnExit: boolean;
   timeoutSeconds?: number;
+  watches?: TaskWatchSnapshot[];
 }
 
 export interface StartTaskInput {
@@ -79,6 +116,12 @@ type ShellOutcome = {
   signal: NodeJS.Signals | null;
 };
 
+type RuntimeWatch = TaskWatchSnapshot & {
+  inactivityHandle?: NodeJS.Timeout;
+  outputOverlap?: Buffer;
+  signature: string;
+};
+
 type RuntimeTask = TaskSnapshot & {
   acceptedBytes: number;
   child: ChildProcessByStdio<null, Readable, Readable>;
@@ -97,6 +140,7 @@ type RuntimeTask = TaskSnapshot & {
   resolveClosed: () => void;
   resolveShellClosed: () => void;
   timeoutHandle?: NodeJS.Timeout;
+  watchState: Map<string, RuntimeWatch>;
 };
 
 export interface BackgroundTaskManagerOptions {
@@ -105,6 +149,8 @@ export interface BackgroundTaskManagerOptions {
   maxRecentTasks?: number;
   maxRetainedTasks?: number;
   maxOutputBytes?: number;
+  maxWatchesPerTask?: number;
+  watchRearmCooldownMs?: number;
   killGraceMs?: number;
   shell?: string;
   writeLogChunk?: (
@@ -114,6 +160,7 @@ export interface BackgroundTaskManagerOptions {
   ) => boolean;
   onChange?: () => void;
   onFinished?: (completion: TaskCompletion) => void;
+  onWatchFired?: (event: TaskWatchEvent) => void;
 }
 
 const isActiveStatus = function isActiveStatus(status: TaskStatus): boolean {
@@ -181,8 +228,11 @@ export const formatTaskList = function formatTaskList(
       terminal = ` signal=${task.signal}`;
     }
     const wake = task.wakeOnExit ? " wake=on" : "";
+    const watches = task.watches?.length
+      ? ` watches=${String(task.watches.length)}`
+      : "";
     const error = task.error ? ` error=${truncate(task.error, 120)}` : "";
-    return `${task.id} ${task.status} ${elapsed}${terminal}${wake}: ${task.name}${error}\n  log: ${task.logPath}`;
+    return `${task.id} ${task.status} ${elapsed}${terminal}${wake}${watches}: ${task.name}${error}\n  log: ${task.logPath}`;
   };
 
   return [
@@ -208,8 +258,11 @@ export const formatModelContext = function formatModelContext(
     lines.push("Active:");
     for (const task of active) {
       const wake = task.wakeOnExit ? ", automatic continuation enabled" : "";
+      const watches = task.watches?.length
+        ? `, ${String(task.watches.length)} active ${task.watches.length === 1 ? "watch" : "watches"}`
+        : "";
       lines.push(
-        `- ${task.id} [${task.status}${wake}] ${escapeXml(task.name)}; log: ${escapeXml(task.logPath)}`
+        `- ${task.id} [${task.status}${wake}${watches}] ${escapeXml(task.name)}; log: ${escapeXml(task.logPath)}`
       );
     }
   }
@@ -238,10 +291,14 @@ export const formatModelContext = function formatModelContext(
 
 export class BackgroundTaskManager {
   readonly #tasks = new Map<string, RuntimeTask>();
+  readonly #watches = new Map<string, RuntimeWatch>();
+  readonly #watchCooldowns = new Map<string, number>();
   readonly #maxActiveTasks: number;
   readonly #maxRecentTasks: number;
   readonly #maxRetainedTasks: number;
   readonly #maxOutputBytes: number;
+  readonly #maxWatchesPerTask: number;
+  readonly #watchRearmCooldownMs: number;
   readonly #killGraceMs: number;
   readonly #shell: string;
   readonly #writeLogChunk: (
@@ -251,6 +308,7 @@ export class BackgroundTaskManager {
   ) => boolean;
   readonly #onChange: (() => void) | undefined;
   readonly #onFinished: ((completion: TaskCompletion) => void) | undefined;
+  readonly #onWatchFired: ((event: TaskWatchEvent) => void) | undefined;
   readonly #ownsRuntimeDir: boolean;
   #runtimeDir: string | undefined;
   #initializePromise: Promise<string> | undefined;
@@ -268,6 +326,10 @@ export class BackgroundTaskManager {
       options.maxRetainedTasks ?? this.#maxActiveTasks
     );
     this.#maxOutputBytes = options.maxOutputBytes ?? MAX_OUTPUT_BYTES;
+    this.#maxWatchesPerTask =
+      options.maxWatchesPerTask ?? MAX_WATCHES_PER_TASK;
+    this.#watchRearmCooldownMs =
+      options.watchRearmCooldownMs ?? WATCH_REARM_COOLDOWN_MS;
     this.#killGraceMs = options.killGraceMs ?? KILL_GRACE_MS;
     this.#shell =
       options.shell ??
@@ -277,6 +339,7 @@ export class BackgroundTaskManager {
       ((stream, data, callback) => stream.write(data, callback));
     this.#onChange = options.onChange;
     this.#onFinished = options.onFinished;
+    this.#onWatchFired = options.onWatchFired;
   }
 
   async initialize(): Promise<string> {
@@ -324,6 +387,121 @@ export class BackgroundTaskManager {
       return this.list();
     }
     return [BackgroundTaskManager.#snapshot(this.#resolve(idOrPrefix))];
+  }
+
+  watch(
+    idOrPrefix: string,
+    input: CreateTaskWatchInput
+  ): TaskWatchSnapshot {
+    const task = this.#resolve(idOrPrefix);
+    if (!isActiveStatus(task.status)) {
+      throw new Error(`Cannot watch task ${task.id} because it is ${task.status}`);
+    }
+    const pattern = input.pattern;
+    const inactivitySeconds = input.inactivitySeconds;
+    if (input.condition === "output") {
+      if (!pattern) {
+        throw new Error("pattern is required for an output watch");
+      }
+      if (Buffer.byteLength(pattern) > MAX_WATCH_PATTERN_BYTES) {
+        throw new Error(
+          `Watch patterns are limited to ${String(MAX_WATCH_PATTERN_BYTES)} bytes`
+        );
+      }
+      if (inactivitySeconds !== undefined) {
+        throw new Error("inactivitySeconds is valid only for inactivity watches");
+      }
+    } else if (input.condition === "inactivity") {
+      if (
+        typeof inactivitySeconds !== "number" ||
+        !Number.isFinite(inactivitySeconds) ||
+        inactivitySeconds <= 0
+      ) {
+        throw new Error(
+          "inactivitySeconds must be a positive number for an inactivity watch"
+        );
+      }
+      if (pattern !== undefined) {
+        throw new Error("pattern is valid only for output watches");
+      }
+    } else if (input.condition === "exit") {
+      if (pattern !== undefined || inactivitySeconds !== undefined) {
+        throw new Error("Exit watches do not accept a pattern or inactivitySeconds");
+      }
+    } else {
+      throw new Error(`Unsupported watch condition: ${String(input.condition)}`);
+    }
+
+    const active = [...task.watchState.values()].filter(
+      (watch) => watch.status === "active"
+    );
+    if (active.length >= this.#maxWatchesPerTask) {
+      throw new Error(
+        `At most ${String(this.#maxWatchesPerTask)} watches may be active for one task`
+      );
+    }
+    if (
+      active.some(
+        (watch) =>
+          watch.condition === input.condition &&
+          watch.pattern === pattern &&
+          watch.inactivitySeconds === inactivitySeconds
+      )
+    ) {
+      throw new Error("An identical watch is already active for this task");
+    }
+    const signature = BackgroundTaskManager.#watchSignature(task.id, input);
+    const lastFiredAt = this.#watchCooldowns.get(signature);
+    if (
+      lastFiredAt !== undefined &&
+      Date.now() - lastFiredAt < this.#watchRearmCooldownMs
+    ) {
+      throw new Error("An identical watch is still in its rearm cooldown");
+    }
+
+    const id = this.#newWatchId();
+    const watch: RuntimeWatch = {
+      condition: input.condition,
+      createdAt: Date.now(),
+      id,
+      inactivitySeconds,
+      outputOverlap:
+        input.condition === "output" ? Buffer.alloc(0) : undefined,
+      pattern,
+      signature,
+      status: "active",
+      taskId: task.id,
+      wake: input.wake ?? false,
+    };
+    task.watchState.set(id, watch);
+    this.#watches.set(id, watch);
+    if (watch.condition === "inactivity") {
+      this.#scheduleInactivityWatch(task, watch);
+    }
+    this.#notifyChange();
+    return BackgroundTaskManager.#watchSnapshot(watch);
+  }
+
+  unwatch(idOrPrefix: string): TaskWatchSnapshot {
+    const watch = this.#resolveWatch(idOrPrefix);
+    if (watch.status !== "active") {
+      throw new Error(`Watch ${watch.id} is already ${watch.status}`);
+    }
+    if (watch.inactivityHandle) {
+      clearTimeout(watch.inactivityHandle);
+      watch.inactivityHandle = undefined;
+    }
+    watch.status = "cancelled";
+    watch.endedAt = Date.now();
+    this.#notifyChange();
+    return BackgroundTaskManager.#watchSnapshot(watch);
+  }
+
+  watchStatus(taskIdOrPrefix?: string): TaskWatchSnapshot[] {
+    const watches = taskIdOrPrefix?.trim()
+      ? [...this.#resolve(taskIdOrPrefix).watchState.values()]
+      : [...this.#watches.values()];
+    return watches.map((watch) => BackgroundTaskManager.#watchSnapshot(watch));
   }
 
   async start(input: StartTaskInput): Promise<TaskSnapshot> {
@@ -419,6 +597,7 @@ export class BackgroundTaskManager {
         stream,
         timeoutSeconds,
         wakeOnExit: input.wakeOnExit ?? false,
+        watchState: new Map(),
       };
       this.#tasks.set(id, task);
 
@@ -626,6 +805,27 @@ export class BackgroundTaskManager {
     }
   }
 
+  static #watchSignature(
+    taskId: string,
+    input: CreateTaskWatchInput
+  ): string {
+    return JSON.stringify([
+      taskId,
+      input.condition,
+      input.pattern ?? null,
+      input.inactivitySeconds ?? null,
+    ]);
+  }
+
+  #newWatchId(): string {
+    for (;;) {
+      const id = randomBytes(4).toString("hex");
+      if (!this.#watches.has(id)) {
+        return id;
+      }
+    }
+  }
+
   #newTaskId(): string {
     for (;;) {
       const id = randomBytes(4).toString("hex");
@@ -633,6 +833,28 @@ export class BackgroundTaskManager {
         return id;
       }
     }
+  }
+
+  #resolveWatch(idOrPrefix: string): RuntimeWatch {
+    const query = idOrPrefix.trim();
+    if (!query) {
+      throw new Error("watchId is required");
+    }
+    const exact = this.#watches.get(query);
+    if (exact) {
+      return exact;
+    }
+    const matches = [...this.#watches.values()].filter((watch) =>
+      watch.id.startsWith(query)
+    );
+    const [match] = matches;
+    if (matches.length === 1 && match) {
+      return match;
+    }
+    if (matches.length > 1) {
+      throw new Error(`Ambiguous watch ID prefix: ${query}`);
+    }
+    throw new Error(`Unknown watch ID: ${query}`);
   }
 
   #resolve(idOrPrefix: string): RuntimeTask {
@@ -711,6 +933,23 @@ export class BackgroundTaskManager {
     return buffer.subarray(offset).toString("utf-8");
   }
 
+  static #watchSnapshot(watch: RuntimeWatch): TaskWatchSnapshot {
+    return {
+      condition: watch.condition,
+      createdAt: watch.createdAt,
+      endedAt: watch.endedAt,
+      id: watch.id,
+      inactivitySeconds: watch.inactivitySeconds,
+      matchedOutput: watch.matchedOutput,
+      nextByte: watch.nextByte,
+      pattern: watch.pattern,
+      startByte: watch.startByte,
+      status: watch.status,
+      taskId: watch.taskId,
+      wake: watch.wake,
+    };
+  }
+
   static #snapshot(task: RuntimeTask): TaskSnapshot {
     return {
       bytesWritten: task.bytesWritten,
@@ -729,6 +968,9 @@ export class BackgroundTaskManager {
       status: task.status,
       timeoutSeconds: task.timeoutSeconds,
       wakeOnExit: task.wakeOnExit,
+      watches: [...task.watchState.values()]
+        .filter((watch) => watch.status === "active")
+        .map((watch) => BackgroundTaskManager.#watchSnapshot(watch)),
     };
   }
 
@@ -746,7 +988,8 @@ export class BackgroundTaskManager {
     if (accepted.length > 0) {
       task.acceptedBytes += accepted.length;
       task.lastOutputAt = Date.now();
-      const canContinue = this.#writeLog(task, accepted);
+      this.#resetInactivityWatches(task);
+      const canContinue = this.#writeLog(task, accepted, true);
       if (!canContinue && "pause" in source && "resume" in source) {
         source.pause();
         task.stream.once("drain", () => source.resume());
@@ -764,12 +1007,20 @@ export class BackgroundTaskManager {
     }
   }
 
-  #writeLog(task: RuntimeTask, data: Buffer): boolean {
+  #writeLog(
+    task: RuntimeTask,
+    data: Buffer,
+    matchOutput = false
+  ): boolean {
     const settled = Promise.withResolvers<void>();
     task.pendingLogWrites.add(settled.promise);
     const callback = (error?: Error | null): void => {
       if (!error) {
+        const startByte = task.bytesWritten;
         task.bytesWritten += data.length;
+        if (matchOutput) {
+          this.#matchOutputWatches(task, data, startByte);
+        }
       }
       task.pendingLogWrites.delete(settled.promise);
       settled.resolve();
@@ -780,6 +1031,115 @@ export class BackgroundTaskManager {
       callback(error instanceof Error ? error : new Error(String(error)));
       throw error;
     }
+  }
+
+  #matchOutputWatches(
+    task: RuntimeTask,
+    data: Buffer,
+    startByte: number
+  ): void {
+    for (const watch of task.watchState.values()) {
+      if (
+        watch.status !== "active" ||
+        watch.condition !== "output" ||
+        !watch.pattern
+      ) {
+        continue;
+      }
+      const pattern = Buffer.from(watch.pattern, "utf-8");
+      const overlap = watch.outputOverlap ?? Buffer.alloc(0);
+      const combined = Buffer.concat([overlap, data]);
+      const combinedStart = startByte - overlap.length;
+      const matchIndex = combined.indexOf(pattern);
+      if (matchIndex >= 0) {
+        watch.startByte = combinedStart + matchIndex;
+        watch.nextByte = watch.startByte + pattern.length;
+        watch.matchedOutput = watch.pattern;
+        this.#fireWatch(task, watch, watch.pattern);
+        continue;
+      }
+      const overlapBytes = Math.min(pattern.length - 1, combined.length);
+      watch.outputOverlap = combined.subarray(combined.length - overlapBytes);
+    }
+  }
+
+  #fireWatch(task: RuntimeTask, watch: RuntimeWatch, output?: string): void {
+    if (watch.status !== "active") {
+      return;
+    }
+    if (watch.inactivityHandle) {
+      clearTimeout(watch.inactivityHandle);
+      watch.inactivityHandle = undefined;
+    }
+    watch.status = "fired";
+    watch.endedAt = Date.now();
+    watch.outputOverlap = undefined;
+    this.#watchCooldowns.set(watch.signature, watch.endedAt);
+    const event: TaskWatchEvent = {
+      nextByte: watch.nextByte,
+      output,
+      startByte: watch.startByte,
+      task: BackgroundTaskManager.#snapshot(task),
+      watch: BackgroundTaskManager.#watchSnapshot(watch),
+    };
+    this.#notifyChange();
+    try {
+      this.#onWatchFired?.(event);
+    } catch {
+      // A watch callback failure must not change task state.
+    }
+  }
+
+  #resetInactivityWatches(task: RuntimeTask): void {
+    if (task.status !== "running") {
+      return;
+    }
+    for (const watch of task.watchState.values()) {
+      if (watch.status === "active" && watch.condition === "inactivity") {
+        this.#scheduleInactivityWatch(task, watch);
+      }
+    }
+  }
+
+  #scheduleInactivityWatch(
+    task: RuntimeTask,
+    watch: RuntimeWatch
+  ): void {
+    if (watch.inactivityHandle) {
+      clearTimeout(watch.inactivityHandle);
+    }
+    const quietSince = task.lastOutputAt ?? watch.createdAt;
+    const durationMs = (watch.inactivitySeconds ?? 0) * 1000;
+    const delay = Math.max(0, quietSince + durationMs - Date.now());
+    watch.inactivityHandle = setTimeout(() => {
+      watch.inactivityHandle = undefined;
+      if (watch.status !== "active") {
+        return;
+      }
+      if (this.#shuttingDown || task.status !== "running") {
+        this.#expireWatch(watch);
+        return;
+      }
+      const latestOutput = task.lastOutputAt ?? watch.createdAt;
+      if (latestOutput + durationMs > Date.now()) {
+        this.#scheduleInactivityWatch(task, watch);
+        return;
+      }
+      watch.startByte = task.bytesWritten;
+      watch.nextByte = task.bytesWritten;
+      this.#fireWatch(task, watch);
+    }, delay);
+    watch.inactivityHandle.unref();
+  }
+
+  #expireWatch(watch: RuntimeWatch, endedAt = Date.now()): void {
+    if (watch.inactivityHandle) {
+      clearTimeout(watch.inactivityHandle);
+      watch.inactivityHandle = undefined;
+    }
+    watch.outputOverlap = undefined;
+    watch.status = "expired";
+    watch.endedAt = endedAt;
   }
 
   #finishAfterCleanup(task: RuntimeTask): Promise<void> {
@@ -1009,6 +1369,18 @@ export class BackgroundTaskManager {
     task.signal = signal;
     task.error = finalError;
     task.endedAt = Date.now();
+    for (const watch of task.watchState.values()) {
+      if (watch.status !== "active") {
+        continue;
+      }
+      if (watch.condition === "exit") {
+        watch.startByte = task.bytesWritten;
+        watch.nextByte = task.bytesWritten;
+        this.#fireWatch(task, watch);
+      } else {
+        this.#expireWatch(watch, task.endedAt);
+      }
+    }
     this.#finishedSequence += 1;
     task.finishedOrder = this.#finishedSequence;
 
@@ -1045,6 +1417,10 @@ export class BackgroundTaskManager {
       .slice(this.#maxRetainedTasks);
     for (const task of removable) {
       this.#tasks.delete(task.id);
+      for (const watch of task.watchState.values()) {
+        this.#watches.delete(watch.id);
+        this.#watchCooldowns.delete(watch.signature);
+      }
       try {
         rmSync(task.logPath, { force: true });
       } catch {
