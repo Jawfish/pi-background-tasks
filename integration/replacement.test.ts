@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { writeFile } from "node:fs/promises";
+import path from "node:path";
 
 import { HANDOFF_LEASE_ENV } from "../index.ts";
 import {
@@ -37,10 +39,11 @@ describe("background task runtime replacement", () => {
     async () => {
       const harness = await PiIntegrationHarness.create();
       const oldService = harness.getService();
+      const completionGate = path.join(harness.rootDir, "reload-completion-gate");
       const task = await startProbe(
         harness,
         "Reload probe",
-        "sleep 0.2; printf reload-output"
+        `while [ ! -f '${completionGate}' ]; do sleep 0.01; done; printf reload-output`
       );
 
       await harness.session.reload();
@@ -60,6 +63,7 @@ describe("background task runtime replacement", () => {
       expect(adopted?.pid).toBe(task.pid);
       expect(isProcessGroupAlive(task.pid!)).toBe(true);
 
+      await writeFile(completionGate, "release");
       expect((await harness.waitForTask(task.id)).status).toBe("completed");
       const logs = await newService.logs({ taskId: task.id });
       expect(logs.output).toBe("reload-output");

@@ -48,8 +48,13 @@ const isProcessGroupAlive = function isProcessGroupAlive(pid: number): boolean {
   try {
     process.kill(-pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    return !(
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === "ESRCH"
+    );
   }
 };
 
@@ -273,7 +278,7 @@ export class PiIntegrationHarness {
     this.#sessionUnsubscribe?.();
     this.#sessionUnsubscribe = undefined;
 
-    let disposeError: unknown;
+    const disposeErrors: unknown[] = [];
     if (this.runtime) {
       try {
         await withTimeout(
@@ -282,7 +287,7 @@ export class PiIntegrationHarness {
           "Pi integration runtime cleanup"
         );
       } catch (error) {
-        disposeError = error;
+        disposeErrors.push(error);
       }
     }
 
@@ -296,17 +301,21 @@ export class PiIntegrationHarness {
         CLEANUP_TIMEOUT_MS
       );
     } catch (error) {
-      disposeError ??= error;
+      disposeErrors.push(error);
     }
     for (const pid of this.#trackedPids) {
       if (!isProcessGroupAlive(pid)) {
         fallbackProcessGroups.delete(pid);
       }
     }
-    await rm(this.rootDir, { force: true, recursive: true });
+    try {
+      await rm(this.rootDir, { force: true, recursive: true });
+    } catch (error) {
+      disposeErrors.push(error);
+    }
 
-    if (disposeError) {
-      throw disposeError;
+    if (disposeErrors.length > 0) {
+      throw new AggregateError(disposeErrors, "Pi integration disposal failed");
     }
   }
 
@@ -418,12 +427,21 @@ export class PiIntegrationHarness {
     this.#serviceUnsubscribe = service.subscribe((event) => {
       this.lifecycleEvents.push(event);
       const pid = event.task.pid;
-      if (pid !== undefined) {
+      if (pid === undefined) {
+        return;
+      }
+      if (event.type === "finished" && !isProcessGroupAlive(pid)) {
+        this.#trackedPids.delete(pid);
+        fallbackProcessGroups.delete(pid);
+      } else {
         this.#trackProcessGroup(pid);
       }
     });
     for (const task of service.list()) {
-      if (task.pid !== undefined) {
+      if (
+        task.pid !== undefined &&
+        (task.status === "running" || task.status === "stopping")
+      ) {
         this.#trackProcessGroup(task.pid);
       }
     }
@@ -440,7 +458,10 @@ export class PiIntegrationHarness {
       return;
     }
     for (const task of service.list()) {
-      if (task.pid !== undefined) {
+      if (
+        task.pid !== undefined &&
+        (task.status === "running" || task.status === "stopping")
+      ) {
         this.#trackProcessGroup(task.pid);
       }
     }

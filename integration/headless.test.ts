@@ -38,6 +38,7 @@ interface RpcRecord {
 }
 
 const activeChildren = new Set<ChildProcessWithoutNullStreams>();
+const childErrors = new WeakMap<ChildProcessWithoutNullStreams, Error>();
 const fallbackProcessGroups = new Set<number>();
 const headlessRoots = new Set<string>();
 
@@ -118,8 +119,8 @@ const terminateChild = async function terminateChild(
 };
 
 const cleanupRoot = async function cleanupRoot(rootDir: string): Promise<void> {
+  const cleanupErrors: unknown[] = [];
   const pid = await readProbePid(rootDir);
-  let cleanupError: unknown;
   if (pid !== undefined) {
     fallbackProcessGroups.add(pid);
     killProbe(pid);
@@ -130,12 +131,16 @@ const cleanupRoot = async function cleanupRoot(rootDir: string): Promise<void> {
       );
       fallbackProcessGroups.delete(pid);
     } catch (error) {
-      cleanupError = error;
+      cleanupErrors.push(error);
     }
   }
-  await rm(rootDir, { force: true, recursive: true });
-  if (cleanupError) {
-    throw cleanupError;
+  try {
+    await rm(rootDir, { force: true, recursive: true });
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError(cleanupErrors, "Headless root cleanup failed");
   }
 };
 
@@ -211,6 +216,9 @@ const spawnHeadless = function spawnHeadless(
     stdio: ["pipe", "pipe", "pipe"],
   });
   activeChildren.add(child);
+  child.once("error", (error) => {
+    childErrors.set(child, error);
+  });
   child.once("close", () => {
     activeChildren.delete(child);
   });
@@ -254,7 +262,6 @@ const runPrintCli = async function runPrintCli(rootDir: string): Promise<{
     });
     child.once("error", (error) => {
       clearTimeout(timeout);
-      activeChildren.delete(child);
       reject(error);
     });
     child.once("close", (code, signal) => {
@@ -288,7 +295,12 @@ const awaitRpcRecord = async function awaitRpcRecord(
   await waitFor(
     () => {
       match = records.find(predicate);
-      return match !== undefined || getParseError() !== undefined || hasExited(child);
+      return (
+        match !== undefined ||
+        getParseError() !== undefined ||
+        childErrors.has(child) ||
+        hasExited(child)
+      );
     },
     label,
     15_000
@@ -296,6 +308,10 @@ const awaitRpcRecord = async function awaitRpcRecord(
   const parseError = getParseError();
   if (parseError) {
     throw parseError;
+  }
+  const childError = childErrors.get(child);
+  if (childError) {
+    throw new Error(`RPC process failed before ${label}`, { cause: childError });
   }
   if (!match) {
     throw new Error(`RPC process exited before ${label}. Stderr: ${stderr()}`);
@@ -351,6 +367,7 @@ const runRpcCli = async function runRpcCli(rootDir: string): Promise<{
     stderr += data;
   });
 
+  let lastAssistantText: string | undefined;
   try {
     child.stdin.write(
       `${JSON.stringify({
@@ -393,17 +410,24 @@ const runRpcCli = async function runRpcCli(rootDir: string): Promise<{
     if (typeof text !== "string") {
       throw new Error("RPC last assistant text response did not contain text");
     }
-    return {
-      events: records.filter((record) => record.type !== "response"),
-      lastAssistantText: text,
-      stderr,
-    };
+    lastAssistantText = text;
   } finally {
     await terminateChild(child);
-    if (buffer.length > 0) {
-      throw new Error(`RPC emitted an unterminated stdout record: ${buffer}`);
-    }
   }
+  if (parseError) {
+    throw parseError;
+  }
+  if (buffer.length > 0) {
+    throw new Error(`RPC emitted an unterminated stdout record: ${buffer}`);
+  }
+  if (lastAssistantText === undefined) {
+    throw new Error("RPC did not return final assistant text");
+  }
+  return {
+    events: records.filter((record) => record.type !== "response"),
+    lastAssistantText,
+    stderr,
+  };
 };
 
 const expectProbeStopped = async function expectProbeStopped(
@@ -447,6 +471,9 @@ describe("background tasks in headless Pi modes", () => {
             !event.isError
         )
       ).toBe(true);
+      expect(
+        result.events.filter((event) => event.type === "agent_start")
+      ).toHaveLength(1);
       expect(
         result.events.some((event) => event.type === "extension_error")
       ).toBe(false);
