@@ -172,6 +172,22 @@ reloads; discover the replacement instead of retaining a stale service.
 - The service returns immutable snapshots only. It never exposes child
   processes, file handles, or Pi-internal objects.
 
+## Testing
+
+Run the unit and real Pi integration suites with:
+
+```sh
+bun run test
+bun run test:integration
+bun run typecheck
+```
+
+The integration suite loads this package through Pi's public extension path and
+uses Pi's local faux provider. It needs no provider credentials or external
+network access. It covers wake and steering delivery, context fallback, log
+cursors, watches, reload and session replacement, process cleanup, print mode,
+and RPC mode.
+
 ## Limits
 
 - POSIX systems only

@@ -668,16 +668,23 @@ describe("BackgroundTaskManager", () => {
     const manager = await createManager({
       onWatchFired: (event) => fired.resolve(event),
     });
+    const gateDir = await mkdtemp(path.join(tmpdir(), "pi-bg-watch-gate-"));
+    runtimeDirs.push(gateDir);
+    const gatePath = path.join(gateDir, "release");
     const started = await manager.start({
-      command: "sleep 0.04; printf a; sleep 0.04; printf b; sleep 30",
+      command: `printf a; while [ ! -f '${gatePath}' ]; do sleep 0.01; done; printf b; sleep 30`,
       cwd: process.cwd(),
     });
+    await waitForLog(manager, started.id, "a");
     const watch = manager.watch(started.id, {
       condition: "inactivity",
-      inactivitySeconds: 0.08,
+      inactivitySeconds: 0.25,
       wake: true,
     });
 
+    await writeFile(gatePath, "release");
+    await waitForLog(manager, started.id, "ab");
+    expect(manager.watchStatus(started.id)[0]?.status).toBe("active");
     const event = await Promise.race([
       fired.promise,
       sleep(2000).then(() => {

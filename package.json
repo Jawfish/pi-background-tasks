@@ -21,6 +21,7 @@
   },
   "scripts": {
     "test": "bun test",
+    "test:integration": "bun test integration --timeout 20000",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
