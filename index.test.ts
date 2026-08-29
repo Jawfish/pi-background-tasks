@@ -186,6 +186,11 @@ describe("completion delivery ledger", () => {
 
     ledger.markEnqueued([record]);
     expect(record.state).toBe("enqueued");
+    expect(ledger.unobserved()).toHaveLength(1);
+
+    ledger.markObservedByDeliveryId([record.deliveryId]);
+    expect(record.state).toBe("observed");
+    expect(ledger.unobserved()).toHaveLength(0);
   });
 });
 
@@ -307,8 +312,14 @@ describe("background tasks extension", () => {
     expect(harness.notifications).toHaveLength(2);
 
     const context = (await harness.emit("context", {
-      messages: [],
-    })) as { messages: { content: string }[] };
+      messages: [harness.sentMessages[0]?.message],
+    })) as { messages: { content?: string; customType?: string }[] };
+    expect(
+      context.messages.some(
+        (message) =>
+          message.customType === "background-task-completion-fallback"
+      )
+    ).toBe(false);
     expect(context.messages.at(-1)?.content).not.toContain("First task");
     expect(context.messages.at(-1)?.content).not.toContain("Second task");
 
@@ -334,6 +345,24 @@ describe("background tasks extension", () => {
     expect(harness.sentMessages).toHaveLength(0);
     expect(harness.notifications).toHaveLength(1);
 
+    const fallback = (await harness.emit("context", {
+      messages: [],
+    })) as { messages: { content?: string; customType?: string }[] };
+    expect(fallback.messages.at(-1)).toMatchObject({
+      customType: "background-task-completion-fallback",
+    });
+    expect(fallback.messages.at(-1)?.content).toContain("Failed send");
+
+    const observed = (await harness.emit("context", {
+      messages: [],
+    })) as { messages: { customType?: string }[] };
+    expect(
+      observed.messages.some(
+        (message) =>
+          message.customType === "background-task-completion-fallback"
+      )
+    ).toBe(false);
+
     await harness.emit("session_shutdown");
   });
 
@@ -356,6 +385,38 @@ describe("background tasks extension", () => {
     expect(harness.sentMessages).toHaveLength(1);
 
     await harness.emit("session_shutdown");
+  });
+
+  test("status and logs observe completion before its wake", async () => {
+    for (const action of ["status", "logs"] as const) {
+      const harness = createHarness();
+      await harness.emit("session_start");
+      const started = await harness.execute({
+        action: "start",
+        command: "true",
+        name: `Observed by ${action}`,
+        wakeOnExit: true,
+      });
+      await harness.notificationReceived;
+
+      await harness.execute({
+        action,
+        taskId: started.details.task?.id,
+      });
+      await waitForCompletion();
+
+      expect(harness.sendAttempts).toBe(0);
+      const context = (await harness.emit("context", {
+        messages: [],
+      })) as { messages: { customType?: string }[] };
+      expect(
+        context.messages.some(
+          (message) =>
+            message.customType === "background-task-completion-fallback"
+        )
+      ).toBe(false);
+      await harness.emit("session_shutdown");
+    }
   });
 
   test("does not wake for default tasks or manual stops", async () => {

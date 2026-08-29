@@ -113,6 +113,10 @@ export class CompletionDeliveryLedger {
     return [...this.#records.values()];
   }
 
+  unobserved(): CompletionDeliveryRecord[] {
+    return this.list().filter((record) => record.state !== "observed");
+  }
+
   wakeCandidates(): CompletionDeliveryRecord[] {
     return this.list().filter(
       (record) => record.state === "pending" && !record.wakeAttempted
@@ -136,12 +140,59 @@ export class CompletionDeliveryLedger {
       }
     }
   }
+
+  markObservedByDeliveryId(deliveryIds: readonly string[]): void {
+    for (const deliveryId of deliveryIds) {
+      const record = this.#records.get(deliveryId);
+      if (record) {
+        record.state = "observed";
+      }
+    }
+  }
+
+  markObservedByTaskId(taskIds: readonly string[]): void {
+    for (const taskId of taskIds) {
+      const deliveryId = this.#taskDeliveries.get(taskId);
+      if (deliveryId) {
+        this.markObservedByDeliveryId([deliveryId]);
+      }
+    }
+  }
 }
 
 interface BoundedXml {
   text: string;
   truncated: boolean;
 }
+
+const deliveryIdsInMessages = function deliveryIdsInMessages(
+  messages: readonly unknown[]
+): string[] {
+  const deliveryIds: string[] = [];
+  for (const message of messages) {
+    if (!message || typeof message !== "object") {
+      continue;
+    }
+    const custom = message as { customType?: unknown; details?: unknown };
+    if (
+      custom.customType !== "background-task-completion" &&
+      custom.customType !== "background-task-completion-fallback"
+    ) {
+      continue;
+    }
+    if (!custom.details || typeof custom.details !== "object") {
+      continue;
+    }
+    const ids = (custom.details as { deliveryIds?: unknown }).deliveryIds;
+    if (!Array.isArray(ids)) {
+      continue;
+    }
+    deliveryIds.push(
+      ...ids.filter((value): value is string => typeof value === "string")
+    );
+  }
+  return deliveryIds;
+};
 
 const escapeXmlWithinBytes = function escapeXmlWithinBytes(
   value: string,
@@ -431,6 +482,14 @@ const backgroundTasksExtension = function backgroundTasksExtension(
         }
         case "status": {
           const tasks = manager.status(params.taskId);
+          deliveryLedger.markObservedByTaskId(
+            tasks
+              .filter(
+                (task) =>
+                  task.status === "completed" || task.status === "failed"
+              )
+              .map((task) => task.id)
+          );
           return {
             content: [{ text: formatTaskList(tasks), type: "text" as const }],
             details: { tasks },
@@ -441,6 +500,12 @@ const backgroundTasksExtension = function backgroundTasksExtension(
             throw new Error("taskId is required for action=logs");
           }
           const logs = await manager.logs(params.taskId, params.maxBytes);
+          if (
+            logs.task.status === "completed" ||
+            logs.task.status === "failed"
+          ) {
+            deliveryLedger.markObservedByTaskId([logs.task.id]);
+          }
           return {
             content: [{ text: logs.text, type: "text" as const }],
             details: logs,
@@ -534,24 +599,47 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     if (shuttingDown) {
       return { messages: event.messages };
     }
-    return {
-      messages: [
-        ...event.messages,
-        {
-          content: formatModelContext(
-            manager.list().filter(
-              (task) =>
-                !task.wakeOnExit ||
-                (task.status !== "completed" && task.status !== "failed")
-            )
-          ),
-          customType: "background-task-status",
-          display: false,
-          role: "custom" as const,
-          timestamp: Date.now(),
+    deliveryLedger.markObservedByDeliveryId(
+      deliveryIdsInMessages(event.messages)
+    );
+    const fallback = deliveryLedger
+      .unobserved()
+      .slice(0, MAX_COMPLETION_TASKS);
+    const messages = [
+      ...event.messages,
+      {
+        content: formatModelContext(
+          manager.list().filter(
+            (task) =>
+              !task.wakeOnExit ||
+              (task.status !== "completed" && task.status !== "failed")
+          )
+        ),
+        customType: "background-task-status",
+        display: false,
+        role: "custom" as const,
+        timestamp: Date.now(),
+      },
+    ];
+    if (fallback.length > 0) {
+      messages.push({
+        content: completionMessage(
+          fallback.map((record) => record.completion),
+          fallback.map((record) => record.deliveryId)
+        ),
+        customType: "background-task-completion-fallback",
+        details: {
+          deliveryIds: fallback.map((record) => record.deliveryId),
         },
-      ],
-    };
+        display: false,
+        role: "custom" as const,
+        timestamp: Date.now(),
+      });
+      deliveryLedger.markObservedByDeliveryId(
+        fallback.map((record) => record.deliveryId)
+      );
+    }
+    return { messages };
   });
 
   pi.on("session_start", async (_event, ctx) => {
