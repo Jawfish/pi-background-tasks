@@ -128,6 +128,50 @@ every managed process group and deletes the log directory. Set
 shutdown reason, including quit, new, resume, and fork, stops all tasks
 immediately.
 
+## Extension service
+
+Other Pi extensions can share this manager instead of spawning their own
+processes. The contract lives in `service.ts` and is versioned as `v1`. Listen
+for announcements before emitting discovery so either extension load order
+works:
+
+```typescript
+import {
+  BACKGROUND_TASK_DISCOVERY_CHANNEL,
+  BACKGROUND_TASK_SERVICE_CHANNEL,
+  isBackgroundTaskServiceAnnouncement,
+} from "@jawfish/pi-background-tasks/service.ts";
+import type {
+  BackgroundTaskService,
+} from "@jawfish/pi-background-tasks/service.ts";
+
+let tasks: BackgroundTaskService | undefined;
+const accept = (service: BackgroundTaskService): void => {
+  tasks = service;
+};
+const unsubscribe = pi.events.on(BACKGROUND_TASK_SERVICE_CHANNEL, (data) => {
+  if (isBackgroundTaskServiceAnnouncement(data)) {
+    accept(data.service);
+  }
+});
+pi.events.emit(BACKGROUND_TASK_DISCOVERY_CHANNEL, { onService: accept });
+```
+
+The service supports start, list, status, logs, stop, watch, and unwatch. Its
+`subscribe` method emits `started`, `output-committed`, `watch-fired`, and
+`finished` events. Call the returned unsubscribe functions when the consumer
+shuts down. A service becomes unavailable when its session ends or its provider
+reloads; discover the replacement instead of retaining a stale service.
+
+- Channel names, the `version` value, and existing field meanings stay fixed
+  while `v1` is published.
+- New optional request fields, response fields, and lifecycle event types may
+  appear, so consumers must ignore unknown event types.
+- A breaking change ships as a new `v2` channel set, published next to `v1` for
+  at least one minor release before `v1` is removed.
+- The service returns immutable snapshots only. It never exposes child
+  processes, file handles, or Pi-internal objects.
+
 ## Limits
 
 - POSIX systems only

@@ -19,10 +19,12 @@ import {
   DEFAULT_SHELL,
   formatModelContext,
   formatTaskList,
+  MAX_OUTPUT_PREVIEW_BYTES,
 } from "./core.ts";
 import type {
   BackgroundTaskManagerOptions,
   TaskCompletion,
+  TaskOutputEvent,
   TaskSnapshot,
   TaskWatchEvent,
 } from "./core.ts";
@@ -844,6 +846,31 @@ describe("BackgroundTaskManager", () => {
     expect(manager.list()).toHaveLength(1);
     for (const task of started) {
       expect(manager.status(task.id)).toHaveLength(1);
+    }
+  });
+
+  test("bounds committed output previews after UTF-8 decoding", async () => {
+    const outputEvents: TaskOutputEvent[] = [];
+    const manager = await createManager({
+      onOutput: (event) => {
+        outputEvents.push(event);
+      },
+    });
+    const task = await manager.start({
+      command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(
+        "process.stdout.write(Buffer.alloc(300, 128))"
+      )}`,
+      cwd: process.cwd(),
+    });
+    await waitForTerminal(manager, task.id);
+
+    expect(outputEvents.length).toBeGreaterThan(0);
+    expect(outputEvents.some((event) => event.previewTruncated)).toBe(true);
+    for (const event of outputEvents) {
+      expect(Buffer.byteLength(event.preview)).toBeLessThanOrEqual(
+        MAX_OUTPUT_PREVIEW_BYTES
+      );
+      expect(event.nextByte).toBeGreaterThan(event.startByte);
     }
   });
 

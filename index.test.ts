@@ -16,6 +16,16 @@ import backgroundTasksExtension, {
   HANDOFF_LEASE_ENV,
   MAX_COMPLETION_MESSAGE_BYTES,
 } from "./index.ts";
+import {
+  BACKGROUND_TASK_DISCOVERY_CHANNEL,
+  BACKGROUND_TASK_SERVICE_CHANNEL,
+  isBackgroundTaskServiceAnnouncement,
+  MAX_SERVICE_PREVIEW_BYTES,
+} from "./service.ts";
+import type {
+  BackgroundTaskLifecycleEvent,
+  BackgroundTaskService,
+} from "./service.ts";
 
 const isProcessGroupAlive = function isProcessGroupAlive(pid: number): boolean {
   try {
@@ -103,7 +113,32 @@ type EventHandler = (
   ctx: ExtensionContext
 ) => unknown | Promise<unknown>;
 
+interface TestEventBus {
+  emit(channel: string, data: unknown): void;
+  on(channel: string, handler: (data: unknown) => void): () => void;
+}
+
+const createEventBus = function createEventBus(): TestEventBus {
+  const channels = new Map<string, Set<(data: unknown) => void>>();
+  return {
+    emit(channel, data) {
+      for (const handler of [...(channels.get(channel) ?? [])]) {
+        handler(data);
+      }
+    },
+    on(channel, handler) {
+      const handlers = channels.get(channel) ?? new Set();
+      handlers.add(handler);
+      channels.set(channel, handlers);
+      return () => {
+        handlers.delete(handler);
+      };
+    },
+  };
+};
+
 interface HarnessOptions {
+  events?: TestEventBus;
   hasUI?: boolean;
   model?: { id: string; provider: string };
   notificationError?: Error;
@@ -128,7 +163,9 @@ const createHarness = function createHarness(options: HarnessOptions = {}) {
   const statuses: (string | undefined)[] = [];
   let tool: RegisteredTool | undefined;
 
+  const events = options.events ?? createEventBus();
   const pi = {
+    events,
     on(event: string, handler: EventHandler) {
       const registered = handlers.get(event) ?? [];
       registered.push(handler);
@@ -209,6 +246,7 @@ const createHarness = function createHarness(options: HarnessOptions = {}) {
 
   return {
     emit,
+    events,
     execute,
     get registeredTool() {
       return tool;
@@ -1245,6 +1283,256 @@ describe("background tasks extension", () => {
       await waitForDeadProcessGroup(pid!);
       expect(isProcessGroupAlive(pid!)).toBe(false);
     }
+  });
+
+  test("publishes one service to early and late consumers", async () => {
+    const events = createEventBus();
+    const announced: BackgroundTaskService[] = [];
+    events.on(BACKGROUND_TASK_SERVICE_CHANNEL, (data) => {
+      if (isBackgroundTaskServiceAnnouncement(data)) {
+        announced.push(data.service);
+      }
+    });
+
+    const harness = createHarness({ events, sessionId: "service-session" });
+    await harness.emit("session_start");
+    expect(announced).toHaveLength(1);
+
+    const discovered: BackgroundTaskService[] = [];
+    events.emit(BACKGROUND_TASK_DISCOVERY_CHANNEL, {
+      onService: (value: BackgroundTaskService) => {
+        discovered.push(value);
+      },
+    });
+    expect(discovered).toHaveLength(1);
+    expect(discovered[0]).toBe(announced[0]!);
+    expect(discovered[0]?.version).toBe("v1");
+    expect(discovered[0]?.sessionId).toBe("service-session");
+
+    events.emit(BACKGROUND_TASK_DISCOVERY_CHANNEL, { onService: "not callable" });
+    expect(discovered).toHaveLength(1);
+    expect(() =>
+      events.emit(BACKGROUND_TASK_DISCOVERY_CHANNEL, {
+        onService: () => {
+          throw new Error("consumer callback failed");
+        },
+      })
+    ).not.toThrow();
+    events.emit(BACKGROUND_TASK_DISCOVERY_CHANNEL, {
+      onService: (value: BackgroundTaskService) => {
+        discovered.push(value);
+      },
+    });
+    expect(discovered).toHaveLength(2);
+
+    await harness.emit("session_shutdown");
+  });
+
+  test("runs task operations through the shared service", async () => {
+    const events = createEventBus();
+    let service: BackgroundTaskService | undefined;
+    events.on(BACKGROUND_TASK_SERVICE_CHANNEL, (data) => {
+      if (isBackgroundTaskServiceAnnouncement(data)) {
+        service = data.service;
+      }
+    });
+    const harness = createHarness({ events });
+    await harness.emit("session_start");
+    expect(service).toBeDefined();
+
+    const started = await service!.start({
+      command: "printf service-output; sleep 30",
+      name: "Service task",
+    });
+    expect(started.cwd).toBe(process.cwd());
+    expect(service!.list()).toHaveLength(1);
+    expect(service!.status(started.id.slice(0, 4))[0]?.id).toBe(started.id);
+
+    await Bun.sleep(60);
+    const logs = await service!.logs({ afterByte: 0, taskId: started.id });
+    expect(logs.output).toContain("service-output");
+    expect(logs.nextByte).toBeGreaterThan(0);
+
+    const watch = service!.watch(started.id, { condition: "exit", wake: false });
+    expect(service!.watchStatus(started.id)).toHaveLength(1);
+    expect(service!.unwatch(watch.id).status).toBe("cancelled");
+
+    expect(() => service!.watch(started.id, { condition: "output" })).toThrow(
+      "pattern is required"
+    );
+    expect(() => service!.stop("missing-task")).toThrow(
+      "Unknown background task ID"
+    );
+    await expect(
+      service!.start({ command: "true", cwd: "/definitely/missing/dir" })
+    ).rejects.toThrow("does not exist");
+
+    expect(service!.stop(started.id).status).toBe("stopping");
+    await waitForCompletion();
+    await harness.emit("session_shutdown");
+  });
+
+  test("invalidates a stale service after reload and shutdown", async () => {
+    const events = createEventBus();
+    const services: BackgroundTaskService[] = [];
+    events.on(BACKGROUND_TASK_SERVICE_CHANNEL, (data) => {
+      if (isBackgroundTaskServiceAnnouncement(data)) {
+        services.push(data.service);
+      }
+    });
+    const sessionId = `service-reload-${crypto.randomUUID()}`;
+
+    const before = createHarness({ events, sessionId });
+    await before.emit("session_start");
+    await before.emit("session_shutdown", { reason: "reload" });
+
+    const stale = services[0]!;
+    expect(stale.isAvailable()).toBe(false);
+    expect(() => stale.list()).toThrow("no longer available");
+    expect(() => stale.subscribe(() => {})).toThrow("no longer available");
+    await expect(stale.start({ command: "true" })).rejects.toThrow(
+      "no longer available"
+    );
+
+    const after = createHarness({ events, sessionId });
+    await after.emit("session_start");
+    expect(services).toHaveLength(2);
+    const current = services[1]!;
+    expect(current).not.toBe(stale);
+    expect(current.isAvailable()).toBe(true);
+    expect(stale.isAvailable()).toBe(false);
+    expect(() => stale.list()).toThrow("no longer available");
+
+    const discovered: BackgroundTaskService[] = [];
+    events.emit(BACKGROUND_TASK_DISCOVERY_CHANNEL, {
+      onService: (value: BackgroundTaskService) => {
+        discovered.push(value);
+      },
+    });
+    expect(discovered).toEqual([current]);
+
+    await after.emit("session_shutdown");
+    expect(current.isAvailable()).toBe(false);
+  });
+
+  test("broadcasts immutable bounded lifecycle events", async () => {
+    const events = createEventBus();
+    let service: BackgroundTaskService | undefined;
+    events.on(BACKGROUND_TASK_SERVICE_CHANNEL, (data) => {
+      if (isBackgroundTaskServiceAnnouncement(data)) {
+        service = data.service;
+      }
+    });
+    const harness = createHarness({ events });
+    await harness.emit("session_start");
+
+    const received: BackgroundTaskLifecycleEvent[] = [];
+    service!.subscribe(() => {
+      throw new Error("subscriber failure");
+    });
+    service!.subscribe((event) => {
+      received.push(event);
+    });
+
+    const task = await service!.start({
+      command:
+        "sleep 0.05; printf 'abcdefghijklmnopqrstuvwxyz%.0s' 1 2 3 4 5 6 7 8 9 10 11; printf MATCH",
+      completionPolicy: "silent",
+      name: "Lifecycle events",
+    });
+    service!.watch(task.id, {
+      condition: "output",
+      pattern: "MATCH",
+      wake: false,
+    });
+    await waitForCompletion();
+
+    expect(service!.status(task.id)[0]?.status).toBe("completed");
+    const started = received.filter((event) => event.type === "started");
+    const output = received.filter(
+      (event) => event.type === "output-committed"
+    );
+    const fired = received.filter((event) => event.type === "watch-fired");
+    const finished = received.filter((event) => event.type === "finished");
+    expect(started).toHaveLength(1);
+    expect(output.length).toBeGreaterThan(0);
+    expect(fired).toHaveLength(1);
+    expect(finished).toHaveLength(1);
+
+    const outputEvent = output[0]!;
+    if (outputEvent.type !== "output-committed") {
+      throw new Error("Expected an output event");
+    }
+    expect(Buffer.byteLength(outputEvent.preview)).toBeLessThanOrEqual(
+      MAX_SERVICE_PREVIEW_BYTES
+    );
+    expect(outputEvent.nextByte).toBeGreaterThan(outputEvent.startByte);
+    expect(output.some((event) => event.previewTruncated)).toBe(true);
+    expect(Object.isFrozen(outputEvent)).toBe(true);
+    expect(Object.isFrozen(outputEvent.task)).toBe(true);
+    expect(() => {
+      (outputEvent.task as { name: string }).name = "mutated";
+    }).toThrow();
+    expect(service!.status(task.id)[0]?.name).toBe("Lifecycle events");
+
+    const list = service!.list();
+    expect(Object.isFrozen(list)).toBe(true);
+    expect(Object.isFrozen(list[0])).toBe(true);
+    const logs = await service!.logs({ taskId: task.id });
+    expect(Object.isFrozen(logs)).toBe(true);
+    expect(Object.isFrozen(logs.task)).toBe(true);
+
+    await harness.emit("session_shutdown");
+  });
+
+  test("does not duplicate lifecycle events across reload", async () => {
+    const events = createEventBus();
+    const services: BackgroundTaskService[] = [];
+    events.on(BACKGROUND_TASK_SERVICE_CHANNEL, (data) => {
+      if (isBackgroundTaskServiceAnnouncement(data)) {
+        services.push(data.service);
+      }
+    });
+    const sessionId = `lifecycle-reload-${crypto.randomUUID()}`;
+    const before = createHarness({ events, sessionId });
+    await before.emit("session_start");
+    const beforeEvents: BackgroundTaskLifecycleEvent[] = [];
+    services[0]!.subscribe((event) => {
+      beforeEvents.push(event);
+    });
+    const task = await services[0]!.start({
+      command: "sleep 0.15; printf reload-output",
+      completionPolicy: "silent",
+      name: "Reload lifecycle",
+    });
+    await before.emit("session_shutdown", { reason: "reload" });
+
+    const after = createHarness({ events, sessionId });
+    await after.emit("session_start");
+    const afterEvents: BackgroundTaskLifecycleEvent[] = [];
+    services[1]!.subscribe((event) => {
+      afterEvents.push(event);
+    });
+    await Bun.sleep(400);
+
+    expect(beforeEvents.filter((event) => event.type === "started")).toHaveLength(
+      1
+    );
+    expect(
+      beforeEvents.filter((event) => event.type === "output-committed")
+    ).toHaveLength(0);
+    expect(beforeEvents.filter((event) => event.type === "finished")).toHaveLength(
+      0
+    );
+    expect(
+      afterEvents.filter((event) => event.type === "output-committed")
+    ).toHaveLength(1);
+    expect(afterEvents.filter((event) => event.type === "finished")).toHaveLength(
+      1
+    );
+    expect(services[1]!.status(task.id)[0]?.status).toBe("completed");
+
+    await after.emit("session_shutdown");
   });
 
   test("cancels a queued automatic continuation during shutdown", async () => {
