@@ -31,6 +31,18 @@ import type {
   BackgroundTaskToolDetails,
   CompletionDisplayDetails,
 } from "./tui.ts";
+import {
+  BACKGROUND_TASK_DISCOVERY_CHANNEL,
+  BACKGROUND_TASK_SERVICE_CHANNEL,
+  BACKGROUND_TASK_SERVICE_VERSION,
+  isBackgroundTaskDiscoveryRequest,
+} from "./service.ts";
+import type {
+  BackgroundTaskLifecycleEvent,
+  BackgroundTaskLogRequest,
+  BackgroundTaskService,
+  BackgroundTaskStartRequest,
+} from "./service.ts";
 
 const WAKE_BATCH_MS = 100;
 const MAX_COMPLETION_TASKS = 16;
@@ -627,6 +639,12 @@ const backgroundTasksExtension = function backgroundTasksExtension(
   let dashboardReadState = new TaskDashboardReadState();
   let deliveryLedger = new CompletionDeliveryLedger();
   const unacknowledgedFailures = new Map<string, TaskSnapshot>();
+  const serviceListeners = new Set<
+    (event: BackgroundTaskLifecycleEvent) => void
+  >();
+  let service: BackgroundTaskService | undefined;
+  let serviceAvailable = false;
+  let discoverySubscription: (() => void) | undefined;
   // Callbacks close over the manager, so initialization follows their definitions.
   let manager: BackgroundTaskManager;
 
@@ -804,6 +822,69 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       scheduleWake();
     }
   };
+
+  const requireService = (): void => {
+    if (!serviceAvailable) {
+      throw new Error(
+        "The background task service is no longer available for this session"
+      );
+    }
+  };
+
+  const createService = (ctx: ExtensionContext): BackgroundTaskService => ({
+    isAvailable: () => serviceAvailable,
+    list: () => {
+      requireService();
+      return manager.list();
+    },
+    logs: async (request: BackgroundTaskLogRequest) => {
+      requireService();
+      return await manager.logs(
+        request.taskId,
+        request.maxBytes,
+        request.afterByte
+      );
+    },
+    sessionId: ctx.sessionManager?.getSessionId(),
+    start: async (request: BackgroundTaskStartRequest) => {
+      requireService();
+      return await manager.start({
+        command: request.command,
+        completionPolicy: request.completionPolicy,
+        cwd: await resolveTaskCwd(ctx.cwd, request.cwd),
+        environment: buildTaskEnvironment(ctx),
+        name: request.name,
+        timeoutSeconds: request.timeoutSeconds,
+      });
+    },
+    status: (taskIdOrPrefix?: string) => {
+      requireService();
+      return manager.status(taskIdOrPrefix);
+    },
+    stop: (taskIdOrPrefix: string) => {
+      requireService();
+      return manager.stop(taskIdOrPrefix);
+    },
+    subscribe: (listener) => {
+      serviceListeners.add(listener);
+      return () => {
+        serviceListeners.delete(listener);
+      };
+    },
+    unwatch: (watchIdOrPrefix: string) => {
+      requireService();
+      return manager.unwatch(watchIdOrPrefix);
+    },
+    version: BACKGROUND_TASK_SERVICE_VERSION,
+    watch: (taskIdOrPrefix, input) => {
+      requireService();
+      return manager.watch(taskIdOrPrefix, input);
+    },
+    watchStatus: (taskIdOrPrefix?: string) => {
+      requireService();
+      return manager.watchStatus(taskIdOrPrefix);
+    },
+  });
 
   /** Recover terminal tasks that finished while no instance was bound. */
   const adoptTerminalTasks = async (): Promise<void> => {
@@ -1195,6 +1276,29 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     if (deliveryLedger.wakeCandidates().length > 0) {
       scheduleWake();
     }
+
+    service = createService(ctx);
+    serviceAvailable = true;
+    discoverySubscription?.();
+    discoverySubscription = pi.events.on(
+      BACKGROUND_TASK_DISCOVERY_CHANNEL,
+      (data: unknown) => {
+        if (!serviceAvailable || !service) {
+          return;
+        }
+        if (!isBackgroundTaskDiscoveryRequest(data)) {
+          return;
+        }
+        try {
+          data.onService(service);
+        } catch (error) {
+          console.error(
+            `[background-tasks] service discovery callback failed: ${error instanceof Error ? error.message : String(error)}`
+          );
+        }
+      }
+    );
+    pi.events.emit(BACKGROUND_TASK_SERVICE_CHANNEL, { service });
   });
 
   pi.on("session_shutdown", async (event) => {
@@ -1210,6 +1314,11 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     const reload =
       (event as { reason?: unknown } | undefined)?.reason === "reload" &&
       Boolean(sessionId);
+    serviceAvailable = false;
+    service = undefined;
+    serviceListeners.clear();
+    discoverySubscription?.();
+    discoverySubscription = undefined;
 
     try {
       dashboard?.dispose();

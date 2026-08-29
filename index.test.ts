@@ -16,6 +16,12 @@ import backgroundTasksExtension, {
   HANDOFF_LEASE_ENV,
   MAX_COMPLETION_MESSAGE_BYTES,
 } from "./index.ts";
+import {
+  BACKGROUND_TASK_DISCOVERY_CHANNEL,
+  BACKGROUND_TASK_SERVICE_CHANNEL,
+  isBackgroundTaskServiceAnnouncement,
+} from "./service.ts";
+import type { BackgroundTaskService } from "./service.ts";
 
 const isProcessGroupAlive = function isProcessGroupAlive(pid: number): boolean {
   try {
@@ -103,7 +109,32 @@ type EventHandler = (
   ctx: ExtensionContext
 ) => unknown | Promise<unknown>;
 
+interface TestEventBus {
+  emit(channel: string, data: unknown): void;
+  on(channel: string, handler: (data: unknown) => void): () => void;
+}
+
+const createEventBus = function createEventBus(): TestEventBus {
+  const channels = new Map<string, Set<(data: unknown) => void>>();
+  return {
+    emit(channel, data) {
+      for (const handler of [...(channels.get(channel) ?? [])]) {
+        handler(data);
+      }
+    },
+    on(channel, handler) {
+      const handlers = channels.get(channel) ?? new Set();
+      handlers.add(handler);
+      channels.set(channel, handlers);
+      return () => {
+        handlers.delete(handler);
+      };
+    },
+  };
+};
+
 interface HarnessOptions {
+  events?: TestEventBus;
   hasUI?: boolean;
   model?: { id: string; provider: string };
   notificationError?: Error;
@@ -128,7 +159,9 @@ const createHarness = function createHarness(options: HarnessOptions = {}) {
   const statuses: (string | undefined)[] = [];
   let tool: RegisteredTool | undefined;
 
+  const events = options.events ?? createEventBus();
   const pi = {
+    events,
     on(event: string, handler: EventHandler) {
       const registered = handlers.get(event) ?? [];
       registered.push(handler);
@@ -209,6 +242,7 @@ const createHarness = function createHarness(options: HarnessOptions = {}) {
 
   return {
     emit,
+    events,
     execute,
     get registeredTool() {
       return tool;
@@ -1245,6 +1279,120 @@ describe("background tasks extension", () => {
       await waitForDeadProcessGroup(pid!);
       expect(isProcessGroupAlive(pid!)).toBe(false);
     }
+  });
+
+  test("publishes one service to early and late consumers", async () => {
+    const events = createEventBus();
+    const announced: BackgroundTaskService[] = [];
+    events.on(BACKGROUND_TASK_SERVICE_CHANNEL, (data) => {
+      if (isBackgroundTaskServiceAnnouncement(data)) {
+        announced.push(data.service);
+      }
+    });
+
+    const harness = createHarness({ events, sessionId: "service-session" });
+    await harness.emit("session_start");
+    expect(announced).toHaveLength(1);
+
+    const discovered: BackgroundTaskService[] = [];
+    events.emit(BACKGROUND_TASK_DISCOVERY_CHANNEL, {
+      onService: (value: BackgroundTaskService) => {
+        discovered.push(value);
+      },
+    });
+    expect(discovered).toHaveLength(1);
+    expect(discovered[0]).toBe(announced[0]!);
+    expect(discovered[0]?.version).toBe("v1");
+    expect(discovered[0]?.sessionId).toBe("service-session");
+
+    events.emit(BACKGROUND_TASK_DISCOVERY_CHANNEL, { onService: "not callable" });
+    expect(discovered).toHaveLength(1);
+
+    await harness.emit("session_shutdown");
+  });
+
+  test("runs task operations through the shared service", async () => {
+    const events = createEventBus();
+    let service: BackgroundTaskService | undefined;
+    events.on(BACKGROUND_TASK_SERVICE_CHANNEL, (data) => {
+      if (isBackgroundTaskServiceAnnouncement(data)) {
+        service = data.service;
+      }
+    });
+    const harness = createHarness({ events });
+    await harness.emit("session_start");
+    expect(service).toBeDefined();
+
+    const started = await service!.start({
+      command: "printf service-output; sleep 30",
+      name: "Service task",
+    });
+    expect(started.cwd).toBe(process.cwd());
+    expect(service!.list()).toHaveLength(1);
+    expect(service!.status(started.id.slice(0, 4))[0]?.id).toBe(started.id);
+
+    await Bun.sleep(60);
+    const logs = await service!.logs({ afterByte: 0, taskId: started.id });
+    expect(logs.output).toContain("service-output");
+    expect(logs.nextByte).toBeGreaterThan(0);
+
+    const watch = service!.watch(started.id, { condition: "exit", wake: false });
+    expect(service!.watchStatus(started.id)).toHaveLength(1);
+    expect(service!.unwatch(watch.id).status).toBe("cancelled");
+
+    expect(() => service!.watch(started.id, { condition: "output" })).toThrow(
+      "pattern is required"
+    );
+    expect(() => service!.stop("missing-task")).toThrow(
+      "Unknown background task ID"
+    );
+    await expect(
+      service!.start({ command: "true", cwd: "/definitely/missing/dir" })
+    ).rejects.toThrow("does not exist");
+
+    expect(service!.stop(started.id).status).toBe("stopping");
+    await waitForCompletion();
+    await harness.emit("session_shutdown");
+  });
+
+  test("invalidates a stale service after reload and shutdown", async () => {
+    const events = createEventBus();
+    const services: BackgroundTaskService[] = [];
+    events.on(BACKGROUND_TASK_SERVICE_CHANNEL, (data) => {
+      if (isBackgroundTaskServiceAnnouncement(data)) {
+        services.push(data.service);
+      }
+    });
+    const sessionId = `service-reload-${crypto.randomUUID()}`;
+
+    const before = createHarness({ events, sessionId });
+    await before.emit("session_start");
+    await before.emit("session_shutdown", { reason: "reload" });
+
+    const stale = services[0]!;
+    expect(stale.isAvailable()).toBe(false);
+    expect(() => stale.list()).toThrow("no longer available");
+    await expect(stale.start({ command: "true" })).rejects.toThrow(
+      "no longer available"
+    );
+
+    const after = createHarness({ events, sessionId });
+    await after.emit("session_start");
+    expect(services).toHaveLength(2);
+    const current = services[1]!;
+    expect(current).not.toBe(stale);
+    expect(current.isAvailable()).toBe(true);
+
+    const discovered: BackgroundTaskService[] = [];
+    events.emit(BACKGROUND_TASK_DISCOVERY_CHANNEL, {
+      onService: (value: BackgroundTaskService) => {
+        discovered.push(value);
+      },
+    });
+    expect(discovered).toEqual([current]);
+
+    await after.emit("session_shutdown");
+    expect(current.isAvailable()).toBe(false);
   });
 
   test("cancels a queued automatic continuation during shutdown", async () => {
