@@ -74,6 +74,70 @@ const Parameters = Type.Object({
   ),
 });
 
+export type CompletionDeliveryState = "pending" | "enqueued" | "observed";
+
+export interface CompletionDeliveryRecord {
+  completion: TaskCompletion;
+  deliveryId: string;
+  state: CompletionDeliveryState;
+  wakeAttempted: boolean;
+}
+
+export class CompletionDeliveryLedger {
+  readonly #records = new Map<string, CompletionDeliveryRecord>();
+  readonly #taskDeliveries = new Map<string, string>();
+  #sequence = 0;
+
+  add(completion: TaskCompletion): CompletionDeliveryRecord {
+    const existingId = this.#taskDeliveries.get(completion.task.id);
+    if (existingId) {
+      const existing = this.#records.get(existingId);
+      if (existing) {
+        return existing;
+      }
+    }
+    this.#sequence += 1;
+    const deliveryId = `completion:${completion.task.id}:${String(this.#sequence)}`;
+    const record: CompletionDeliveryRecord = {
+      completion,
+      deliveryId,
+      state: "pending",
+      wakeAttempted: false,
+    };
+    this.#records.set(deliveryId, record);
+    this.#taskDeliveries.set(completion.task.id, deliveryId);
+    return record;
+  }
+
+  list(): CompletionDeliveryRecord[] {
+    return [...this.#records.values()];
+  }
+
+  wakeCandidates(): CompletionDeliveryRecord[] {
+    return this.list().filter(
+      (record) => record.state === "pending" && !record.wakeAttempted
+    );
+  }
+
+  markWakeAttempted(records: readonly CompletionDeliveryRecord[]): void {
+    for (const record of records) {
+      const stored = this.#records.get(record.deliveryId);
+      if (stored?.state === "pending") {
+        stored.wakeAttempted = true;
+      }
+    }
+  }
+
+  markEnqueued(records: readonly CompletionDeliveryRecord[]): void {
+    for (const record of records) {
+      const stored = this.#records.get(record.deliveryId);
+      if (stored?.state === "pending") {
+        stored.state = "enqueued";
+      }
+    }
+  }
+}
+
 interface BoundedXml {
   text: string;
   truncated: boolean;
@@ -123,15 +187,20 @@ const escapeXmlTailWithinBytes = function escapeXmlTailWithinBytes(
 };
 
 export const completionMessage = function completionMessage(
-  completions: readonly TaskCompletion[]
+  completions: readonly TaskCompletion[],
+  deliveryIds: readonly string[] = []
 ): string {
   const lines = ["<background-task-completion>"];
   const selected = completions.slice(0, MAX_COMPLETION_TASKS);
-  for (const completion of selected) {
+  for (const [index, completion] of selected.entries()) {
     const { task } = completion;
     const name = escapeXmlWithinBytes(task.name, MAX_COMPLETION_NAME_BYTES);
+    const deliveryId = deliveryIds[index];
+    const deliveryAttribute = deliveryId
+      ? ` delivery-id="${escapeXml(deliveryId)}"`
+      : "";
     lines.push(
-      `  <task id="${escapeXml(task.id)}">`,
+      `  <task id="${escapeXml(task.id)}"${deliveryAttribute}>`,
       `    <name truncated="${String(name.truncated)}">${name.text}</name>`,
       `    <status>${task.status}</status>`
     );
@@ -198,7 +267,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
   let shuttingDown = false;
   let wakeHandle: NodeJS.Timeout | undefined;
   let activeDashboard: TaskDashboardComponent | undefined;
-  const pendingWake = new Map<string, TaskCompletion>();
+  const deliveryLedger = new CompletionDeliveryLedger();
   // Callbacks close over the manager, so initialization follows their definitions.
   // oxlint-disable-next-line eslint/prefer-const
   let manager: BackgroundTaskManager;
@@ -225,21 +294,30 @@ const backgroundTasksExtension = function backgroundTasksExtension(
 
   const flushWake = (): void => {
     wakeHandle = undefined;
-    if (shuttingDown || pendingWake.size === 0) {
-      pendingWake.clear();
+    if (shuttingDown) {
       return;
     }
-    const completions = [...pendingWake.values()];
-    pendingWake.clear();
-    const included = completions.slice(0, MAX_COMPLETION_TASKS);
+    const records = deliveryLedger
+      .wakeCandidates()
+      .slice(0, MAX_COMPLETION_TASKS);
+    if (records.length === 0) {
+      return;
+    }
+    deliveryLedger.markWakeAttempted(records);
+    const completions = records.map((record) => record.completion);
     try {
       pi.sendMessage(
         {
-          content: completionMessage(completions),
+          content: completionMessage(
+            completions,
+            records.map((record) => record.deliveryId)
+          ),
           customType: "background-task-completion",
           details: {
-            omitted: completions.length - included.length,
-            tasks: included.map((completion) => ({
+            deliveryIds: records.map((record) => record.deliveryId),
+            omitted: 0,
+            tasks: records.map(({ completion, deliveryId }) => ({
+              deliveryId,
               error: completion.task.error,
               exitCode: completion.task.exitCode,
               id: completion.task.id,
@@ -255,6 +333,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
         },
         { deliverAs: "steer", triggerTurn: true }
       );
+      deliveryLedger.markEnqueued(records);
     } catch (error) {
       console.error(
         `[background-tasks] automatic continuation failed: ${error instanceof Error ? error.message : String(error)}`
@@ -264,6 +343,14 @@ const backgroundTasksExtension = function backgroundTasksExtension(
 
   const handleFinished = (completion: TaskCompletion): void => {
     const { task } = completion;
+    const shouldWake =
+      !shuttingDown &&
+      task.wakeOnExit &&
+      (task.status === "completed" || task.status === "failed");
+    if (shouldWake) {
+      deliveryLedger.add(completion);
+    }
+
     const ctx = currentCtx;
     if (!shuttingDown && ctx?.hasUI) {
       const duration = formatUiDuration(
@@ -275,20 +362,18 @@ const backgroundTasksExtension = function backgroundTasksExtension(
           : task.signal
             ? `, ${task.signal}`
             : "";
-      ctx.ui.notify(
-        `${sanitizeUiInline(task.name)} ${task.status} after ${duration} (${task.id}${terminal}).`,
-        task.status === "failed" ? "error" : "info"
-      );
+      try {
+        ctx.ui.notify(
+          `${sanitizeUiInline(task.name)} ${task.status} after ${duration} (${task.id}${terminal}).`,
+          task.status === "failed" ? "error" : "info"
+        );
+      } catch (error) {
+        console.error(
+          `[background-tasks] completion notification failed: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
     }
-    if (
-      shuttingDown ||
-      !task.wakeOnExit ||
-      (task.status !== "completed" && task.status !== "failed")
-    ) {
-      return;
-    }
-    pendingWake.set(task.id, completion);
-    if (!wakeHandle) {
+    if (shouldWake && !wakeHandle) {
       wakeHandle = setTimeout(flushWake, WAKE_BATCH_MS);
       wakeHandle.unref();
     }
@@ -485,7 +570,6 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       clearTimeout(wakeHandle);
       wakeHandle = undefined;
     }
-    pendingWake.clear();
 
     try {
       dashboard?.dispose();

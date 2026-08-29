@@ -8,6 +8,7 @@ import type {
 import { BackgroundTaskManager } from "./core.ts";
 import type { TaskCompletion } from "./core.ts";
 import backgroundTasksExtension, {
+  CompletionDeliveryLedger,
   completionMessage,
   MAX_COMPLETION_MESSAGE_BYTES,
 } from "./index.ts";
@@ -42,10 +43,16 @@ type EventHandler = (
   ctx: ExtensionContext
 ) => unknown | Promise<unknown>;
 
-const createHarness = function createHarness() {
+interface HarnessOptions {
+  notificationError?: Error;
+  sendMessageError?: Error;
+}
+
+const createHarness = function createHarness(options: HarnessOptions = {}) {
   const handlers = new Map<string, EventHandler[]>();
   const sentMessages: { message: unknown; options: unknown }[] = [];
   const notifications: string[] = [];
+  let sendAttempts = 0;
   const notificationReceived = Promise.withResolvers<null>();
   const statuses: (string | undefined)[] = [];
   let tool: RegisteredTool | undefined;
@@ -65,8 +72,12 @@ const createHarness = function createHarness() {
     registerTool(value: RegisteredTool) {
       tool = value;
     },
-    sendMessage(message: unknown, options: unknown) {
-      sentMessages.push({ message, options });
+    sendMessage(message: unknown, sendOptions: unknown) {
+      sendAttempts += 1;
+      if (options.sendMessageError) {
+        throw options.sendMessageError;
+      }
+      sentMessages.push({ message, options: sendOptions });
     },
   } as unknown as ExtensionAPI;
   backgroundTasksExtension(pi);
@@ -76,6 +87,9 @@ const createHarness = function createHarness() {
     hasUI: true,
     ui: {
       notify(message: string) {
+        if (options.notificationError) {
+          throw options.notificationError;
+        }
         notifications.push(message);
         notificationReceived.resolve(null);
       },
@@ -113,6 +127,9 @@ const createHarness = function createHarness() {
     execute,
     notificationReceived: notificationReceived.promise,
     notifications,
+    get sendAttempts() {
+      return sendAttempts;
+    },
     sentMessages,
     statuses,
   };
@@ -145,6 +162,32 @@ const fakeCompletion = function fakeCompletion(
     ...overrides,
   };
 };
+
+describe("completion delivery ledger", () => {
+  test("tracks stable IDs, wake attempts, and enqueue state", () => {
+    const ledger = new CompletionDeliveryLedger();
+    const completion = fakeCompletion(1);
+
+    const record = ledger.add(completion);
+    expect(record).toMatchObject({
+      state: "pending",
+      wakeAttempted: false,
+    });
+    expect(record.deliveryId).toContain(completion.task.id);
+    expect(ledger.add(completion).deliveryId).toBe(record.deliveryId);
+    expect(ledger.wakeCandidates()).toHaveLength(1);
+
+    ledger.markWakeAttempted([record]);
+    expect(record).toMatchObject({
+      state: "pending",
+      wakeAttempted: true,
+    });
+    expect(ledger.wakeCandidates()).toHaveLength(0);
+
+    ledger.markEnqueued([record]);
+    expect(record.state).toBe("enqueued");
+  });
+});
 
 describe("completion messages", () => {
   test("bounds escaped output and oversized batches", () => {
@@ -240,7 +283,23 @@ describe("background tasks extension", () => {
     });
     const completion = harness.sentMessages[0]?.message as {
       content?: string;
+      details?: {
+        deliveryIds?: string[];
+        tasks?: { deliveryId?: string }[];
+      };
     };
+    expect(completion.details?.deliveryIds).toHaveLength(2);
+    expect(
+      completion.details?.deliveryIds?.every((id) =>
+        id.startsWith("completion:")
+      )
+    ).toBe(true);
+    expect(
+      completion.details?.tasks?.every((task) =>
+        task.deliveryId?.startsWith("completion:")
+      )
+    ).toBe(true);
+    expect(completion.content).toContain("delivery-id=");
     expect(completion.content).toContain("<output-tail");
     expect(completion.content).toContain("first");
     expect(completion.content).toContain("second");
@@ -252,6 +311,49 @@ describe("background tasks extension", () => {
     })) as { messages: { content: string }[] };
     expect(context.messages.at(-1)?.content).not.toContain("First task");
     expect(context.messages.at(-1)?.content).not.toContain("Second task");
+
+    await harness.emit("session_shutdown");
+  });
+
+  test("keeps one pending record after message enqueue fails", async () => {
+    const harness = createHarness({
+      sendMessageError: new Error("send failed"),
+    });
+    await harness.emit("session_start");
+
+    await harness.execute({
+      action: "start",
+      command: "true",
+      name: "Failed send",
+      wakeOnExit: true,
+    });
+    await waitForCompletion();
+    await waitForCompletion();
+
+    expect(harness.sendAttempts).toBe(1);
+    expect(harness.sentMessages).toHaveLength(0);
+    expect(harness.notifications).toHaveLength(1);
+
+    await harness.emit("session_shutdown");
+  });
+
+  test("queues wake delivery before a UI notification failure", async () => {
+    const harness = createHarness({
+      notificationError: new Error("notify failed"),
+    });
+    await harness.emit("session_start");
+
+    await harness.execute({
+      action: "start",
+      command: "true",
+      name: "Failed notification",
+      wakeOnExit: true,
+    });
+    await waitForCompletion();
+
+    expect(harness.notifications).toHaveLength(0);
+    expect(harness.sendAttempts).toBe(1);
+    expect(harness.sentMessages).toHaveLength(1);
 
     await harness.emit("session_shutdown");
   });
