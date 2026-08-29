@@ -268,6 +268,20 @@ const waitForCompletion = async function waitForCompletion(): Promise<void> {
   await Bun.sleep(250);
 };
 
+const waitForMessageCount = async function waitForMessageCount(
+  messages: readonly unknown[],
+  expected: number
+): Promise<void> {
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    if (messages.length >= expected) {
+      return;
+    }
+    // oxlint-disable-next-line eslint/no-await-in-loop
+    await Bun.sleep(5);
+  }
+  throw new Error(`Expected ${String(expected)} delivered messages`);
+};
+
 const waitForNotificationCount = async function waitForNotificationCount(
   notifications: readonly string[],
   expected: number
@@ -818,7 +832,7 @@ describe("background tasks extension", () => {
       taskId: started.details.task?.id,
       wake: true,
     });
-    await waitForCompletion();
+    await waitForMessageCount(harness.sentMessages, 1);
 
     expect(harness.sentMessages).toHaveLength(1);
     const message = harness.sentMessages[0]?.message as {
