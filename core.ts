@@ -167,6 +167,13 @@ export interface BackgroundTaskManagerOptions {
   onWatchFired?: (event: TaskWatchEvent) => void;
 }
 
+/** Observer callbacks one extension instance binds to a manager. */
+export interface BackgroundTaskCallbacks {
+  onChange?: () => void;
+  onFinished?: (completion: TaskCompletion) => void;
+  onWatchFired?: (event: TaskWatchEvent) => void;
+}
+
 const parseShellArguments = function parseShellArguments(
   value: string | undefined
 ): string[] {
@@ -347,9 +354,7 @@ export class BackgroundTaskManager {
     data: Buffer,
     callback: (error?: Error | null) => void
   ) => boolean;
-  readonly #onChange: (() => void) | undefined;
-  readonly #onFinished: ((completion: TaskCompletion) => void) | undefined;
-  readonly #onWatchFired: ((event: TaskWatchEvent) => void) | undefined;
+  #callbacks: BackgroundTaskCallbacks = {};
   readonly #ownsRuntimeDir: boolean;
   #runtimeDir: string | undefined;
   #initializePromise: Promise<string> | undefined;
@@ -382,9 +387,11 @@ export class BackgroundTaskManager {
     this.#writeLogChunk =
       options.writeLogChunk ??
       ((stream, data, callback) => stream.write(data, callback));
-    this.#onChange = options.onChange;
-    this.#onFinished = options.onFinished;
-    this.#onWatchFired = options.onWatchFired;
+    this.#callbacks = {
+      onChange: options.onChange,
+      onFinished: options.onFinished,
+      onWatchFired: options.onWatchFired,
+    };
   }
 
   async initialize(): Promise<string> {
@@ -410,6 +417,16 @@ export class BackgroundTaskManager {
 
   isShuttingDown(): boolean {
     return this.#shuttingDown;
+  }
+
+  /** Replace every observer callback so only the newest owner is notified. */
+  bindCallbacks(callbacks: BackgroundTaskCallbacks): void {
+    this.#callbacks = { ...callbacks };
+  }
+
+  /** Stop notifying the current owner without changing task state. */
+  detachCallbacks(): void {
+    this.#callbacks = {};
   }
 
   list(): TaskSnapshot[] {
@@ -1141,7 +1158,7 @@ export class BackgroundTaskManager {
     };
     this.#notifyChange();
     try {
-      this.#onWatchFired?.(event);
+      this.#callbacks.onWatchFired?.(event);
     } catch {
       // A watch callback failure must not change task state.
     }
@@ -1459,7 +1476,7 @@ export class BackgroundTaskManager {
     this.#prune();
     this.#notifyChange();
     try {
-      this.#onFinished?.(completion);
+      this.#callbacks.onFinished?.(completion);
     } catch {
       // A notification failure must not change process state.
     }
@@ -1488,7 +1505,7 @@ export class BackgroundTaskManager {
 
   #notifyChange(): void {
     try {
-      this.#onChange?.();
+      this.#callbacks.onChange?.();
     } catch {
       // UI failures must not change process state.
     }

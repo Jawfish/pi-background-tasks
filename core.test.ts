@@ -847,6 +847,70 @@ describe("BackgroundTaskManager", () => {
     }
   });
 
+  test("binds and detaches observer callbacks without stopping tasks", async () => {
+    const first = { changes: 0, completions: 0, watches: 0 };
+    const second = { changes: 0, completions: 0, watches: 0 };
+    const secondCompletion = Promise.withResolvers<null>();
+    const manager = await createManager({
+      onChange: () => {
+        first.changes += 1;
+      },
+      onFinished: () => {
+        first.completions += 1;
+      },
+      onWatchFired: () => {
+        first.watches += 1;
+      },
+    });
+
+    const detached = await manager.start({
+      command: "true",
+      cwd: process.cwd(),
+    });
+    await waitForTerminal(manager, detached.id);
+    expect(first.completions).toBe(1);
+
+    manager.detachCallbacks();
+    const running = await manager.start({
+      command: "sleep 30",
+      cwd: process.cwd(),
+    });
+    expect(manager.status(running.id)[0]?.status).toBe("running");
+
+    const changesBeforeRebind = first.changes;
+    manager.bindCallbacks({
+      onChange: () => {
+        second.changes += 1;
+      },
+      onFinished: () => {
+        second.completions += 1;
+        secondCompletion.resolve(null);
+      },
+      onWatchFired: () => {
+        second.watches += 1;
+      },
+    });
+    manager.watch(running.id, { condition: "exit" });
+    manager.stop(running.id);
+    await Promise.race([
+      secondCompletion.promise,
+      sleep(2000).then(() => {
+        throw new Error("Rebound completion callback did not run");
+      }),
+    ]);
+
+    expect(first.changes).toBe(changesBeforeRebind);
+    expect(first.completions).toBe(1);
+    expect(first.watches).toBe(0);
+    expect(second.completions).toBe(1);
+    expect(second.watches).toBe(1);
+    expect(second.changes).toBeGreaterThan(0);
+
+    await manager.shutdown();
+    await manager.shutdown();
+    expect(manager.isShuttingDown()).toBe(true);
+  });
+
   test("preserves wake output after task state and logs are pruned", async () => {
     const completions: TaskCompletion[] = [];
     const manager = await createManager({
