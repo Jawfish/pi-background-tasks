@@ -115,6 +115,19 @@ message or timestamp.
 The model does not need to poll `status` or `logs` while it waits. It can use
 `logs` when it needs command output.
 
+## Reload
+
+`/reload` keeps running tasks alive. The old extension instance stops receiving
+callbacks and hands its manager, logs, watches, delivery state, and dashboard
+read cursors to the new instance for the same session. A task that finishes
+during the handoff is delivered once after the new instance adopts it.
+
+If no new instance claims the handoff within 15 seconds, the extension stops
+every managed process group and deletes the log directory. Set
+`PI_BACKGROUND_TASK_HANDOFF_LEASE_MS` to change that lease. Every other
+shutdown reason, including quit, new, resume, and fork, stops all tasks
+immediately.
+
 ## Limits
 
 - POSIX systems only
@@ -123,7 +136,7 @@ The model does not need to poll `status` or `logs` while it waits. It can use
 - Pruned logs are deleted, and the session log directory is removed at shutdown
 - Each task can write up to 64 MiB before the extension stops it
 - One log read returns at most 32 KiB and does not return a split UTF-8 prefix
-- Tracked process groups stop when the Pi session shuts down or reloads
-- Tasks do not survive a Pi restart
+- Tracked process groups stop when the Pi session shuts down or is replaced
+- Tasks survive `/reload` but not a Pi restart
 
 Background commands run with the same user permissions and environment as Pi. This extension does not sandbox them. A command that deliberately creates a new process session or fully daemonizes can escape process-group cleanup and must manage its own shutdown.
