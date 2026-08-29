@@ -1227,10 +1227,13 @@ export class TaskDashboardComponent implements Component {
       this.#logs = logs;
       this.#logsTaskId = taskId;
       this.#readState.markRead(taskId, logs.nextByte ?? logs.totalBytes);
-      this.#tasks[this.#selectedIndex] = {
-        ...task,
-        bytesWritten: Math.max(task.bytesWritten, logs.totalBytes),
-      };
+      const current = this.#tasks[this.#selectedIndex];
+      if (current) {
+        this.#tasks[this.#selectedIndex] = {
+          ...current,
+          bytesWritten: Math.max(current.bytesWritten, logs.totalBytes),
+        };
+      }
     } catch (error) {
       if (
         this.#disposed ||
