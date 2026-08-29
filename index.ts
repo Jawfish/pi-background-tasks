@@ -348,47 +348,55 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     if (shuttingDown) {
       return;
     }
-    const records = deliveryLedger
-      .wakeCandidates()
-      .slice(0, MAX_COMPLETION_TASKS);
-    if (records.length === 0) {
-      return;
-    }
-    deliveryLedger.markWakeAttempted(records);
-    const completions = records.map((record) => record.completion);
-    try {
-      pi.sendMessage(
-        {
-          content: completionMessage(
-            completions,
-            records.map((record) => record.deliveryId)
-          ),
-          customType: "background-task-completion",
-          details: {
-            deliveryIds: records.map((record) => record.deliveryId),
-            omitted: 0,
-            tasks: records.map(({ completion, deliveryId }) => ({
-              deliveryId,
-              error: completion.task.error,
-              exitCode: completion.task.exitCode,
-              id: completion.task.id,
-              name: completion.task.name,
-              output: completion.output,
-              outputError: completion.outputError,
-              outputTruncated: completion.outputTruncated,
-              signal: completion.task.signal,
-              status: completion.task.status,
-            })),
+    const candidates = deliveryLedger.wakeCandidates();
+    let wakeRequested = false;
+    for (
+      let offset = 0;
+      offset < candidates.length;
+      offset += MAX_COMPLETION_TASKS
+    ) {
+      if (shuttingDown) {
+        return;
+      }
+      const records = candidates.slice(offset, offset + MAX_COMPLETION_TASKS);
+      deliveryLedger.markWakeAttempted(records);
+      const completions = records.map((record) => record.completion);
+      const triggerTurn: boolean = !wakeRequested;
+      try {
+        pi.sendMessage(
+          {
+            content: completionMessage(
+              completions,
+              records.map((record) => record.deliveryId)
+            ),
+            customType: "background-task-completion",
+            details: {
+              deliveryIds: records.map((record) => record.deliveryId),
+              omitted: 0,
+              tasks: records.map(({ completion, deliveryId }) => ({
+                deliveryId,
+                error: completion.task.error,
+                exitCode: completion.task.exitCode,
+                id: completion.task.id,
+                name: completion.task.name,
+                output: completion.output,
+                outputError: completion.outputError,
+                outputTruncated: completion.outputTruncated,
+                signal: completion.task.signal,
+                status: completion.task.status,
+              })),
+            },
+            display: true,
           },
-          display: true,
-        },
-        { deliverAs: "steer", triggerTurn: true }
-      );
-      deliveryLedger.markEnqueued(records);
-    } catch (error) {
-      console.error(
-        `[background-tasks] automatic continuation failed: ${error instanceof Error ? error.message : String(error)}`
-      );
+          { deliverAs: "steer", triggerTurn }
+        );
+        deliveryLedger.markEnqueued(records);
+        wakeRequested ||= triggerTurn;
+      } catch (error) {
+        console.error(
+          `[background-tasks] automatic continuation failed: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
     }
   };
 

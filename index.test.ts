@@ -139,6 +139,20 @@ const waitForCompletion = async function waitForCompletion(): Promise<void> {
   await Bun.sleep(250);
 };
 
+const waitForNotificationCount = async function waitForNotificationCount(
+  notifications: readonly string[],
+  expected: number
+): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (notifications.length >= expected) {
+      return;
+    }
+    // oxlint-disable-next-line eslint/no-await-in-loop
+    await Bun.sleep(5);
+  }
+  throw new Error(`Expected ${String(expected)} completion notifications`);
+};
+
 const fakeCompletion = function fakeCompletion(
   index: number,
   overrides: Partial<TaskCompletion> = {}
@@ -383,6 +397,51 @@ describe("background tasks extension", () => {
     expect(harness.notifications).toHaveLength(0);
     expect(harness.sendAttempts).toBe(1);
     expect(harness.sentMessages).toHaveLength(1);
+
+    await harness.emit("session_shutdown");
+  });
+
+  test("splits large completion batches with one turn request", async () => {
+    const harness = createHarness();
+    await harness.emit("session_start");
+    const startWave = async (offset: number): Promise<void> => {
+      await Promise.all(
+        Array.from({ length: 16 }, async (_, index) => {
+          await harness.execute({
+            action: "start",
+            command: "true",
+            name: `Batch ${String(offset + index)}`,
+            wakeOnExit: true,
+          });
+        })
+      );
+    };
+
+    await startWave(0);
+    await waitForNotificationCount(harness.notifications, 16);
+    await startWave(16);
+    await waitForNotificationCount(harness.notifications, 32);
+    await waitForCompletion();
+
+    expect(harness.sentMessages).toHaveLength(2);
+    expect(harness.sentMessages.map(({ options }) => options)).toEqual([
+      { deliverAs: "steer", triggerTurn: true },
+      { deliverAs: "steer", triggerTurn: false },
+    ]);
+    const messages = harness.sentMessages.map(({ message }) =>
+      message as {
+        details?: { deliveryIds?: string[]; omitted?: number };
+      }
+    );
+    const deliveryIds = messages.flatMap(
+      (message) => message.details?.deliveryIds ?? []
+    );
+    expect(messages[0]?.details?.deliveryIds).toHaveLength(16);
+    expect(messages[1]?.details?.deliveryIds).toHaveLength(16);
+    expect(messages.every((message) => message.details?.omitted === 0)).toBe(
+      true
+    );
+    expect(new Set(deliveryIds).size).toBe(32);
 
     await harness.emit("session_shutdown");
   });
