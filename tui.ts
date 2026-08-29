@@ -774,10 +774,12 @@ export class TaskDashboardComponent implements Component {
 
   #frame(width: number, content: string, selected = false): string {
     if (width <= 1) {
-      return truncateToWidth(content, Math.max(0, width), "");
+      const body = truncateToWidth(content, Math.max(0, width), "", true);
+      return body + " ".repeat(Math.max(0, width - visibleWidth(body)));
     }
     const innerWidth = Math.max(0, width - 2);
     let body = truncateToWidth(content, innerWidth, "…", true);
+    body += " ".repeat(Math.max(0, innerWidth - visibleWidth(body)));
     const borderColor = selected ? "borderAccent" : "border";
     return (
       this.#theme.fg(borderColor, "|") +

@@ -116,13 +116,13 @@ describe("background task dashboard", () => {
     });
 
     for (const rows of [1, 2, 4, 8, 14, 30]) {
-      for (const width of [18, 44, 80]) {
+      for (const width of [0, 1, 2, 18, 44, 80]) {
         const { component } = createDashboard({ rows, tasks: [malicious] });
         const lines = component.render(width);
         expect(lines.length).toBeLessThanOrEqual(
           Math.max(1, Math.floor(rows * 0.9))
         );
-        expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
+        expect(lines.every((line) => visibleWidth(line) === width)).toBe(true);
         const visible = stripTerminalSequences(lines.join("\n"));
         expect(visible).not.toContain("bad title");
         expect(visible).not.toContain("https://example.test");
