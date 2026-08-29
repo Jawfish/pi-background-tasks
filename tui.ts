@@ -588,7 +588,7 @@ export class TaskDashboardComponent implements Component {
     this.#interval.unref();
   }
 
-  refresh(): void {
+  refresh(forceLogs = false): void {
     if (this.#disposed) {
       return;
     }
@@ -605,7 +605,7 @@ export class TaskDashboardComponent implements Component {
         Math.max(0, this.#tasks.length - 1)
       );
       if (this.#showLogs) {
-        void this.#loadLogs();
+        void this.#loadLogs(forceLogs);
       }
       if (this.#flash && this.#flash.expiresAt <= Date.now()) {
         this.#flash = undefined;
@@ -681,10 +681,7 @@ export class TaskDashboardComponent implements Component {
     }
     if (matchesKey(data, "r")) {
       this.#setFlash("dim", "Refreshed task state");
-      this.refresh();
-      if (this.#showLogs) {
-        void this.#loadLogs(true);
-      }
+      this.refresh(true);
       return;
     }
     if (matchesKey(data, "x")) {
@@ -777,10 +774,12 @@ export class TaskDashboardComponent implements Component {
 
   #frame(width: number, content: string, selected = false): string {
     if (width <= 1) {
-      return truncateToWidth(content, Math.max(0, width), "");
+      const body = truncateToWidth(content, Math.max(0, width), "", true);
+      return body + " ".repeat(Math.max(0, width - visibleWidth(body)));
     }
     const innerWidth = Math.max(0, width - 2);
     let body = truncateToWidth(content, innerWidth, "…", true);
+    body += " ".repeat(Math.max(0, innerWidth - visibleWidth(body)));
     const borderColor = selected ? "borderAccent" : "border";
     return (
       this.#theme.fg(borderColor, "|") +
@@ -1045,14 +1044,19 @@ export class TaskDashboardComponent implements Component {
       this.#logs = logs;
       this.#logsTaskId = taskId;
     } catch (error) {
-      if (!this.#disposed && this.#tasks[this.#selectedIndex]?.id === taskId) {
-        this.#logs = undefined;
-        this.#logsTaskId = undefined;
-        this.#setFlash(
-          "error",
-          `Could not read log: ${error instanceof Error ? error.message : String(error)}`
-        );
+      if (
+        this.#disposed ||
+        requestSequence !== this.#logRequestSequence ||
+        this.#tasks[this.#selectedIndex]?.id !== taskId
+      ) {
+        return;
       }
+      this.#logs = undefined;
+      this.#logsTaskId = undefined;
+      this.#setFlash(
+        "error",
+        `Could not read log: ${error instanceof Error ? error.message : String(error)}`
+      );
     } finally {
       this.#activeLogRequests = Math.max(0, this.#activeLogRequests - 1);
       this.#loadingLogs = this.#activeLogRequests > 0;

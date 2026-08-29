@@ -116,13 +116,13 @@ describe("background task dashboard", () => {
     });
 
     for (const rows of [1, 2, 4, 8, 14, 30]) {
-      for (const width of [18, 44, 80]) {
+      for (const width of [0, 1, 2, 18, 44, 80]) {
         const { component } = createDashboard({ rows, tasks: [malicious] });
         const lines = component.render(width);
         expect(lines.length).toBeLessThanOrEqual(
           Math.max(1, Math.floor(rows * 0.9))
         );
-        expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
+        expect(lines.every((line) => visibleWidth(line) === width)).toBe(true);
         const visible = stripTerminalSequences(lines.join("\n"));
         expect(visible).not.toContain("bad title");
         expect(visible).not.toContain("https://example.test");
@@ -146,7 +146,7 @@ describe("background task dashboard", () => {
     );
   });
 
-  test("keeps the newest log response when refreshes overlap", async () => {
+  test("keeps the newest log response with one read per refresh", async () => {
     const selected = task();
     const first = Promise.withResolvers<TaskLogs>();
     const second = Promise.withResolvers<TaskLogs>();
@@ -190,6 +190,53 @@ describe("background task dashboard", () => {
     expect(logCalls).toBe(2);
     expect(rendered).toContain("new response");
     expect(rendered).not.toContain("stale response");
+  });
+
+  test("ignores a stale log failure after a newer success", async () => {
+    const selected = task();
+    const first = Promise.withResolvers<TaskLogs>();
+    const second = Promise.withResolvers<TaskLogs>();
+    let logCalls = 0;
+    const manager = {
+      list: () => [{ ...selected }],
+      logs: () => {
+        logCalls += 1;
+        return logCalls === 1 ? first.promise : second.promise;
+      },
+      stop: () => ({ ...selected, status: "stopping" as const }),
+    };
+    const { tui } = createTui(30);
+    const component = new TaskDashboardComponent({
+      keybindings: new KeybindingsManager(TUI_KEYBINDINGS),
+      manager,
+      onClose() {},
+      theme,
+      tui,
+    });
+    components.push(component);
+    const logs: TaskLogs = {
+      bytesRead: 12,
+      output: "new response",
+      task: selected,
+      text: "new response",
+      totalBytes: 12,
+      truncated: false,
+    };
+
+    component.handleInput("\r");
+    component.handleInput("r");
+    second.resolve(logs);
+    await Promise.resolve();
+    await Promise.resolve();
+    first.reject(new Error("stale failure"));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const rendered = stripTerminalSequences(component.render(80).join("\n"));
+    expect(logCalls).toBe(2);
+    expect(rendered).toContain("new response");
+    expect(rendered).not.toContain("stale failure");
+    expect(rendered).not.toContain("Could not read log");
   });
 
   test("loads a sanitized log tail without rendering terminal controls", async () => {
