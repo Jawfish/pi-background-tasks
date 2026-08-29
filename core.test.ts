@@ -134,7 +134,7 @@ describe("BackgroundTaskManager", () => {
       command: "printf 'hello from task'",
       cwd: process.cwd(),
       name: "Greeting",
-      wakeOnExit: true,
+      completionPolicy: "wake",
     });
 
     const terminal = await waitForTerminal(manager, started.id);
@@ -143,7 +143,7 @@ describe("BackgroundTaskManager", () => {
     expect(terminal).toMatchObject({
       name: "Greeting",
       status: "completed",
-      wakeOnExit: true,
+      completionPolicy: "wake",
     });
     expect(terminal.lastOutputAt).toBeGreaterThanOrEqual(terminal.startedAt);
     expect(terminal.bytesWritten).toBe(logs.totalBytes);
@@ -770,13 +770,13 @@ describe("BackgroundTaskManager", () => {
     const first = await manager.start({
       command: "printf first-output",
       cwd: process.cwd(),
-      wakeOnExit: true,
+      completionPolicy: "wake",
     });
     await waitForTerminal(manager, first.id);
     const second = await manager.start({
       command: "printf second-output",
       cwd: process.cwd(),
-      wakeOnExit: true,
+      completionPolicy: "wake",
     });
     await waitForTerminal(manager, second.id);
 
@@ -1001,7 +1001,7 @@ describe("task formatting", () => {
     name: "Build <main>",
     startedAt: 1000,
     status: "running",
-    wakeOnExit: true,
+    completionPolicy: "wake",
   };
 
   test("injects active status and escapes model-controlled names", () => {
@@ -1009,27 +1009,29 @@ describe("task formatting", () => {
 
     expect(context).toContain("abc12345 [running");
     expect(context).toContain("Build &lt;main&gt;");
-    expect(context).toContain("automatic continuation enabled");
+    expect(context).toContain("completion policy wake");
+    expect(context).not.toContain(task.logPath);
+    expect(context).not.toContain(task.command);
 
     const failedContext = formatModelContext([
       {
         ...task,
         endedAt: 2000,
-        error: "Exited with code 1",
+        error: "Exited with <code 1>",
         exitCode: 1,
         status: "failed",
       },
     ]);
-    expect(failedContext).toContain("inspect the original command");
-    expect(failedContext).toContain("read logs once if needed");
-    expect(failedContext).toContain("retry only when retry is safe");
-    expect(failedContext).toContain("Do not retry an unchanged command");
+    expect(failedContext).toContain("Unacknowledged failures:");
+    expect(failedContext).toContain("exit 1");
+    expect(failedContext).toContain("Exited with &lt;code 1&gt;");
+    expect(formatModelContext([])).toBe("");
   });
 
   test("formats an empty and populated task list", () => {
     expect(formatTaskList([])).toBe("No background tasks.");
     expect(formatTaskList([task], 2000)).toContain(
-      "abc12345 running 1s wake=on"
+      "abc12345 running 1s policy=wake"
     );
   });
 
@@ -1044,6 +1046,6 @@ describe("task formatting", () => {
 
     expect(formatTaskList([stopped], 2000)).toContain("signal=SIGTERM");
     expect(formatTaskList([stopped], 2000)).not.toContain("exit=null");
-    expect(formatModelContext([stopped])).toContain("signal SIGTERM");
+    expect(formatModelContext([stopped])).toBe("");
   });
 });

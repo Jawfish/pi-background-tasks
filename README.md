@@ -6,7 +6,7 @@ Task commands run from Pi's current working directory and inherit Pi's environme
 
 ## Tool
 
-The extension adds one `background_task` tool with four actions.
+The extension adds one `background_task` tool with six actions.
 
 Start a task:
 
@@ -15,7 +15,7 @@ Start a task:
   "action": "start",
   "name": "Typecheck",
   "command": "bun run typecheck",
-  "wakeOnExit": true
+  "completionPolicy": "wake"
 }
 ```
 
@@ -38,7 +38,14 @@ Stop a task:
 {"action":"stop","taskId":"a12bc34d"}
 ```
 
-`taskId` accepts a full ID or a unique prefix.
+Register or cancel a one-shot task watch:
+
+```json
+{"action":"watch","taskId":"a12bc34d","condition":"exit","wake":true}
+{"action":"unwatch","watchId":"d45ef678"}
+```
+
+`taskId` and `watchId` accept a full ID or a unique prefix.
 
 ## Interactive monitor
 
@@ -58,17 +65,38 @@ and automatic completions use themed, expandable summaries instead of raw task
 data. Terminal control sequences from commands and logs are removed before
 custom TUI rendering.
 
-## Automatic continuation
+## Completion policy
 
-`wakeOnExit` defaults to `false`. When it is `true`, a completed or failed task delivers one automatic continuation. If the agent is active, the completion steers the next model call instead of waiting for the whole run to settle. If the agent is idle, it starts a turn. Completions within 100 milliseconds share one continuation.
+`completionPolicy` controls what happens when a task ends:
 
-The continuation includes bounded output tails captured before log pruning. Its model-facing message is capped at 32 KiB and includes details for at most 16 tasks. Completed and failed wake-enabled tasks are omitted from the parallel recent-task status because the continuation is authoritative. A manual stop does not start a continuation. Pi also suppresses continuations during session shutdown.
+- `silent` sends no automatic user notification or model continuation.
+- `notify` alerts the user in supported UI modes without starting a model turn.
+  This is the default.
+- `wake` alerts the user and delivers one automatic model continuation for a
+  completed or failed task.
+
+Stored calls that use the old `wakeOnExit` Boolean remain compatible: `true`
+maps to `wake`, while `false` maps to `notify`. New calls must use
+`completionPolicy`.
+
+A wake continuation steers the next model call when the agent is active or
+starts a turn when it is idle. Completions within 100 milliseconds share one
+continuation. The continuation includes bounded output tails captured before
+log pruning. Its model-facing message is capped at 32 KiB and includes details
+for at most 16 tasks. Command output is marked as untrusted data. A manual stop
+does not start a continuation. Pi also suppresses continuations during session
+shutdown.
 
 ## Status context
 
-Before every model call, the extension adds an ephemeral custom message with all active tasks and up to eight recent tasks. The message is sent to the model but is not stored in the session. More completed tasks remain available briefly by ID so a simultaneous completion batch does not lose its logs.
+Before a model call, the extension adds ephemeral context only when there are
+active tasks, unobserved task events, or unacknowledged failures. The context is
+not stored in the session, omits temporary log paths and routine successful
+history, and disappears after acknowledgement. Empty task state does not add a
+message or timestamp.
 
-The model does not need to poll `status` or `logs` while it waits. It can use `logs` when it needs the command output.
+The model does not need to poll `status` or `logs` while it waits. It can use
+`logs` when it needs command output.
 
 ## Limits
 

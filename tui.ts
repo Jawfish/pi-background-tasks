@@ -17,6 +17,7 @@ import {
 
 import type {
   BackgroundTaskManager,
+  CompletionPolicy,
   TaskLogs,
   TaskSnapshot,
   TaskStatus,
@@ -36,6 +37,7 @@ export interface BackgroundTaskToolParams {
   action: BackgroundTaskAction;
   afterByte?: number;
   command?: string;
+  completionPolicy?: CompletionPolicy;
   condition?: TaskWatchCondition;
   inactivitySeconds?: number;
   maxBytes?: number;
@@ -44,7 +46,6 @@ export interface BackgroundTaskToolParams {
   taskId?: string;
   timeoutSeconds?: number;
   wake?: boolean;
-  wakeOnExit?: boolean;
   watchId?: string;
 }
 
@@ -224,13 +225,33 @@ const terminalSummary = function terminalSummary(task: TaskSnapshot): string {
   return "";
 };
 
+const effectiveCompletionPolicy = function effectiveCompletionPolicy(
+  value: {
+    completionPolicy?: CompletionPolicy;
+    wakeOnExit?: boolean;
+  },
+  fallback?: CompletionPolicy
+): CompletionPolicy | undefined {
+  if (value.completionPolicy) {
+    return value.completionPolicy;
+  }
+  if (typeof value.wakeOnExit === "boolean") {
+    return value.wakeOnExit ? "wake" : "notify";
+  }
+  return fallback;
+};
+
 const renderTaskRow = function renderTaskRow(
   task: TaskSnapshot,
   theme: Theme,
   options: { expanded: boolean; now?: number }
 ): string[] {
   const terminal = terminalSummary(task);
-  const wake = task.wakeOnExit ? theme.fg("accent", " · wake on") : "";
+  const completionPolicy = effectiveCompletionPolicy(task, "notify")!;
+  const policy = theme.fg(
+    completionPolicy === "wake" ? "accent" : "muted",
+    ` · ${completionPolicy}`
+  );
   const error = task.error ? ` · ${theme.fg("error", cleanInline(task.error))}` : "";
   const summary = [
     styledStatus(task.status, theme),
@@ -243,7 +264,7 @@ const renderTaskRow = function renderTaskRow(
     .join(" · ");
 
   if (!options.expanded) {
-    return [`${summary}${wake}${error}`];
+    return [`${summary}${policy}${error}`];
   }
 
   const details = [
@@ -255,7 +276,7 @@ const renderTaskRow = function renderTaskRow(
       `${theme.fg("error", "error")} ${cleanInline(task.error)}`
     );
   }
-  return [summary + wake, ...details.map((line) => `  ${line}`)];
+  return [summary + policy, ...details.map((line) => `  ${line}`)];
 };
 
 const textResult = function textResult(text: string): Component {
@@ -276,8 +297,11 @@ export const renderBackgroundTaskCall = function renderBackgroundTaskCall(
     if (identity) {
       text += ` ${theme.fg("muted", cleanInline(identity))}`;
     }
+    const completionPolicy = effectiveCompletionPolicy(args);
     const options = [
-      args.wakeOnExit ? "wake on" : undefined,
+      completionPolicy === undefined
+        ? undefined
+        : `policy ${completionPolicy}`,
       args.timeoutSeconds === undefined
         ? undefined
         : `timeout ${formatUiDuration(args.timeoutSeconds * 1000)}`,
@@ -459,7 +483,7 @@ export const renderBackgroundTaskResult = function renderBackgroundTaskResult(
   });
   const metadata = [
     task.pid === undefined ? undefined : `PID ${String(task.pid)}`,
-    task.wakeOnExit ? "wake on" : "wake off",
+    `policy ${effectiveCompletionPolicy(task, "notify")!}`,
     task.timeoutSeconds === undefined
       ? undefined
       : `timeout ${formatUiDuration(task.timeoutSeconds * 1000)}`,
@@ -903,7 +927,10 @@ export class TaskDashboardComponent implements Component {
     const lines = visible.map((task, index) => {
       const absoluteIndex = start + index;
       const selected = absoluteIndex === this.#selectedIndex;
-      const wake = task.wakeOnExit ? this.#theme.fg("accent", " ↻") : "";
+      const policy =
+        effectiveCompletionPolicy(task, "notify") === "wake"
+          ? this.#theme.fg("accent", " ↻")
+          : "";
       const terminal = terminalSummary(task);
       const content = [
         selected ? this.#theme.fg("accent", " ›") : "  ",
@@ -912,7 +939,7 @@ export class TaskDashboardComponent implements Component {
         this.#theme.fg("accent", task.id),
         this.#theme.fg("text", cleanInline(task.name)),
         terminal ? this.#theme.fg("muted", `(${terminal})`) : "",
-        wake,
+        policy,
       ]
         .filter(Boolean)
         .join(" ");
@@ -952,7 +979,7 @@ export class TaskDashboardComponent implements Component {
       const metadata = [
         `ID ${task.id}`,
         task.pid === undefined ? undefined : `PID ${String(task.pid)}`,
-        task.wakeOnExit ? "wake on" : "wake off",
+        `policy ${effectiveCompletionPolicy(task, "notify")!}`,
         task.timeoutSeconds === undefined
           ? undefined
           : `timeout ${formatUiDuration(task.timeoutSeconds * 1000)}`,
