@@ -307,6 +307,86 @@ describe("background task dashboard", () => {
     expect(readState.cursor(selected.id)).toBe(0);
   });
 
+  test("updates unread counts for open, closed, and switched tasks", async () => {
+    const first = task({ bytesWritten: 12, id: "first001" });
+    const second = task({
+      bytesWritten: 20,
+      id: "second02",
+      status: "completed",
+    });
+    const source = [first, second];
+    const readState = new TaskDashboardReadState();
+    readState.markRead(first.id, 4);
+    readState.markRead(second.id, 5);
+    const requests: { afterByte: number; taskId: string }[] = [];
+    const manager = {
+      list: () => source.map((item) => ({ ...item })),
+      logs: (
+        taskId: string,
+        _requestedBytes?: number,
+        afterByte = 0
+      ): Promise<TaskLogs> => {
+        const selected = source.find((item) => item.id === taskId)!;
+        requests.push({ afterByte, taskId });
+        return Promise.resolve({
+          bytesRead: selected.bytesWritten - afterByte,
+          nextByte: selected.bytesWritten,
+          output: `new ${taskId}`,
+          startByte: afterByte,
+          task: { ...selected },
+          text: "unused",
+          totalBytes: selected.bytesWritten,
+          truncated: false,
+        });
+      },
+      stop: (taskId: string) =>
+        ({ ...source.find((item) => item.id === taskId)! }),
+    };
+    const { tui } = createTui(30);
+    const component = new TaskDashboardComponent({
+      keybindings: new KeybindingsManager(TUI_KEYBINDINGS),
+      manager,
+      onClose() {},
+      readState,
+      theme,
+      tui,
+    });
+    components.push(component);
+
+    let rendered = stripTerminalSequences(component.render(100).join("\n"));
+    expect(rendered).toContain("+8 B unread");
+    expect(rendered).toContain("+15 B unread");
+
+    component.handleInput("\r");
+    await Promise.resolve();
+    await Promise.resolve();
+    rendered = stripTerminalSequences(component.render(100).join("\n"));
+    expect(rendered).toContain("read through byte 12 of 12");
+    expect(readState.cursor(first.id)).toBe(12);
+    expect(readState.cursor(second.id)).toBe(5);
+
+    component.handleInput("\r");
+    first.bytesWritten = 18;
+    component.refresh();
+    rendered = stripTerminalSequences(component.render(100).join("\n"));
+    expect(rendered).toContain("+6 B unread");
+
+    component.handleInput("\r");
+    await Promise.resolve();
+    await Promise.resolve();
+    component.handleInput("j");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(requests).toEqual([
+      { afterByte: 4, taskId: first.id },
+      { afterByte: 12, taskId: first.id },
+      { afterByte: 5, taskId: second.id },
+    ]);
+    expect(readState.cursor(first.id)).toBe(18);
+    expect(readState.cursor(second.id)).toBe(20);
+  });
+
   test("loads a sanitized log tail without rendering terminal controls", async () => {
     const selected = task();
     const dashboard = createDashboard({

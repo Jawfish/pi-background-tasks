@@ -633,8 +633,8 @@ export class TaskDashboardReadState {
     }
   }
 
-  unreadBytes(task: TaskSnapshot): number {
-    return Math.max(0, task.bytesWritten - this.cursor(task.id));
+  unreadBytes(task: TaskSnapshot, committedBytes = task.bytesWritten): number {
+    return Math.max(0, committedBytes - this.cursor(task.id));
   }
 }
 
@@ -968,6 +968,14 @@ export class TaskDashboardComponent implements Component {
           ? this.#theme.fg("accent", " ↻")
           : "";
       const terminal = terminalSummary(task);
+      const unreadBytes = this.#readState.unreadBytes(task);
+      const unread =
+        unreadBytes > 0
+          ? this.#theme.fg(
+              "warning",
+              `+${formatUiBytes(unreadBytes)} unread`
+            )
+          : "";
       const content = [
         selected ? this.#theme.fg("accent", " ›") : "  ",
         styledStatus(task.status, this.#theme, false),
@@ -975,6 +983,7 @@ export class TaskDashboardComponent implements Component {
         this.#theme.fg("accent", task.id),
         this.#theme.fg("text", cleanInline(task.name)),
         terminal ? this.#theme.fg("muted", `(${terminal})`) : "",
+        unread,
         policy,
       ]
         .filter(Boolean)
@@ -993,13 +1002,19 @@ export class TaskDashboardComponent implements Component {
       return ` ${this.#theme.fg("dim", "Task details")}`;
     }
     if (this.#showLogs) {
-      const counts =
-        this.#logs?.bytesRead === undefined
-          ? ""
-          : this.#logs.truncated
-            ? ` · tail ${formatUiBytes(this.#logs.bytesRead)} of ${formatUiBytes(this.#logs.totalBytes)}`
-            : ` · ${formatUiBytes(this.#logs.totalBytes)}`;
-      return ` ${this.#theme.fg("accent", this.#theme.bold("Log tail"))} · ${this.#theme.fg("text", cleanInline(task.name))}${this.#theme.fg("dim", counts)}`;
+      const committedBytes = Math.max(
+        task.bytesWritten,
+        this.#logsTaskId === task.id ? (this.#logs?.totalBytes ?? 0) : 0
+      );
+      const cursor = Math.min(
+        committedBytes,
+        this.#readState.cursor(task.id)
+      );
+      const unreadBytes = this.#readState.unreadBytes(task, committedBytes);
+      const range = ` · read through byte ${String(cursor)} of ${String(committedBytes)}`;
+      const unread =
+        unreadBytes > 0 ? ` · ${formatUiBytes(unreadBytes)} unread` : "";
+      return ` ${this.#theme.fg("accent", this.#theme.bold("Task log"))} · ${this.#theme.fg("text", cleanInline(task.name))}${this.#theme.fg("dim", `${range}${unread}`)}`;
     }
     return ` ${styledStatus(task.status, this.#theme)} · ${this.#theme.fg("text", this.#theme.bold(cleanInline(task.name)))}`;
   }
@@ -1167,6 +1182,10 @@ export class TaskDashboardComponent implements Component {
       this.#logs = logs;
       this.#logsTaskId = taskId;
       this.#readState.markRead(taskId, logs.nextByte ?? logs.totalBytes);
+      this.#tasks[this.#selectedIndex] = {
+        ...task,
+        bytesWritten: Math.max(task.bytesWritten, logs.totalBytes),
+      };
     } catch (error) {
       if (
         this.#disposed ||
