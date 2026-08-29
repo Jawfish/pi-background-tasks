@@ -460,6 +460,37 @@ describe("background tasks extension", () => {
     await harness.emit("session_shutdown");
   });
 
+  test("does not repeat an observed wake failure in status context", async () => {
+    const harness = createHarness();
+    await harness.emit("session_start");
+
+    await harness.execute({
+      action: "start",
+      command: "exit 9",
+      completionPolicy: "wake",
+      name: "Delivered failure",
+    });
+    await waitForCompletion();
+    const delivered = harness.sentMessages[0]?.message;
+    expect(delivered).toBeDefined();
+
+    const context = (await harness.emit("context", {
+      messages: [delivered],
+    })) as { messages: { customType?: string }[] };
+    expect(
+      context.messages.some(
+        (message) => message.customType === "background-task-status"
+      )
+    ).toBe(false);
+    expect(
+      context.messages.filter(
+        (message) => message.customType === "background-task-completion"
+      )
+    ).toHaveLength(1);
+
+    await harness.emit("session_shutdown");
+  });
+
   test("registers and cancels task watches", async () => {
     const harness = createHarness();
     await harness.emit("session_start");

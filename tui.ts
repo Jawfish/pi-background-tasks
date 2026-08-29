@@ -225,15 +225,32 @@ const terminalSummary = function terminalSummary(task: TaskSnapshot): string {
   return "";
 };
 
+const effectiveCompletionPolicy = function effectiveCompletionPolicy(
+  value: {
+    completionPolicy?: CompletionPolicy;
+    wakeOnExit?: boolean;
+  },
+  fallback?: CompletionPolicy
+): CompletionPolicy | undefined {
+  if (value.completionPolicy) {
+    return value.completionPolicy;
+  }
+  if (typeof value.wakeOnExit === "boolean") {
+    return value.wakeOnExit ? "wake" : "notify";
+  }
+  return fallback;
+};
+
 const renderTaskRow = function renderTaskRow(
   task: TaskSnapshot,
   theme: Theme,
   options: { expanded: boolean; now?: number }
 ): string[] {
   const terminal = terminalSummary(task);
+  const completionPolicy = effectiveCompletionPolicy(task, "notify")!;
   const policy = theme.fg(
-    task.completionPolicy === "wake" ? "accent" : "muted",
-    ` · ${task.completionPolicy}`
+    completionPolicy === "wake" ? "accent" : "muted",
+    ` · ${completionPolicy}`
   );
   const error = task.error ? ` · ${theme.fg("error", cleanInline(task.error))}` : "";
   const summary = [
@@ -280,10 +297,11 @@ export const renderBackgroundTaskCall = function renderBackgroundTaskCall(
     if (identity) {
       text += ` ${theme.fg("muted", cleanInline(identity))}`;
     }
+    const completionPolicy = effectiveCompletionPolicy(args);
     const options = [
-      args.completionPolicy === undefined
+      completionPolicy === undefined
         ? undefined
-        : `policy ${args.completionPolicy}`,
+        : `policy ${completionPolicy}`,
       args.timeoutSeconds === undefined
         ? undefined
         : `timeout ${formatUiDuration(args.timeoutSeconds * 1000)}`,
@@ -465,7 +483,7 @@ export const renderBackgroundTaskResult = function renderBackgroundTaskResult(
   });
   const metadata = [
     task.pid === undefined ? undefined : `PID ${String(task.pid)}`,
-    `policy ${task.completionPolicy}`,
+    `policy ${effectiveCompletionPolicy(task, "notify")!}`,
     task.timeoutSeconds === undefined
       ? undefined
       : `timeout ${formatUiDuration(task.timeoutSeconds * 1000)}`,
@@ -910,7 +928,7 @@ export class TaskDashboardComponent implements Component {
       const absoluteIndex = start + index;
       const selected = absoluteIndex === this.#selectedIndex;
       const policy =
-        task.completionPolicy === "wake"
+        effectiveCompletionPolicy(task, "notify") === "wake"
           ? this.#theme.fg("accent", " ↻")
           : "";
       const terminal = terminalSummary(task);
@@ -961,7 +979,7 @@ export class TaskDashboardComponent implements Component {
       const metadata = [
         `ID ${task.id}`,
         task.pid === undefined ? undefined : `PID ${String(task.pid)}`,
-        `policy ${task.completionPolicy}`,
+        `policy ${effectiveCompletionPolicy(task, "notify")!}`,
         task.timeoutSeconds === undefined
           ? undefined
           : `timeout ${formatUiDuration(task.timeoutSeconds * 1000)}`,

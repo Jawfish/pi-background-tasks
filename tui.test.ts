@@ -333,6 +333,28 @@ describe("background task transcript rendering", () => {
     expect(rendered).not.toContain("should not be shown");
   });
 
+  test("renders legacy task snapshots with an effective policy", () => {
+    const current = task();
+    const { completionPolicy: _completionPolicy, ...legacyFields } = current;
+    const legacy = {
+      ...legacyFields,
+      wakeOnExit: true,
+    } as unknown as TaskSnapshot;
+    const result = renderBackgroundTaskResult(
+      {
+        content: [{ type: "text", text: "started" }],
+        details: { task: legacy },
+      },
+      { expanded: true, isPartial: false },
+      theme,
+      { args: { action: "start" }, isError: false }
+    );
+
+    const rendered = stripTerminalSequences(result.render(80).join("\n"));
+    expect(rendered).toContain("policy wake");
+    expect(rendered).not.toContain("undefined");
+  });
+
   test("renders compact calls, results, and completion cards", () => {
     const running = task();
     const call = renderBackgroundTaskCall(

@@ -256,13 +256,16 @@ export class CompletionDeliveryLedger {
     }
   }
 
-  markObservedByDeliveryId(deliveryIds: readonly string[]): void {
+  markObservedByDeliveryId(deliveryIds: readonly string[]): string[] {
+    const taskIds = new Set<string>();
     for (const deliveryId of deliveryIds) {
       const record = this.#records.get(deliveryId);
       if (record) {
         record.state = "observed";
+        taskIds.add(record.taskId);
       }
     }
+    return [...taskIds];
   }
 
   markObservedByTaskId(taskIds: readonly string[]): void {
@@ -904,9 +907,12 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     if (shuttingDown) {
       return { messages: event.messages };
     }
-    deliveryLedger.markObservedByDeliveryId(
+    const observedTaskIds = deliveryLedger.markObservedByDeliveryId(
       deliveryIdsInMessages(event.messages)
     );
+    for (const taskId of observedTaskIds) {
+      unacknowledgedFailures.delete(taskId);
+    }
     const unobserved = deliveryLedger.unobserved();
     const fallbackKind = unobserved[0]?.kind;
     const fallback = unobserved
