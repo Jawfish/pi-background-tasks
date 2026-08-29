@@ -11,6 +11,6 @@
     "verbatimModuleSyntax": true,
     "types": ["bun", "node"]
   },
-  "include": ["*.ts"],
+  "include": ["*.ts", "integration/**/*.ts"],
   "exclude": ["node_modules"]
 }

@@ -16,8 +16,10 @@ const provider = fauxProvider({
   tokenSize: { max: 64, min: 64 },
 });
 
+let rejectFinished: ((error: Error) => void) | undefined;
 let resolveFinished: (() => void) | undefined;
-const finished = new Promise<void>((resolve) => {
+const finished = new Promise<void>((resolve, reject) => {
+  rejectFinished = reject;
   resolveFinished = resolve;
 });
 
@@ -51,8 +53,17 @@ export default function headlessProvider(pi: ExtensionAPI): void {
       return;
     }
     data.service.subscribe((event) => {
-      if (event.type === "finished") {
+      if (event.type !== "finished" || event.task.name !== "Headless lifecycle") {
+        return;
+      }
+      if (event.task.status === "completed" && event.output === "headless-output") {
         resolveFinished?.();
+      } else {
+        rejectFinished?.(
+          new Error(
+            `Headless task ended as ${event.task.status} with output ${JSON.stringify(event.output)}`
+          )
+        );
       }
     });
   });

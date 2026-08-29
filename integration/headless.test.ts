@@ -448,9 +448,8 @@ describe("background tasks in headless Pi modes", () => {
       const rootDir = await createHeadlessRoot();
       const result = await runPrintCli(rootDir);
 
-      expect(result.stdout).toContain("Headless completion handled");
-      expect(result.stderr).not.toContain("Extension error");
-      expect(result.stderr).not.toContain("No API key");
+      expect(result.stdout).toBe("Headless completion handled\n");
+      expect(result.stderr).toBe("");
       await expectProbeStopped(rootDir);
     },
     INTEGRATION_TIMEOUT_MS
@@ -477,7 +476,7 @@ describe("background tasks in headless Pi modes", () => {
       expect(
         result.events.some((event) => event.type === "extension_error")
       ).toBe(false);
-      expect(result.stderr).not.toContain("Extension error");
+      expect(result.stderr).toBe("");
       await expectProbeStopped(rootDir);
     },
     INTEGRATION_TIMEOUT_MS
