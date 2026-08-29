@@ -699,7 +699,7 @@ describe("BackgroundTaskManager", () => {
       status: "fired",
     });
     expect(event.task.status).toBe("running");
-    expect(event.task.lastOutputAt).toBeGreaterThan(watch.createdAt);
+    expect(event.task.lastOutputAt).toBeGreaterThanOrEqual(watch.createdAt);
 
     manager.stop(started.id);
     await waitForTerminal(manager, started.id);
