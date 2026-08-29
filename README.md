@@ -128,6 +128,20 @@ every managed process group and deletes the log directory. Set
 shutdown reason, including quit, new, resume, and fork, stops all tasks
 immediately.
 
+## Extension service
+
+Other Pi extensions can share this manager instead of spawning their own
+processes. The contract lives in `service.ts` and is versioned as `v1`.
+
+- Channel names, the `version` value, and existing field meanings stay fixed
+  while `v1` is published.
+- New optional request fields, response fields, and lifecycle event types may
+  appear, so consumers must ignore unknown event types.
+- A breaking change ships as a new `v2` channel set, published next to `v1` for
+  at least one minor release before `v1` is removed.
+- The service returns immutable snapshots only. It never exposes child
+  processes, file handles, or Pi-internal objects.
+
 ## Limits
 
 - POSIX systems only
