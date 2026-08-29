@@ -249,13 +249,18 @@ export const formatTaskList = function formatTaskList(
 export const formatModelContext = function formatModelContext(
   tasks: readonly TaskSnapshot[]
 ): string {
+  if (tasks.length === 0) {
+    return "";
+  }
+
   const active = tasks.filter((task) => isActiveStatus(task.status));
-  const recent = tasks.filter((task) => !isActiveStatus(task.status));
+  const failures = tasks.filter((task) => task.status === "failed");
+  if (active.length === 0 && failures.length === 0) {
+    return "";
+  }
   const lines = ["<background-tasks>"];
 
-  if (active.length === 0) {
-    lines.push("Active: none");
-  } else {
+  if (active.length > 0) {
     lines.push("Active:");
     for (const task of active) {
       const policy = `, completion policy ${task.completionPolicy}`;
@@ -263,33 +268,31 @@ export const formatModelContext = function formatModelContext(
         ? `, ${String(task.watches.length)} active ${task.watches.length === 1 ? "watch" : "watches"}`
         : "";
       lines.push(
-        `- ${task.id} [${task.status}${policy}${watches}] ${escapeXml(task.name)}; log: ${escapeXml(task.logPath)}`
+        `- ${task.id} [${task.status}${policy}${watches}] ${escapeXml(task.name)}`
       );
     }
   }
 
-  if (recent.length > 0) {
-    lines.push("Recent:");
-    for (const task of recent) {
+  if (failures.length > 0) {
+    lines.push("Unacknowledged failures:");
+    for (const task of failures) {
       let terminal = "";
       if (typeof task.exitCode === "number") {
         terminal = `, exit ${String(task.exitCode)}`;
       } else if (task.signal) {
         terminal = `, signal ${task.signal}`;
       }
+      const error = task.error
+        ? `; error: ${escapeXml(truncate(task.error, 240))}`
+        : "";
       lines.push(
-        `- ${task.id} [${task.status}${terminal}] ${escapeXml(task.name)}; log: ${escapeXml(task.logPath)}`
+        `- ${task.id} [failed${terminal}] ${escapeXml(task.name)}${error}`
       );
     }
   }
 
-  if (recent.some((task) => task.status === "failed")) {
-    lines.push(
-      "For a recent failed task, inspect the original command and read logs once if needed. Correct the cause, and retry only when retry is safe. Do not retry an unchanged command or poll."
-    );
-  }
   lines.push(
-    "Use background_task for start, status, logs, or stop. This is the current status for this model call.",
+    "Use background_task for status or logs only when details are needed; do not poll.",
     "</background-tasks>"
   );
   return lines.join("\n");
