@@ -43,7 +43,7 @@ const task = function task(
     pid: 1234,
     startedAt: Date.now() - 5000,
     status: "running",
-    wakeOnExit: true,
+    completionPolicy: "wake",
     ...overrides,
   };
 };
@@ -341,7 +341,7 @@ describe("background task transcript rendering", () => {
         command: "bun test",
         name: "Test suite",
         timeoutSeconds: 120,
-        wakeOnExit: true,
+        completionPolicy: "wake",
       },
       theme,
       { expanded: false }
@@ -380,7 +380,7 @@ describe("background task transcript rendering", () => {
       expect(lines.every((line) => visibleWidth(line) <= 48)).toBe(true);
     }
     expect(stripTerminalSequences(call.render(80).join("\n"))).toContain(
-      "wake on"
+      "policy wake"
     );
     expect(stripTerminalSequences(result.render(80).join("\n"))).toContain(
       "Running"

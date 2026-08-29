@@ -134,7 +134,7 @@ describe("BackgroundTaskManager", () => {
       command: "printf 'hello from task'",
       cwd: process.cwd(),
       name: "Greeting",
-      wakeOnExit: true,
+      completionPolicy: "wake",
     });
 
     const terminal = await waitForTerminal(manager, started.id);
@@ -143,7 +143,7 @@ describe("BackgroundTaskManager", () => {
     expect(terminal).toMatchObject({
       name: "Greeting",
       status: "completed",
-      wakeOnExit: true,
+      completionPolicy: "wake",
     });
     expect(terminal.lastOutputAt).toBeGreaterThanOrEqual(terminal.startedAt);
     expect(terminal.bytesWritten).toBe(logs.totalBytes);
@@ -770,13 +770,13 @@ describe("BackgroundTaskManager", () => {
     const first = await manager.start({
       command: "printf first-output",
       cwd: process.cwd(),
-      wakeOnExit: true,
+      completionPolicy: "wake",
     });
     await waitForTerminal(manager, first.id);
     const second = await manager.start({
       command: "printf second-output",
       cwd: process.cwd(),
-      wakeOnExit: true,
+      completionPolicy: "wake",
     });
     await waitForTerminal(manager, second.id);
 
@@ -1001,7 +1001,7 @@ describe("task formatting", () => {
     name: "Build <main>",
     startedAt: 1000,
     status: "running",
-    wakeOnExit: true,
+    completionPolicy: "wake",
   };
 
   test("injects active status and escapes model-controlled names", () => {
@@ -1009,7 +1009,7 @@ describe("task formatting", () => {
 
     expect(context).toContain("abc12345 [running");
     expect(context).toContain("Build &lt;main&gt;");
-    expect(context).toContain("automatic continuation enabled");
+    expect(context).toContain("completion policy wake");
 
     const failedContext = formatModelContext([
       {
@@ -1029,7 +1029,7 @@ describe("task formatting", () => {
   test("formats an empty and populated task list", () => {
     expect(formatTaskList([])).toBe("No background tasks.");
     expect(formatTaskList([task], 2000)).toContain(
-      "abc12345 running 1s wake=on"
+      "abc12345 running 1s policy=wake"
     );
   });
 

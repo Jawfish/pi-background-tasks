@@ -25,6 +25,7 @@ interface ToolParams {
   taskId?: string;
   timeoutSeconds?: number;
   wake?: boolean;
+  completionPolicy?: "silent" | "notify" | "wake";
   wakeOnExit?: boolean;
   watchId?: string;
 }
@@ -38,6 +39,7 @@ interface ToolResult {
     output?: string;
     startByte?: number;
     task?: {
+      completionPolicy?: "silent" | "notify" | "wake";
       id: string;
       status: string;
       watches?: { id: string; status: string }[];
@@ -53,6 +55,7 @@ interface ToolResult {
 }
 
 interface RegisteredTool {
+  prepareArguments?: (args: unknown) => ToolParams;
   description: string;
   promptGuidelines?: readonly string[];
   promptSnippet?: string;
@@ -140,9 +143,10 @@ const createHarness = function createHarness(options: HarnessOptions = {}) {
     if (!tool) {
       throw new Error("background_task was not registered");
     }
+    const prepared = tool.prepareArguments?.(params) ?? params;
     return await tool.execute(
       crypto.randomUUID(),
-      params,
+      prepared,
       undefined,
       undefined,
       ctx
@@ -201,11 +205,48 @@ const fakeCompletion = function fakeCompletion(
       name: "'".repeat(60),
       startedAt: 1000,
       status: "failed",
-      wakeOnExit: true,
+      completionPolicy: "wake",
     },
     ...overrides,
   };
 };
+
+describe("completion policy compatibility", () => {
+  test("prepares legacy wake values and rejects conflicting policies", async () => {
+    const harness = createHarness();
+
+    const wake = await harness.execute({
+      action: "start",
+      command: "true",
+      wakeOnExit: true,
+    });
+    expect(wake.details.task?.completionPolicy).toBe("wake");
+
+    const notify = await harness.execute({
+      action: "start",
+      command: "true",
+      wakeOnExit: false,
+    });
+    expect(notify.details.task?.completionPolicy).toBe("notify");
+
+    const defaultPolicy = await harness.execute({
+      action: "start",
+      command: "true",
+    });
+    expect(defaultPolicy.details.task?.completionPolicy).toBe("notify");
+
+    expect(
+      harness.execute({
+        action: "start",
+        command: "true",
+        completionPolicy: "wake",
+        wakeOnExit: true,
+      })
+    ).rejects.toThrow("conflicts");
+
+    await harness.emit("session_shutdown");
+  });
+});
 
 describe("completion delivery ledger", () => {
   test("tracks stable IDs, wake attempts, and enqueue state", () => {
@@ -323,7 +364,9 @@ describe("background tasks extension", () => {
     const active = (await harness.emit("context", {
       messages: [],
     })) as { messages: { content: string }[] };
-    expect(active.messages.at(-1)?.content).toContain(`${id} [running]`);
+    expect(active.messages.at(-1)?.content).toContain(
+      `${id} [running, completion policy notify]`
+    );
 
     await harness.execute({ action: "stop", taskId: id });
     await waitForCompletion();
@@ -545,13 +588,13 @@ describe("background tasks extension", () => {
         action: "start",
         command: "sleep 0.05; printf first",
         name: "First task",
-        wakeOnExit: true,
+        completionPolicy: "wake",
       }),
       harness.execute({
         action: "start",
         command: "sleep 0.05; printf second",
         name: "Second task",
-        wakeOnExit: true,
+        completionPolicy: "wake",
       }),
     ]);
     await waitForCompletion();
@@ -615,7 +658,7 @@ describe("background tasks extension", () => {
       action: "start",
       command: "true",
       name: "Failed send",
-      wakeOnExit: true,
+      completionPolicy: "wake",
     });
     await waitForCompletion();
     await waitForCompletion();
@@ -655,7 +698,7 @@ describe("background tasks extension", () => {
       action: "start",
       command: "true",
       name: "Failed notification",
-      wakeOnExit: true,
+      completionPolicy: "wake",
     });
     await waitForCompletion();
 
@@ -676,7 +719,7 @@ describe("background tasks extension", () => {
             action: "start",
             command: "true",
             name: `Batch ${String(offset + index)}`,
-            wakeOnExit: true,
+            completionPolicy: "wake",
           });
         })
       );
@@ -719,7 +762,7 @@ describe("background tasks extension", () => {
         action: "start",
         command: "true",
         name: `Observed by ${action}`,
-        wakeOnExit: true,
+        completionPolicy: "wake",
       });
       await harness.notificationReceived;
 
@@ -756,7 +799,7 @@ describe("background tasks extension", () => {
       action: "start",
       command: "sleep 10",
       name: "Stopped task",
-      wakeOnExit: true,
+      completionPolicy: "wake",
     });
     await harness.execute({
       action: "stop",
@@ -784,7 +827,7 @@ describe("background tasks extension", () => {
       action: "start",
       command: "true",
       name: "Finishes before shutdown",
-      wakeOnExit: true,
+      completionPolicy: "wake",
     });
     await harness.notificationReceived;
     await harness.emit("session_shutdown");

@@ -29,6 +29,7 @@ export type TaskStatus =
   | "failed"
   | "stopped";
 
+export type CompletionPolicy = "silent" | "notify" | "wake";
 export type TaskWatchCondition = "output" | "exit" | "inactivity";
 export type TaskWatchStatus = "active" | "fired" | "cancelled" | "expired";
 
@@ -77,7 +78,7 @@ export interface TaskSnapshot {
   error?: string;
   bytesWritten: number;
   lastOutputAt?: number;
-  wakeOnExit: boolean;
+  completionPolicy: CompletionPolicy;
   timeoutSeconds?: number;
   watches?: TaskWatchSnapshot[];
 }
@@ -86,7 +87,7 @@ export interface StartTaskInput {
   name?: string;
   command: string;
   cwd: string;
-  wakeOnExit?: boolean;
+  completionPolicy?: CompletionPolicy;
   timeoutSeconds?: number;
 }
 
@@ -227,12 +228,12 @@ export const formatTaskList = function formatTaskList(
     } else if (task.signal) {
       terminal = ` signal=${task.signal}`;
     }
-    const wake = task.wakeOnExit ? " wake=on" : "";
+    const policy = ` policy=${task.completionPolicy}`;
     const watches = task.watches?.length
       ? ` watches=${String(task.watches.length)}`
       : "";
     const error = task.error ? ` error=${truncate(task.error, 120)}` : "";
-    return `${task.id} ${task.status} ${elapsed}${terminal}${wake}${watches}: ${task.name}${error}\n  log: ${task.logPath}`;
+    return `${task.id} ${task.status} ${elapsed}${terminal}${policy}${watches}: ${task.name}${error}\n  log: ${task.logPath}`;
   };
 
   return [
@@ -257,12 +258,12 @@ export const formatModelContext = function formatModelContext(
   } else {
     lines.push("Active:");
     for (const task of active) {
-      const wake = task.wakeOnExit ? ", automatic continuation enabled" : "";
+      const policy = `, completion policy ${task.completionPolicy}`;
       const watches = task.watches?.length
         ? `, ${String(task.watches.length)} active ${task.watches.length === 1 ? "watch" : "watches"}`
         : "";
       lines.push(
-        `- ${task.id} [${task.status}${wake}${watches}] ${escapeXml(task.name)}; log: ${escapeXml(task.logPath)}`
+        `- ${task.id} [${task.status}${policy}${watches}] ${escapeXml(task.name)}; log: ${escapeXml(task.logPath)}`
       );
     }
   }
@@ -601,7 +602,7 @@ export class BackgroundTaskManager {
         status: "running",
         stream,
         timeoutSeconds,
-        wakeOnExit: input.wakeOnExit ?? false,
+        completionPolicy: input.completionPolicy ?? "notify",
         watchState: new Map(),
       };
       this.#tasks.set(id, task);
@@ -972,7 +973,7 @@ export class BackgroundTaskManager {
       startedAt: task.startedAt,
       status: task.status,
       timeoutSeconds: task.timeoutSeconds,
-      wakeOnExit: task.wakeOnExit,
+      completionPolicy: task.completionPolicy,
       watches: [...task.watchState.values()]
         .filter((watch) => watch.status === "active")
         .map((watch) => BackgroundTaskManager.#watchSnapshot(watch)),
@@ -1392,7 +1393,7 @@ export class BackgroundTaskManager {
     const completion: TaskCompletion = {
       task: BackgroundTaskManager.#snapshot(task),
     };
-    if (task.wakeOnExit) {
+    if (task.completionPolicy === "wake") {
       try {
         const logs = await this.logs(task.id, MAX_COMPLETION_LOG_BYTES);
         completion.output = logs.output;

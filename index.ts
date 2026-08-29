@@ -4,6 +4,7 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import type { Static } from "typebox";
 
 import {
   BackgroundTaskManager,
@@ -53,6 +54,12 @@ const Parameters = Type.Object({
     Type.String({
       description:
         "POSIX shell command for action=start. It runs in -c mode under the configured POSIX shell (sh from PATH by default), from Pi's current working directory, with Pi's environment. Shell quoting and command escapes are not rewritten.",
+    })
+  ),
+  completionPolicy: Type.Optional(
+    StringEnum(["silent", "notify", "wake"] as const, {
+      description:
+        "For action=start: silent sends nothing, notify alerts the user, and wake also continues the model. Default: notify.",
     })
   ),
   condition: Type.Optional(
@@ -110,13 +117,37 @@ const Parameters = Type.Object({
       minimum: 1,
     })
   ),
-  wakeOnExit: Type.Optional(
-    Type.Boolean({
-      description:
-        "For action=start, deliver one automatic continuation when the task completes or fails. Default: false.",
-    })
-  ),
 });
+
+type BackgroundTaskParameters = Static<typeof Parameters>;
+
+export const prepareBackgroundTaskArguments = function prepareBackgroundTaskArguments(
+  args: unknown
+): BackgroundTaskParameters {
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    return args as BackgroundTaskParameters;
+  }
+  const input = args as Record<string, unknown>;
+  if (input.action !== "start") {
+    return input as BackgroundTaskParameters;
+  }
+  const hasLegacyPolicy = Object.hasOwn(input, "wakeOnExit");
+  const hasCurrentPolicy = Object.hasOwn(input, "completionPolicy");
+  if (hasLegacyPolicy && hasCurrentPolicy) {
+    throw new Error("completionPolicy conflicts with legacy wakeOnExit");
+  }
+  if (hasLegacyPolicy && typeof input.wakeOnExit === "boolean") {
+    const { wakeOnExit, ...prepared } = input;
+    return {
+      ...prepared,
+      completionPolicy: wakeOnExit ? "wake" : "notify",
+    } as BackgroundTaskParameters;
+  }
+  return {
+    ...input,
+    completionPolicy: input.completionPolicy ?? "notify",
+  } as BackgroundTaskParameters;
+};
 
 export type CompletionDeliveryState = "pending" | "enqueued" | "observed";
 
@@ -588,7 +619,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     const { task } = completion;
     const shouldWake =
       !shuttingDown &&
-      task.wakeOnExit &&
+      task.completionPolicy === "wake" &&
       (task.status === "completed" || task.status === "failed");
     if (shouldWake) {
       deliveryLedger.add(completion);
@@ -676,12 +707,13 @@ const backgroundTasksExtension = function backgroundTasksExtension(
             command: params.command,
             cwd: ctx.cwd,
             name: params.name,
+            completionPolicy: params.completionPolicy,
             timeoutSeconds: params.timeoutSeconds,
-            wakeOnExit: params.wakeOnExit ?? false,
           });
-          const continuation = task.wakeOnExit
-            ? "Automatic continuation: enabled. Do not poll or sleep to wait."
-            : "Automatic continuation: disabled. The current status will still appear on each model call.";
+          const continuation =
+            task.completionPolicy === "wake"
+              ? "Completion policy: wake. Do not poll or sleep to wait."
+              : `Completion policy: ${task.completionPolicy}.`;
           return {
             content: [
               {
@@ -797,6 +829,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     label: "Background Task",
     name: "background_task",
     parameters: Parameters,
+    prepareArguments: prepareBackgroundTaskArguments,
     renderCall(args, theme, context) {
       return renderBackgroundTaskCall(args, theme, context);
     },
@@ -807,8 +840,8 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       "Use background_task with action=start for commands that should run without blocking the agent.",
       "Use POSIX shell syntax in background_task start commands. Commands run in -c mode under the configured POSIX shell (sh from PATH by default), from Pi's current working directory, with Pi's environment. Shell quoting and command escapes are not rewritten.",
       "For quote-heavy or multiline programs in another language, write the program to a file or use a quoted heredoc. Do not use literal \\uXXXX sequences as substitutes for shell quotes.",
-      "Set background_task wakeOnExit=true only when the agent must continue automatically after that task completes or fails.",
-      "Do not poll background_task status or logs merely to wait. Current active status is injected before every model call, and wakeOnExit steers completion into the next model call or starts a turn when idle.",
+      "Set background_task completionPolicy=wake only when the agent must continue automatically after the task completes or fails. Use notify for a user alert without a model turn, or silent for no automatic message.",
+      "Do not poll background_task status or logs merely to wait. Current active status is injected before every model call, and completionPolicy=wake steers completion into the next model call or starts a turn when idle.",
       "Use background_task logs only when task output is needed. Keep maxBytes modest to protect model context, and reuse a returned nextByte as afterByte for incremental reads.",
       "Use one-shot watches for output, exit, or inactivity conditions instead of polling. Cancel an active watch with action=unwatch.",
     ],
@@ -876,7 +909,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
         content: formatModelContext(
           manager.list().filter(
             (task) =>
-              !task.wakeOnExit ||
+              task.completionPolicy !== "wake" ||
               (task.status !== "completed" && task.status !== "failed")
           )
         ),

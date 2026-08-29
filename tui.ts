@@ -17,6 +17,7 @@ import {
 
 import type {
   BackgroundTaskManager,
+  CompletionPolicy,
   TaskLogs,
   TaskSnapshot,
   TaskStatus,
@@ -36,6 +37,7 @@ export interface BackgroundTaskToolParams {
   action: BackgroundTaskAction;
   afterByte?: number;
   command?: string;
+  completionPolicy?: CompletionPolicy;
   condition?: TaskWatchCondition;
   inactivitySeconds?: number;
   maxBytes?: number;
@@ -44,7 +46,6 @@ export interface BackgroundTaskToolParams {
   taskId?: string;
   timeoutSeconds?: number;
   wake?: boolean;
-  wakeOnExit?: boolean;
   watchId?: string;
 }
 
@@ -230,7 +231,10 @@ const renderTaskRow = function renderTaskRow(
   options: { expanded: boolean; now?: number }
 ): string[] {
   const terminal = terminalSummary(task);
-  const wake = task.wakeOnExit ? theme.fg("accent", " · wake on") : "";
+  const policy = theme.fg(
+    task.completionPolicy === "wake" ? "accent" : "muted",
+    ` · ${task.completionPolicy}`
+  );
   const error = task.error ? ` · ${theme.fg("error", cleanInline(task.error))}` : "";
   const summary = [
     styledStatus(task.status, theme),
@@ -243,7 +247,7 @@ const renderTaskRow = function renderTaskRow(
     .join(" · ");
 
   if (!options.expanded) {
-    return [`${summary}${wake}${error}`];
+    return [`${summary}${policy}${error}`];
   }
 
   const details = [
@@ -255,7 +259,7 @@ const renderTaskRow = function renderTaskRow(
       `${theme.fg("error", "error")} ${cleanInline(task.error)}`
     );
   }
-  return [summary + wake, ...details.map((line) => `  ${line}`)];
+  return [summary + policy, ...details.map((line) => `  ${line}`)];
 };
 
 const textResult = function textResult(text: string): Component {
@@ -277,7 +281,9 @@ export const renderBackgroundTaskCall = function renderBackgroundTaskCall(
       text += ` ${theme.fg("muted", cleanInline(identity))}`;
     }
     const options = [
-      args.wakeOnExit ? "wake on" : undefined,
+      args.completionPolicy === undefined
+        ? undefined
+        : `policy ${args.completionPolicy}`,
       args.timeoutSeconds === undefined
         ? undefined
         : `timeout ${formatUiDuration(args.timeoutSeconds * 1000)}`,
@@ -459,7 +465,7 @@ export const renderBackgroundTaskResult = function renderBackgroundTaskResult(
   });
   const metadata = [
     task.pid === undefined ? undefined : `PID ${String(task.pid)}`,
-    task.wakeOnExit ? "wake on" : "wake off",
+    `policy ${task.completionPolicy}`,
     task.timeoutSeconds === undefined
       ? undefined
       : `timeout ${formatUiDuration(task.timeoutSeconds * 1000)}`,
@@ -903,7 +909,10 @@ export class TaskDashboardComponent implements Component {
     const lines = visible.map((task, index) => {
       const absoluteIndex = start + index;
       const selected = absoluteIndex === this.#selectedIndex;
-      const wake = task.wakeOnExit ? this.#theme.fg("accent", " ↻") : "";
+      const policy =
+        task.completionPolicy === "wake"
+          ? this.#theme.fg("accent", " ↻")
+          : "";
       const terminal = terminalSummary(task);
       const content = [
         selected ? this.#theme.fg("accent", " ›") : "  ",
@@ -912,7 +921,7 @@ export class TaskDashboardComponent implements Component {
         this.#theme.fg("accent", task.id),
         this.#theme.fg("text", cleanInline(task.name)),
         terminal ? this.#theme.fg("muted", `(${terminal})`) : "",
-        wake,
+        policy,
       ]
         .filter(Boolean)
         .join(" ");
@@ -952,7 +961,7 @@ export class TaskDashboardComponent implements Component {
       const metadata = [
         `ID ${task.id}`,
         task.pid === undefined ? undefined : `PID ${String(task.pid)}`,
-        task.wakeOnExit ? "wake on" : "wake off",
+        `policy ${task.completionPolicy}`,
         task.timeoutSeconds === undefined
           ? undefined
           : `timeout ${formatUiDuration(task.timeoutSeconds * 1000)}`,
