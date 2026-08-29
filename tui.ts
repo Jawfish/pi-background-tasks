@@ -26,6 +26,7 @@ export type BackgroundTaskAction = "start" | "status" | "logs" | "stop";
 
 export interface BackgroundTaskToolParams {
   action: BackgroundTaskAction;
+  afterByte?: number;
   command?: string;
   maxBytes?: number;
   name?: string;
@@ -40,6 +41,9 @@ export interface BackgroundTaskToolDetails {
   text?: string;
   output?: string;
   bytesRead?: number;
+  droppedBytes?: number;
+  nextByte?: number;
+  startByte?: number;
   totalBytes?: number;
   truncated?: boolean;
 }
@@ -272,8 +276,13 @@ export const renderBackgroundTaskCall = function renderBackgroundTaskCall(
     }
   } else if (args.taskId) {
     text += ` ${theme.fg("accent", cleanInline(args.taskId))}`;
-    if (args.action === "logs" && args.maxBytes !== undefined) {
-      text += theme.fg("dim", ` · up to ${formatUiBytes(args.maxBytes)}`);
+    if (args.action === "logs") {
+      if (args.afterByte !== undefined) {
+        text += theme.fg("dim", ` · after byte ${String(args.afterByte)}`);
+      }
+      if (args.maxBytes !== undefined) {
+        text += theme.fg("dim", ` · up to ${formatUiBytes(args.maxBytes)}`);
+      }
     }
   } else if (args.action === "status") {
     text += theme.fg("dim", " · all tasks");
@@ -307,9 +316,11 @@ const renderLogResult = function renderLogResult(
     const counts =
       details?.bytesRead === undefined || details.totalBytes === undefined
         ? ""
-        : details.truncated
-          ? ` · tail ${formatUiBytes(details.bytesRead)} of ${formatUiBytes(details.totalBytes)}`
-          : ` · ${formatUiBytes(details.totalBytes)}`;
+        : details.startByte !== undefined && details.nextByte !== undefined
+          ? ` · bytes ${String(details.startByte)}-${String(details.nextByte)} of ${String(details.totalBytes)}${details.droppedBytes ? ` · skipped ${String(details.droppedBytes)}` : ""}`
+          : details.truncated
+            ? ` · tail ${formatUiBytes(details.bytesRead)} of ${formatUiBytes(details.totalBytes)}`
+            : ` · ${formatUiBytes(details.totalBytes)}`;
     lines.push(
       `${styledStatus(task.status, theme)} · ${theme.fg("text", cleanInline(task.name))}${theme.fg("dim", counts)}`
     );

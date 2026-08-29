@@ -267,6 +267,46 @@ describe("background task dashboard", () => {
 });
 
 describe("background task transcript rendering", () => {
+  test("renders incremental cursor calls and ranges", () => {
+    const selected = task({ status: "completed" });
+    const call = renderBackgroundTaskCall(
+      {
+        action: "logs",
+        afterByte: 2,
+        maxBytes: 16,
+        taskId: selected.id,
+      },
+      theme,
+      { expanded: false }
+    );
+    const result = renderBackgroundTaskResult(
+      {
+        content: [{ type: "text", text: "unused" }],
+        details: {
+          bytesRead: 2,
+          droppedBytes: 1,
+          nextByte: 5,
+          output: "ok",
+          startByte: 3,
+          task: selected,
+          totalBytes: 9,
+          truncated: true,
+        },
+      },
+      { expanded: false, isPartial: false },
+      theme,
+      { args: { action: "logs" }, isError: false }
+    );
+
+    expect(stripTerminalSequences(call.render(80).join("\n"))).toContain(
+      "after byte 2"
+    );
+    const rendered = stripTerminalSequences(result.render(80).join("\n"));
+    expect(rendered).toContain("bytes 3-5 of 9");
+    expect(rendered).toContain("skipped 1");
+    expect(rendered).toContain("ok");
+  });
+
   test("does not report an empty captured output as unavailable", () => {
     const completion = renderCompletionMessage(
       {

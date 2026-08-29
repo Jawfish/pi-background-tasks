@@ -15,6 +15,7 @@ import backgroundTasksExtension, {
 
 interface ToolParams {
   action: "start" | "status" | "logs" | "stop";
+  afterByte?: number;
   command?: string;
   maxBytes?: number;
   name?: string;
@@ -25,7 +26,16 @@ interface ToolParams {
 
 interface ToolResult {
   content: { type: "text"; text: string }[];
-  details: { task?: { id: string; status: string }; tasks?: unknown[] };
+  details: {
+    bytesRead?: number;
+    droppedBytes?: number;
+    nextByte?: number;
+    output?: string;
+    startByte?: number;
+    task?: { id: string; status: string };
+    tasks?: unknown[];
+    totalBytes?: number;
+  };
 }
 
 interface RegisteredTool {
@@ -268,6 +278,36 @@ describe("background tasks extension", () => {
 
     await harness.execute({ action: "stop", taskId: id });
     await waitForCompletion();
+    await harness.emit("session_shutdown");
+  });
+
+  test("returns incremental log cursor metadata", async () => {
+    const harness = createHarness();
+    await harness.emit("session_start");
+    const started = await harness.execute({
+      action: "start",
+      command: "printf abcdef",
+      name: "Cursor task",
+    });
+    await harness.notificationReceived;
+
+    const logs = await harness.execute({
+      action: "logs",
+      afterByte: 2,
+      maxBytes: 2,
+      taskId: started.details.task?.id,
+    });
+
+    expect(logs.details).toMatchObject({
+      bytesRead: 2,
+      droppedBytes: 0,
+      nextByte: 4,
+      output: "cd",
+      startByte: 2,
+      totalBytes: 6,
+    });
+    expect(logs.content[0]?.text).toContain("[Bytes 2-4 of 6]");
+
     await harness.emit("session_shutdown");
   });
 

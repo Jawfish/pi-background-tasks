@@ -37,6 +37,14 @@ const Parameters = Type.Object({
   action: StringEnum(["start", "status", "logs", "stop"] as const, {
     description: "Operation to perform",
   }),
+  afterByte: Type.Optional(
+    Type.Integer({
+      description:
+        "For action=logs, read forward after this byte offset and return a nextByte cursor.",
+      maximum: Number.MAX_SAFE_INTEGER,
+      minimum: 0,
+    })
+  ),
   command: Type.Optional(
     Type.String({ description: "Shell command for action=start" })
   ),
@@ -454,7 +462,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       "Manage session-scoped background shell tasks.",
       "Actions: start, status, logs, stop.",
       "Task status is injected before every model call, so status and logs are not polling tools.",
-      `Log reads are capped at ${String(MAX_LOG_READ_BYTES)} bytes.`,
+      `Log reads are capped at ${String(MAX_LOG_READ_BYTES)} bytes. Reuse nextByte as afterByte for incremental reads.`,
     ].join(" "),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       currentCtx = ctx;
@@ -507,7 +515,11 @@ const backgroundTasksExtension = function backgroundTasksExtension(
           if (!params.taskId) {
             throw new Error("taskId is required for action=logs");
           }
-          const logs = await manager.logs(params.taskId, params.maxBytes);
+          const logs = await manager.logs(
+            params.taskId,
+            params.maxBytes,
+            params.afterByte
+          );
           if (
             logs.task.status === "completed" ||
             logs.task.status === "failed"
@@ -555,7 +567,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       "Use background_task with action=start for commands that should run without blocking the agent.",
       "Set background_task wakeOnExit=true only when the agent must continue automatically after that task completes or fails.",
       "Do not poll background_task status or logs merely to wait. Current active status is injected before every model call, and wakeOnExit steers completion into the next model call or starts a turn when idle.",
-      "Use background_task logs only when task output is needed. Keep maxBytes modest to protect model context.",
+      "Use background_task logs only when task output is needed. Keep maxBytes modest to protect model context, and reuse a returned nextByte as afterByte for incremental reads.",
     ],
     promptSnippet:
       "Start, inspect, read, or stop session-scoped background shell tasks",
