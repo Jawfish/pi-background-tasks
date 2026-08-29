@@ -535,6 +535,87 @@ export const completionMessage = function completionMessage(
   ].join("\n");
 };
 
+const HANDOFF_REGISTRY_KEY = Symbol.for("pi.background-tasks.reload-handoff");
+export const HANDOFF_LEASE_ENV = "PI_BACKGROUND_TASK_HANDOFF_LEASE_MS";
+export const HANDOFF_LEASE_MS = 15_000;
+
+interface HandoffState {
+  deliveryLedger: CompletionDeliveryLedger;
+  manager: BackgroundTaskManager;
+  readState: TaskDashboardReadState;
+  unacknowledgedFailures: Map<string, TaskSnapshot>;
+}
+
+type HandoffEntry = HandoffState & { timer: NodeJS.Timeout };
+
+const handoffRegistry = function handoffRegistry(): Map<string, HandoffEntry> {
+  const globals = globalThis as unknown as Record<symbol, unknown>;
+  const existing = globals[HANDOFF_REGISTRY_KEY];
+  if (existing instanceof Map) {
+    return existing as Map<string, HandoffEntry>;
+  }
+  const registry = new Map<string, HandoffEntry>();
+  globals[HANDOFF_REGISTRY_KEY] = registry;
+  return registry;
+};
+
+const handoffLeaseMs = function handoffLeaseMs(): number {
+  const configured = Number(process.env[HANDOFF_LEASE_ENV]);
+  return Number.isFinite(configured) && configured > 0
+    ? configured
+    : HANDOFF_LEASE_MS;
+};
+
+const releaseHandoff = function releaseHandoff(
+  entry: HandoffState,
+  reason: string
+): void {
+  void entry.manager.shutdown().catch((error: unknown) => {
+    console.error(
+      `[background-tasks] ${reason}: ${error instanceof Error ? error.message : String(error)}`
+    );
+  });
+};
+
+const storeHandoff = function storeHandoff(
+  sessionId: string,
+  state: HandoffState
+): void {
+  const registry = handoffRegistry();
+  const previous = registry.get(sessionId);
+  if (previous) {
+    clearTimeout(previous.timer);
+    registry.delete(sessionId);
+    releaseHandoff(previous, "replaced reload handoff cleanup failed");
+  }
+  const timer = setTimeout(() => {
+    const current = registry.get(sessionId);
+    if (current?.timer !== timer) {
+      return;
+    }
+    registry.delete(sessionId);
+    releaseHandoff(current, "unclaimed reload handoff cleanup failed");
+  }, handoffLeaseMs());
+  timer.unref();
+  registry.set(sessionId, { ...state, timer });
+};
+
+const claimHandoff = function claimHandoff(
+  sessionId: string | undefined
+): HandoffState | undefined {
+  if (!sessionId) {
+    return undefined;
+  }
+  const registry = handoffRegistry();
+  const entry = registry.get(sessionId);
+  if (!entry) {
+    return undefined;
+  }
+  clearTimeout(entry.timer);
+  registry.delete(sessionId);
+  return entry;
+};
+
 const backgroundTasksExtension = function backgroundTasksExtension(
   pi: ExtensionAPI
 ): void {
@@ -542,11 +623,10 @@ const backgroundTasksExtension = function backgroundTasksExtension(
   let shuttingDown = false;
   let wakeHandle: NodeJS.Timeout | undefined;
   let activeDashboard: TaskDashboardComponent | undefined;
-  const dashboardReadState = new TaskDashboardReadState();
-  const deliveryLedger = new CompletionDeliveryLedger();
+  let dashboardReadState = new TaskDashboardReadState();
+  let deliveryLedger = new CompletionDeliveryLedger();
   const unacknowledgedFailures = new Map<string, TaskSnapshot>();
   // Callbacks close over the manager, so initialization follows their definitions.
-  // oxlint-disable-next-line eslint/prefer-const
   let manager: BackgroundTaskManager;
 
   const updateUi = (): void => {
@@ -1059,11 +1139,36 @@ const backgroundTasksExtension = function backgroundTasksExtension(
   pi.on("session_start", async (_event, ctx) => {
     shuttingDown = false;
     currentCtx = ctx;
+    const adopted = claimHandoff(ctx.sessionManager?.getSessionId());
+    if (adopted) {
+      const discarded = manager;
+      manager = adopted.manager;
+      deliveryLedger = adopted.deliveryLedger;
+      dashboardReadState = adopted.readState;
+      for (const [taskId, task] of adopted.unacknowledgedFailures) {
+        unacknowledgedFailures.set(taskId, task);
+      }
+      manager.bindCallbacks({
+        onChange: updateUi,
+        onFinished: handleFinished,
+        onWatchFired: handleWatchFired,
+      });
+      try {
+        await discarded.shutdown();
+      } catch (error) {
+        console.error(
+          `[background-tasks] unused manager cleanup failed: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
     await manager.initialize();
     updateUi();
+    if (deliveryLedger.wakeCandidates().length > 0) {
+      scheduleWake();
+    }
   });
 
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (event) => {
     shuttingDown = true;
     const dashboard = activeDashboard;
     const ctx = currentCtx;
@@ -1072,12 +1177,26 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       clearTimeout(wakeHandle);
       wakeHandle = undefined;
     }
+    const sessionId = ctx?.sessionManager?.getSessionId();
+    const reload =
+      (event as { reason?: unknown } | undefined)?.reason === "reload" &&
+      Boolean(sessionId);
 
     try {
       dashboard?.dispose();
     } finally {
       try {
-        await manager.shutdown();
+        if (reload && sessionId) {
+          manager.detachCallbacks();
+          storeHandoff(sessionId, {
+            deliveryLedger,
+            manager,
+            readState: dashboardReadState,
+            unacknowledgedFailures: new Map(unacknowledgedFailures),
+          });
+        } else {
+          await manager.shutdown();
+        }
       } finally {
         currentCtx = undefined;
         ctx?.ui.setStatus("background-tasks", undefined);
