@@ -14,19 +14,14 @@ import backgroundTasksExtension, {
 } from "./index.ts";
 
 interface ToolParams {
-  action: "start" | "status" | "logs" | "stop" | "watch" | "unwatch";
+  action: "start" | "status" | "logs" | "stop";
   afterByte?: number;
   command?: string;
-  condition?: "output" | "exit" | "inactivity";
-  inactivitySeconds?: number;
   maxBytes?: number;
   name?: string;
-  pattern?: string;
   taskId?: string;
   timeoutSeconds?: number;
-  wake?: boolean;
   wakeOnExit?: boolean;
-  watchId?: string;
 }
 
 interface ToolResult {
@@ -37,18 +32,9 @@ interface ToolResult {
     nextByte?: number;
     output?: string;
     startByte?: number;
-    task?: {
-      id: string;
-      status: string;
-      watches?: { id: string; status: string }[];
-    };
-    tasks?: {
-      id: string;
-      status: string;
-      watches?: { id: string; status: string }[];
-    }[];
+    task?: { id: string; status: string };
+    tasks?: unknown[];
     totalBytes?: number;
-    watch?: { id: string; status: string; taskId: string };
   };
 }
 
@@ -293,182 +279,6 @@ describe("background tasks extension", () => {
     await harness.execute({ action: "stop", taskId: id });
     await waitForCompletion();
     await harness.emit("session_shutdown");
-  });
-
-  test("registers and cancels task watches", async () => {
-    const harness = createHarness();
-    await harness.emit("session_start");
-    const started = await harness.execute({
-      action: "start",
-      command: "sleep 30",
-      name: "Watched task",
-    });
-    const watched = await harness.execute({
-      action: "watch",
-      condition: "output",
-      pattern: "ready",
-      taskId: started.details.task?.id,
-      wake: true,
-    });
-
-    expect(watched.details.watch).toMatchObject({
-      status: "active",
-      taskId: started.details.task?.id,
-    });
-    const status = await harness.execute({
-      action: "status",
-      taskId: started.details.task?.id,
-    });
-    expect(status.details.tasks?.[0]?.watches).toHaveLength(1);
-
-    const cancelled = await harness.execute({
-      action: "unwatch",
-      watchId: watched.details.watch?.id.slice(0, 4),
-    });
-    expect(cancelled.details.watch?.status).toBe("cancelled");
-
-    await harness.execute({
-      action: "stop",
-      taskId: started.details.task?.id,
-    });
-    await waitForCompletion();
-    await harness.emit("session_shutdown");
-  });
-
-  test("wakes once when a committed output watch fires", async () => {
-    const harness = createHarness();
-    await harness.emit("session_start");
-    const started = await harness.execute({
-      action: "start",
-      command: "sleep 0.05; printf ready; sleep 30",
-      name: "Ready server",
-    });
-    const watched = await harness.execute({
-      action: "watch",
-      condition: "output",
-      pattern: "ready",
-      taskId: started.details.task?.id,
-      wake: true,
-    });
-    await waitForCompletion();
-
-    expect(harness.sentMessages).toHaveLength(1);
-    expect(harness.sentMessages[0]?.options).toEqual({
-      deliverAs: "steer",
-      triggerTurn: true,
-    });
-    expect(harness.sentMessages[0]?.message).toMatchObject({
-      customType: "background-task-watch",
-      display: false,
-    });
-    const message = harness.sentMessages[0]?.message as {
-      content?: string;
-      details?: {
-        deliveryIds?: string[];
-        watches?: {
-          condition?: string;
-          deliveryId?: string;
-          id?: string;
-          nextByte?: number;
-          output?: string;
-          startByte?: number;
-          status?: string;
-          taskId?: string;
-        }[];
-      };
-    };
-    expect(message.details?.deliveryIds?.[0]).toStartWith("watch:");
-    expect(message.details?.watches?.[0]).toEqual({
-      condition: "output",
-      deliveryId: message.details?.deliveryIds?.[0],
-      id: watched.details.watch?.id,
-      nextByte: 5,
-      output: "ready",
-      startByte: 0,
-      status: "fired",
-      taskId: started.details.task?.id,
-    });
-    expect(message.content).toContain("<background-task-watch-events>");
-    expect(message.content).toContain('<range start-byte="0" next-byte="5"');
-
-    const context = (await harness.emit("context", {
-      messages: [harness.sentMessages[0]?.message],
-    })) as { messages: { customType?: string }[] };
-    expect(
-      context.messages.some(
-        (entry) => entry.customType === "background-task-watch-fallback"
-      )
-    ).toBe(false);
-
-    await harness.execute({
-      action: "stop",
-      taskId: started.details.task?.id,
-    });
-    await waitForCompletion();
-    expect(harness.sentMessages).toHaveLength(1);
-    await harness.emit("session_shutdown");
-  });
-
-  test("delivers exit watches with terminal cursor metadata", async () => {
-    const harness = createHarness();
-    await harness.emit("session_start");
-    const started = await harness.execute({
-      action: "start",
-      command: "sleep 0.05; printf done",
-      name: "Finite watch",
-    });
-    const watched = await harness.execute({
-      action: "watch",
-      condition: "exit",
-      taskId: started.details.task?.id,
-      wake: true,
-    });
-    await waitForCompletion();
-
-    expect(harness.sentMessages).toHaveLength(1);
-    const message = harness.sentMessages[0]?.message as {
-      customType?: string;
-      details?: {
-        watches?: {
-          condition?: string;
-          id?: string;
-          nextByte?: number;
-          startByte?: number;
-          status?: string;
-        }[];
-      };
-    };
-    expect(message.customType).toBe("background-task-watch");
-    expect(message.details?.watches?.[0]).toMatchObject({
-      condition: "exit",
-      id: watched.details.watch?.id,
-      nextByte: 4,
-      startByte: 4,
-      status: "fired",
-    });
-
-    await harness.emit("session_shutdown");
-  });
-
-  test("suppresses exit-watch delivery during shutdown", async () => {
-    const harness = createHarness();
-    await harness.emit("session_start");
-    const started = await harness.execute({
-      action: "start",
-      command: "sleep 30",
-      name: "Shutdown watch",
-    });
-    await harness.execute({
-      action: "watch",
-      condition: "exit",
-      taskId: started.details.task?.id,
-      wake: true,
-    });
-
-    await harness.emit("session_shutdown");
-    await waitForCompletion();
-
-    expect(harness.sentMessages).toHaveLength(0);
   });
 
   test("returns incremental log cursor metadata", async () => {

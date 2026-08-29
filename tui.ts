@@ -20,32 +20,19 @@ import type {
   TaskLogs,
   TaskSnapshot,
   TaskStatus,
-  TaskWatchCondition,
-  TaskWatchSnapshot,
 } from "./core.ts";
 
-export type BackgroundTaskAction =
-  | "start"
-  | "status"
-  | "logs"
-  | "stop"
-  | "watch"
-  | "unwatch";
+export type BackgroundTaskAction = "start" | "status" | "logs" | "stop";
 
 export interface BackgroundTaskToolParams {
   action: BackgroundTaskAction;
   afterByte?: number;
   command?: string;
-  condition?: TaskWatchCondition;
-  inactivitySeconds?: number;
   maxBytes?: number;
   name?: string;
-  pattern?: string;
   taskId?: string;
   timeoutSeconds?: number;
-  wake?: boolean;
   wakeOnExit?: boolean;
-  watchId?: string;
 }
 
 export interface BackgroundTaskToolDetails {
@@ -59,7 +46,6 @@ export interface BackgroundTaskToolDetails {
   startByte?: number;
   totalBytes?: number;
   truncated?: boolean;
-  watch?: TaskWatchSnapshot;
 }
 
 interface TextContent {
@@ -288,29 +274,6 @@ export const renderBackgroundTaskCall = function renderBackgroundTaskCall(
     if (context.expanded && args.command && args.name) {
       text += `\n${theme.fg("dim", "command")} ${cleanInline(args.command)}`;
     }
-  } else if (args.action === "watch") {
-    if (args.taskId) {
-      text += ` ${theme.fg("accent", cleanInline(args.taskId))}`;
-    }
-    if (args.condition) {
-      text += ` ${theme.fg("muted", args.condition)}`;
-    }
-    if (args.pattern) {
-      text += ` ${theme.fg("text", cleanInline(args.pattern))}`;
-    }
-    if (args.inactivitySeconds !== undefined) {
-      text += theme.fg(
-        "dim",
-        ` · ${formatUiDuration(args.inactivitySeconds * 1000)}`
-      );
-    }
-    if (args.wake) {
-      text += theme.fg("dim", " · wake");
-    }
-  } else if (args.action === "unwatch") {
-    if (args.watchId) {
-      text += ` ${theme.fg("accent", cleanInline(args.watchId))}`;
-    }
   } else if (args.taskId) {
     text += ` ${theme.fg("accent", cleanInline(args.taskId))}`;
     if (args.action === "logs") {
@@ -433,14 +396,6 @@ export const renderBackgroundTaskResult = function renderBackgroundTaskResult(
       );
     }
     return textResult(lines.join("\n"));
-  }
-
-  const watch = details?.watch;
-  if (watch) {
-    const stateColor = watch.status === "active" ? "accent" : "muted";
-    return textResult(
-      `${theme.fg(stateColor, watch.status)} · ${theme.fg("text", watch.condition)} · ${theme.fg("accent", watch.id)} · task ${theme.fg("accent", watch.taskId)}`
-    );
   }
 
   const task = details?.task;
