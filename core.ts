@@ -40,6 +40,7 @@ export interface TaskSnapshot {
   signal?: NodeJS.Signals | null;
   error?: string;
   bytesWritten: number;
+  lastOutputAt?: number;
   wakeOnExit: boolean;
   timeoutSeconds?: number;
 }
@@ -59,6 +60,9 @@ export interface TaskLogs {
   bytesRead: number;
   totalBytes: number;
   truncated: boolean;
+  droppedBytes?: number;
+  nextByte?: number;
+  startByte?: number;
 }
 
 export interface TaskCompletion {
@@ -76,10 +80,12 @@ type ShellOutcome = {
 };
 
 type RuntimeTask = TaskSnapshot & {
+  acceptedBytes: number;
   child: ChildProcessByStdio<null, Readable, Readable>;
   stream: WriteStream;
   stopReason?: StopReason;
   outputLimitReached: boolean;
+  pendingLogWrites: Set<Promise<void>>;
   finalizing: boolean;
   cleanupPromise?: Promise<string | undefined>;
   completionPromise?: Promise<void>;
@@ -101,6 +107,11 @@ export interface BackgroundTaskManagerOptions {
   maxOutputBytes?: number;
   killGraceMs?: number;
   shell?: string;
+  writeLogChunk?: (
+    stream: WriteStream,
+    data: Buffer,
+    callback: (error?: Error | null) => void
+  ) => boolean;
   onChange?: () => void;
   onFinished?: (completion: TaskCompletion) => void;
 }
@@ -233,6 +244,11 @@ export class BackgroundTaskManager {
   readonly #maxOutputBytes: number;
   readonly #killGraceMs: number;
   readonly #shell: string;
+  readonly #writeLogChunk: (
+    stream: WriteStream,
+    data: Buffer,
+    callback: (error?: Error | null) => void
+  ) => boolean;
   readonly #onChange: (() => void) | undefined;
   readonly #onFinished: ((completion: TaskCompletion) => void) | undefined;
   readonly #ownsRuntimeDir: boolean;
@@ -256,6 +272,9 @@ export class BackgroundTaskManager {
     this.#shell =
       options.shell ??
       (process.env[BACKGROUND_TASK_SHELL_ENV]?.trim() || DEFAULT_SHELL);
+    this.#writeLogChunk =
+      options.writeLogChunk ??
+      ((stream, data, callback) => stream.write(data, callback));
     this.#onChange = options.onChange;
     this.#onFinished = options.onFinished;
   }
@@ -379,6 +398,7 @@ export class BackgroundTaskManager {
           ? Math.max(1, Math.floor(input.timeoutSeconds))
           : undefined;
       const task: RuntimeTask = {
+        acceptedBytes: 0,
         bytesWritten: 0,
         child,
         closed: closed.promise,
@@ -389,6 +409,7 @@ export class BackgroundTaskManager {
         logPath,
         name: cleanName(input.name ?? "") || deriveTaskName(command),
         outputLimitReached: false,
+        pendingLogWrites: new Set(),
         pid: child.pid,
         resolveClosed: () => closed.resolve(null),
         resolveShellClosed: () => shellClosed.resolve(null),
@@ -465,7 +486,8 @@ export class BackgroundTaskManager {
 
   async logs(
     idOrPrefix: string,
-    requestedBytes = MAX_LOG_READ_BYTES
+    requestedBytes = MAX_LOG_READ_BYTES,
+    afterByte?: number
   ): Promise<TaskLogs> {
     const task = this.#resolve(idOrPrefix);
     const maxBytes = Math.max(
@@ -480,7 +502,62 @@ export class BackgroundTaskManager {
     const file = await open(task.logPath, "r");
     try {
       const stats = await file.stat();
-      const totalBytes = stats.size;
+      const totalBytes = Math.min(stats.size, task.bytesWritten);
+      if (afterByte !== undefined) {
+        const requestedStart = Math.min(
+          totalBytes,
+          Math.max(
+            0,
+            Number.isFinite(afterByte) ? Math.floor(afterByte) : 0
+          )
+        );
+        let startByte = requestedStart;
+        if (startByte < totalBytes) {
+          const boundary = Buffer.alloc(
+            Math.min(3, totalBytes - startByte)
+          );
+          await file.read(boundary, 0, boundary.length, startByte);
+          while (
+            startByte - requestedStart < boundary.length &&
+            BackgroundTaskManager.#isUtf8Continuation(
+              boundary[startByte - requestedStart]
+            )
+          ) {
+            startByte += 1;
+          }
+        }
+        const droppedBytes = startByte - requestedStart;
+        const availableBytes = totalBytes - startByte;
+        const readCapacity = Math.min(availableBytes, maxBytes + 3);
+        const candidate = Buffer.alloc(readCapacity);
+        if (readCapacity > 0) {
+          await file.read(candidate, 0, readCapacity, startByte);
+        }
+        let bytesRead = BackgroundTaskManager.#completeUtf8PrefixLength(
+          candidate,
+          maxBytes
+        );
+        if (bytesRead === 0 && candidate.length > 0 && readCapacity === availableBytes) {
+          bytesRead = Math.min(candidate.length, maxBytes);
+        }
+        const output = candidate.subarray(0, bytesRead).toString("utf-8");
+        const nextByte = startByte + bytesRead;
+        const truncated = nextByte < totalBytes;
+        const range = `[Bytes ${String(startByte)}-${String(nextByte)} of ${String(totalBytes)}${droppedBytes > 0 ? `; skipped ${String(droppedBytes)} split UTF-8 ${droppedBytes === 1 ? "byte" : "bytes"}` : ""}]`;
+        const body = output || "(no new output)";
+        return {
+          bytesRead,
+          droppedBytes,
+          nextByte,
+          output,
+          startByte,
+          task: BackgroundTaskManager.#snapshot(task),
+          text: `${range}\n\n${body}\n\nFull log: ${task.logPath}`,
+          totalBytes,
+          truncated,
+        };
+      }
+
       const bytesRead = Math.min(totalBytes, maxBytes);
       const buffer = Buffer.alloc(bytesRead);
       if (bytesRead > 0) {
@@ -580,6 +657,45 @@ export class BackgroundTaskManager {
     throw new Error(`Unknown background task ID: ${query}`);
   }
 
+  static #isUtf8Continuation(byte: number | undefined): boolean {
+    return byte !== undefined && byte >= 0x80 && byte <= 0xbf;
+  }
+
+  static #completeUtf8PrefixLength(buffer: Buffer, maxBytes: number): number {
+    let offset = 0;
+    while (offset < buffer.length) {
+      const first = buffer[offset];
+      let sequenceLength = 1;
+      if (first !== undefined && first >= 0xc2 && first <= 0xdf) {
+        sequenceLength = 2;
+      } else if (first !== undefined && first >= 0xe0 && first <= 0xef) {
+        sequenceLength = 3;
+      } else if (first !== undefined && first >= 0xf0 && first <= 0xf4) {
+        sequenceLength = 4;
+      }
+      if (offset + sequenceLength > buffer.length) {
+        break;
+      }
+      if (
+        sequenceLength > 1 &&
+        !buffer
+          .subarray(offset + 1, offset + sequenceLength)
+          .every((byte) => BackgroundTaskManager.#isUtf8Continuation(byte))
+      ) {
+        sequenceLength = 1;
+      }
+      const nextOffset = offset + sequenceLength;
+      if (nextOffset > maxBytes && offset > 0) {
+        break;
+      }
+      offset = nextOffset;
+      if (offset >= maxBytes) {
+        break;
+      }
+    }
+    return offset;
+  }
+
   static #decodeLogTail(buffer: Buffer, truncated: boolean): string {
     if (!truncated) {
       return buffer.toString("utf-8");
@@ -605,6 +721,7 @@ export class BackgroundTaskManager {
       exitCode: task.exitCode,
       id: task.id,
       logPath: task.logPath,
+      lastOutputAt: task.lastOutputAt,
       name: task.name,
       pid: task.pid,
       signal: task.signal,
@@ -624,11 +741,12 @@ export class BackgroundTaskManager {
       return;
     }
     const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data, "utf-8");
-    const remaining = Math.max(0, this.#maxOutputBytes - task.bytesWritten);
+    const remaining = Math.max(0, this.#maxOutputBytes - task.acceptedBytes);
     const accepted = buffer.subarray(0, remaining);
     if (accepted.length > 0) {
-      task.bytesWritten += accepted.length;
-      const canContinue = task.stream.write(accepted);
+      task.acceptedBytes += accepted.length;
+      task.lastOutputAt = Date.now();
+      const canContinue = this.#writeLog(task, accepted);
       if (!canContinue && "pause" in source && "resume" in source) {
         source.pause();
         task.stream.once("drain", () => source.resume());
@@ -638,8 +756,29 @@ export class BackgroundTaskManager {
     if (accepted.length < buffer.length) {
       task.outputLimitReached = true;
       task.error = `Output exceeded ${String(this.#maxOutputBytes)} bytes`;
-      task.stream.write(`\n\n[background task stopped: ${task.error}]\n`);
+      this.#writeLog(
+        task,
+        Buffer.from(`\n\n[background task stopped: ${task.error}]\n`)
+      );
       this.#beginStop(task, "output_limit");
+    }
+  }
+
+  #writeLog(task: RuntimeTask, data: Buffer): boolean {
+    const settled = Promise.withResolvers<void>();
+    task.pendingLogWrites.add(settled.promise);
+    const callback = (error?: Error | null): void => {
+      if (!error) {
+        task.bytesWritten += data.length;
+      }
+      task.pendingLogWrites.delete(settled.promise);
+      settled.resolve();
+    };
+    try {
+      return this.#writeLogChunk(task.stream, data, callback);
+    } catch (error) {
+      callback(error instanceof Error ? error : new Error(String(error)));
+      throw error;
     }
   }
 
@@ -856,6 +995,7 @@ export class BackgroundTaskManager {
     try {
       task.stream.end();
       await finished(task.stream);
+      await Promise.all(task.pendingLogWrites);
     } catch (streamError) {
       finalStatus = "failed";
       finalError = appendError(
