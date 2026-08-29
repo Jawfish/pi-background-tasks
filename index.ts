@@ -13,6 +13,7 @@ import {
   escapeXml,
   formatModelContext,
   formatTaskList,
+  MAX_COMPLETION_LOG_BYTES,
   MAX_LOG_READ_BYTES,
   MAX_WATCH_PATTERN_BYTES,
 } from "./core.ts";
@@ -804,6 +805,33 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     }
   };
 
+  /** Recover terminal tasks that finished while no instance was bound. */
+  const adoptTerminalTasks = async (): Promise<void> => {
+    for (const task of manager.list()) {
+      if (task.status !== "completed" && task.status !== "failed") {
+        continue;
+      }
+      if (task.status === "failed") {
+        unacknowledgedFailures.set(task.id, task);
+      }
+      if (task.completionPolicy !== "wake") {
+        continue;
+      }
+      const completion: TaskCompletion = { task };
+      try {
+        // Adoption is sequential so one unreadable log cannot hide later tasks.
+        // oxlint-disable-next-line eslint/no-await-in-loop
+        const logs = await manager.logs(task.id, MAX_COMPLETION_LOG_BYTES);
+        completion.output = logs.output;
+        completion.outputTruncated = logs.truncated;
+      } catch (error) {
+        completion.outputError =
+          error instanceof Error ? error.message : String(error);
+      }
+      deliveryLedger.add(completion);
+    }
+  };
+
   const handleWatchFired = (event: TaskWatchEvent): void => {
     if (shuttingDown) {
       return;
@@ -1160,6 +1188,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
           `[background-tasks] unused manager cleanup failed: ${error instanceof Error ? error.message : String(error)}`
         );
       }
+      await adoptTerminalTasks();
     }
     await manager.initialize();
     updateUi();

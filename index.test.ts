@@ -1166,6 +1166,87 @@ describe("background tasks extension", () => {
     }
   });
 
+  test("delivers a completion that finishes during a reload handoff", async () => {
+    const sessionId = `handoff-${crypto.randomUUID()}`;
+    const before = createHarness({ sessionId });
+    await before.emit("session_start");
+    await before.execute({
+      action: "start",
+      command: "sleep 0.2; printf handoff-output",
+      completionPolicy: "wake",
+      name: "Finishes while detached",
+    });
+    await before.emit("session_shutdown", { reason: "reload" });
+    await Bun.sleep(400);
+    expect(before.sentMessages).toHaveLength(0);
+
+    const after = createHarness({ sessionId });
+    await after.emit("session_start");
+    await waitForCompletion();
+
+    expect(after.sentMessages).toHaveLength(1);
+    const message = after.sentMessages[0]?.message as { content?: string };
+    expect(message.content).toContain("Finishes while detached");
+    expect(message.content).toContain("handoff-output");
+
+    await after.emit("session_shutdown");
+  });
+
+  test("does not repeat delivery across repeated reloads", async () => {
+    const sessionId = `repeat-${crypto.randomUUID()}`;
+    const first = createHarness({ sessionId });
+    await first.emit("session_start");
+    await first.execute({
+      action: "start",
+      command: "printf once",
+      completionPolicy: "wake",
+      name: "Delivered once",
+    });
+    await waitForCompletion();
+    expect(first.sentMessages).toHaveLength(1);
+    expect(first.notifications).toHaveLength(1);
+    await first.emit("session_shutdown", { reason: "reload" });
+
+    const second = createHarness({ sessionId });
+    await second.emit("session_start");
+    await waitForCompletion();
+    expect(second.sentMessages).toHaveLength(0);
+    expect(second.notifications).toHaveLength(0);
+    await second.emit("session_shutdown", { reason: "reload" });
+
+    const third = createHarness({ sessionId });
+    await third.emit("session_start");
+    await waitForCompletion();
+    expect(third.sentMessages).toHaveLength(0);
+    expect(third.notifications).toHaveLength(0);
+    await third.emit("session_shutdown");
+  });
+
+  test("stops process groups for non-reload session replacement", async () => {
+    for (const reason of ["new", "resume", "fork", "quit"] as const) {
+      const harness = createHarness({
+        sessionId: `replace-${reason}-${crypto.randomUUID()}`,
+      });
+      // Each replacement reason is verified with its own extension instance.
+      // oxlint-disable-next-line eslint/no-await-in-loop
+      await harness.emit("session_start");
+      // oxlint-disable-next-line eslint/no-await-in-loop
+      const started = await harness.execute({
+        action: "start",
+        command: "sleep 30",
+        name: `Replaced by ${reason}`,
+      });
+      const pid = started.details.task?.pid;
+      expect(pid).toBeNumber();
+
+      // oxlint-disable-next-line eslint/no-await-in-loop
+      await harness.emit("session_shutdown", { reason });
+      // oxlint-disable-next-line eslint/no-await-in-loop
+      await waitForDeadProcessGroup(pid!);
+      expect(isProcessGroupAlive(pid!)).toBe(false);
+    }
+  });
+
   test("cancels a queued automatic continuation during shutdown", async () => {
     const harness = createHarness();
     await harness.emit("session_start");
