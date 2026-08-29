@@ -40,6 +40,7 @@ export interface TaskSnapshot {
   signal?: NodeJS.Signals | null;
   error?: string;
   bytesWritten: number;
+  lastOutputAt?: number;
   wakeOnExit: boolean;
   timeoutSeconds?: number;
 }
@@ -76,10 +77,12 @@ type ShellOutcome = {
 };
 
 type RuntimeTask = TaskSnapshot & {
+  acceptedBytes: number;
   child: ChildProcessByStdio<null, Readable, Readable>;
   stream: WriteStream;
   stopReason?: StopReason;
   outputLimitReached: boolean;
+  pendingLogWrites: Set<Promise<void>>;
   finalizing: boolean;
   cleanupPromise?: Promise<string | undefined>;
   completionPromise?: Promise<void>;
@@ -101,6 +104,11 @@ export interface BackgroundTaskManagerOptions {
   maxOutputBytes?: number;
   killGraceMs?: number;
   shell?: string;
+  writeLogChunk?: (
+    stream: WriteStream,
+    data: Buffer,
+    callback: (error?: Error | null) => void
+  ) => boolean;
   onChange?: () => void;
   onFinished?: (completion: TaskCompletion) => void;
 }
@@ -233,6 +241,11 @@ export class BackgroundTaskManager {
   readonly #maxOutputBytes: number;
   readonly #killGraceMs: number;
   readonly #shell: string;
+  readonly #writeLogChunk: (
+    stream: WriteStream,
+    data: Buffer,
+    callback: (error?: Error | null) => void
+  ) => boolean;
   readonly #onChange: (() => void) | undefined;
   readonly #onFinished: ((completion: TaskCompletion) => void) | undefined;
   readonly #ownsRuntimeDir: boolean;
@@ -256,6 +269,9 @@ export class BackgroundTaskManager {
     this.#shell =
       options.shell ??
       (process.env[BACKGROUND_TASK_SHELL_ENV]?.trim() || DEFAULT_SHELL);
+    this.#writeLogChunk =
+      options.writeLogChunk ??
+      ((stream, data, callback) => stream.write(data, callback));
     this.#onChange = options.onChange;
     this.#onFinished = options.onFinished;
   }
@@ -379,6 +395,7 @@ export class BackgroundTaskManager {
           ? Math.max(1, Math.floor(input.timeoutSeconds))
           : undefined;
       const task: RuntimeTask = {
+        acceptedBytes: 0,
         bytesWritten: 0,
         child,
         closed: closed.promise,
@@ -389,6 +406,7 @@ export class BackgroundTaskManager {
         logPath,
         name: cleanName(input.name ?? "") || deriveTaskName(command),
         outputLimitReached: false,
+        pendingLogWrites: new Set(),
         pid: child.pid,
         resolveClosed: () => closed.resolve(null),
         resolveShellClosed: () => shellClosed.resolve(null),
@@ -480,7 +498,7 @@ export class BackgroundTaskManager {
     const file = await open(task.logPath, "r");
     try {
       const stats = await file.stat();
-      const totalBytes = stats.size;
+      const totalBytes = Math.min(stats.size, task.bytesWritten);
       const bytesRead = Math.min(totalBytes, maxBytes);
       const buffer = Buffer.alloc(bytesRead);
       if (bytesRead > 0) {
@@ -605,6 +623,7 @@ export class BackgroundTaskManager {
       exitCode: task.exitCode,
       id: task.id,
       logPath: task.logPath,
+      lastOutputAt: task.lastOutputAt,
       name: task.name,
       pid: task.pid,
       signal: task.signal,
@@ -624,11 +643,12 @@ export class BackgroundTaskManager {
       return;
     }
     const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data, "utf-8");
-    const remaining = Math.max(0, this.#maxOutputBytes - task.bytesWritten);
+    const remaining = Math.max(0, this.#maxOutputBytes - task.acceptedBytes);
     const accepted = buffer.subarray(0, remaining);
     if (accepted.length > 0) {
-      task.bytesWritten += accepted.length;
-      const canContinue = task.stream.write(accepted);
+      task.acceptedBytes += accepted.length;
+      task.lastOutputAt = Date.now();
+      const canContinue = this.#writeLog(task, accepted);
       if (!canContinue && "pause" in source && "resume" in source) {
         source.pause();
         task.stream.once("drain", () => source.resume());
@@ -638,8 +658,29 @@ export class BackgroundTaskManager {
     if (accepted.length < buffer.length) {
       task.outputLimitReached = true;
       task.error = `Output exceeded ${String(this.#maxOutputBytes)} bytes`;
-      task.stream.write(`\n\n[background task stopped: ${task.error}]\n`);
+      this.#writeLog(
+        task,
+        Buffer.from(`\n\n[background task stopped: ${task.error}]\n`)
+      );
       this.#beginStop(task, "output_limit");
+    }
+  }
+
+  #writeLog(task: RuntimeTask, data: Buffer): boolean {
+    const settled = Promise.withResolvers<void>();
+    task.pendingLogWrites.add(settled.promise);
+    const callback = (error?: Error | null): void => {
+      if (!error) {
+        task.bytesWritten += data.length;
+      }
+      task.pendingLogWrites.delete(settled.promise);
+      settled.resolve();
+    };
+    try {
+      return this.#writeLogChunk(task.stream, data, callback);
+    } catch (error) {
+      callback(error instanceof Error ? error : new Error(String(error)));
+      throw error;
     }
   }
 
@@ -856,6 +897,7 @@ export class BackgroundTaskManager {
     try {
       task.stream.end();
       await finished(task.stream);
+      await Promise.all(task.pendingLogWrites);
     } catch (streamError) {
       finalStatus = "failed";
       finalError = appendError(

@@ -144,9 +144,65 @@ describe("BackgroundTaskManager", () => {
       status: "completed",
       wakeOnExit: true,
     });
+    expect(terminal.lastOutputAt).toBeGreaterThanOrEqual(terminal.startedAt);
+    expect(terminal.bytesWritten).toBe(logs.totalBytes);
     expect(logs.text).toContain("hello from task");
     expect(finished).toHaveLength(1);
     expect(finished[0]?.id).toBe(started.id);
+  });
+
+  test("reports only committed output and waits for write callbacks", async () => {
+    const delayedCallbacks: (() => void)[] = [];
+    let releaseWrites = false;
+    const manager = await createManager({
+      writeLogChunk(stream, data, callback) {
+        return stream.write(data, (error) => {
+          const complete = () => callback(error);
+          if (releaseWrites) {
+            complete();
+          } else {
+            delayedCallbacks.push(complete);
+          }
+        });
+      },
+    });
+    const started = await manager.start({
+      command: "printf first; printf second >&2",
+      cwd: process.cwd(),
+    });
+    let waitResolved = false;
+    const waiting = manager.wait(started.id).then((snapshot) => {
+      waitResolved = true;
+      return snapshot;
+    });
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (delayedCallbacks.length > 0) {
+        break;
+      }
+      // oxlint-disable-next-line eslint/no-await-in-loop
+      await sleep(5);
+    }
+
+    const pending = manager.status(started.id)[0];
+    const pendingLogs = await manager.logs(started.id);
+    expect(delayedCallbacks.length).toBeGreaterThan(0);
+    expect(pending?.lastOutputAt).toBeGreaterThanOrEqual(started.startedAt);
+    expect(pending?.bytesWritten).toBe(0);
+    expect(pendingLogs.totalBytes).toBe(0);
+    expect(waitResolved).toBe(false);
+
+    releaseWrites = true;
+    for (const callback of delayedCallbacks.splice(0)) {
+      callback();
+    }
+    const terminal = await waiting;
+    const logs = await manager.logs(started.id);
+
+    expect(terminal.status).toBe("completed");
+    expect(terminal.bytesWritten).toBe(11);
+    expect(logs.totalBytes).toBe(11);
+    expect(logs.output).toContain("first");
+    expect(logs.output).toContain("second");
   });
 
   test("truncates names without splitting a Unicode character", async () => {
@@ -359,6 +415,7 @@ describe("BackgroundTaskManager", () => {
       expect(terminal.status).toBe("failed");
       expect(terminal.error).toContain("Output exceeded 64 bytes");
       expect(logs.totalBytes).toBeGreaterThanOrEqual(64);
+      expect(terminal.bytesWritten).toBe(logs.totalBytes);
       expect(logs.text).toContain("background task stopped");
       expect(await processIsAlive(childPid)).toBe(false);
     }
