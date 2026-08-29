@@ -72,11 +72,17 @@ process.once("exit", () => {
 });
 
 afterEach(async () => {
-  await Promise.allSettled(
+  const results = await Promise.allSettled(
     [...activeHarnesses].map(async (harness) => {
       await harness.dispose();
     })
   );
+  const failures = results.flatMap((result) =>
+    result.status === "rejected" ? [result.reason] : []
+  );
+  if (failures.length > 0) {
+    throw new AggregateError(failures, "Pi integration cleanup failed");
+  }
 });
 
 const withTimeout = async function withTimeout<T>(
@@ -293,7 +299,9 @@ export class PiIntegrationHarness {
       disposeError ??= error;
     }
     for (const pid of this.#trackedPids) {
-      fallbackProcessGroups.delete(pid);
+      if (!isProcessGroupAlive(pid)) {
+        fallbackProcessGroups.delete(pid);
+      }
     }
     await rm(this.rootDir, { force: true, recursive: true });
 

@@ -4,7 +4,8 @@ import {
   fauxToolCall,
 } from "@earendil-works/pi-ai";
 import type { Context } from "@earendil-works/pi-ai";
-import { setTimeout as sleep } from "node:timers/promises";
+import { writeFile } from "node:fs/promises";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { PiIntegrationHarness, waitFor } from "./harness.ts";
@@ -21,6 +22,17 @@ const contextContains = function contextContains(
   value: string
 ): boolean {
   return context !== undefined && JSON.stringify(context.messages).includes(value);
+};
+
+const shellQuote = function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+};
+
+const gatedOutputCommand = function gatedOutputCommand(
+  gatePath: string,
+  output: string
+): string {
+  return `while [ ! -f ${shellQuote(gatePath)} ]; do sleep 0.01; done; printf %s ${shellQuote(output)}`;
 };
 
 const waitForCalls = async function waitForCalls(
@@ -55,11 +67,12 @@ describe("background tasks through Pi lifecycles", () => {
     "starts one new turn when a wake task finishes while Pi is idle",
     async () => {
       const harness = await PiIntegrationHarness.create();
+      const completionGate = path.join(harness.rootDir, "idle-completion-gate");
       harness.queueResponses([
         fauxAssistantMessage(
           fauxToolCall("background_task", {
             action: "start",
-            command: "sleep 0.15; printf idle-wake-output",
+            command: gatedOutputCommand(completionGate, "idle-wake-output"),
             completionPolicy: "wake",
             name: "Idle wake",
           }),
@@ -70,6 +83,7 @@ describe("background tasks through Pi lifecycles", () => {
       ]);
 
       await harness.session.prompt("Start an idle wake task");
+      await writeFile(completionGate, "release");
       await waitForCalls(harness, 3);
 
       const task = harness.getService().list().find(({ name }) => name === "Idle wake");
@@ -96,14 +110,17 @@ describe("background tasks through Pi lifecycles", () => {
         fauxAssistantMessage(
           fauxToolCall("background_task", {
             action: "start",
-            command: "sleep 0.05; printf active-wake-output",
+            command: "printf active-wake-output",
             completionPolicy: "wake",
             name: "Active wake",
           }),
           { stopReason: "toolUse" }
         ),
         async () => {
-          await sleep(220);
+          await waitFor(
+            () => harness.session.agent.hasQueuedMessages(),
+            "queued active completion steering"
+          );
           return fauxAssistantMessage("The active turn can now finish");
         },
         fauxAssistantMessage("The steered completion was handled"),
@@ -139,6 +156,10 @@ describe("background tasks through Pi lifecycles", () => {
       const harness = await PiIntegrationHarness.create({
         extensionPathsBefore: [DROP_COMPLETION_CONTEXT_PATH],
       });
+      const completionGate = path.join(
+        harness.rootDir,
+        "fallback-completion-gate"
+      );
       expect(harness.session.extensionRunner.getExtensionPaths()[0]).toBe(
         DROP_COMPLETION_CONTEXT_PATH
       );
@@ -146,7 +167,7 @@ describe("background tasks through Pi lifecycles", () => {
         fauxAssistantMessage(
           fauxToolCall("background_task", {
             action: "start",
-            command: "sleep 0.15; printf fallback-output",
+            command: gatedOutputCommand(completionGate, "fallback-output"),
             completionPolicy: "wake",
             name: "Fallback wake",
           }),
@@ -158,6 +179,7 @@ describe("background tasks through Pi lifecycles", () => {
       ]);
 
       await harness.session.prompt("Start a fallback wake task");
+      await writeFile(completionGate, "release");
       await waitForCalls(harness, 3);
       expect(contextContains(harness.modelContexts[2], COMPLETION_MARKER)).toBe(
         true
@@ -181,11 +203,12 @@ describe("background tasks through Pi lifecycles", () => {
     "matches one-shot watches and advances committed log cursors",
     async () => {
       const harness = await PiIntegrationHarness.create();
+      const outputGate = path.join(harness.rootDir, "watch-output-gate");
       harness.queueResponses([
         fauxAssistantMessage(
           fauxToolCall("background_task", {
             action: "start",
-            command: "sleep 0.2; printf 'alpha😀omega'",
+            command: gatedOutputCommand(outputGate, "alpha😀omega"),
             completionPolicy: "silent",
             name: "Cursor and watch",
           }),
@@ -210,7 +233,14 @@ describe("background tasks through Pi lifecycles", () => {
             { stopReason: "toolUse" }
           );
         },
-        fauxAssistantMessage("The watch is armed"),
+        async () => {
+          await writeFile(outputGate, "release");
+          await waitFor(
+            () => harness.session.agent.hasQueuedMessages(),
+            "queued watch steering"
+          );
+          return fauxAssistantMessage("The watch is armed");
+        },
         fauxAssistantMessage("The watch event was handled"),
       ]);
 
