@@ -60,6 +60,9 @@ export interface TaskLogs {
   bytesRead: number;
   totalBytes: number;
   truncated: boolean;
+  droppedBytes?: number;
+  nextByte?: number;
+  startByte?: number;
 }
 
 export interface TaskCompletion {
@@ -483,7 +486,8 @@ export class BackgroundTaskManager {
 
   async logs(
     idOrPrefix: string,
-    requestedBytes = MAX_LOG_READ_BYTES
+    requestedBytes = MAX_LOG_READ_BYTES,
+    afterByte?: number
   ): Promise<TaskLogs> {
     const task = this.#resolve(idOrPrefix);
     const maxBytes = Math.max(
@@ -499,6 +503,61 @@ export class BackgroundTaskManager {
     try {
       const stats = await file.stat();
       const totalBytes = Math.min(stats.size, task.bytesWritten);
+      if (afterByte !== undefined) {
+        const requestedStart = Math.min(
+          totalBytes,
+          Math.max(
+            0,
+            Number.isFinite(afterByte) ? Math.floor(afterByte) : 0
+          )
+        );
+        let startByte = requestedStart;
+        if (startByte < totalBytes) {
+          const boundary = Buffer.alloc(
+            Math.min(3, totalBytes - startByte)
+          );
+          await file.read(boundary, 0, boundary.length, startByte);
+          while (
+            startByte - requestedStart < boundary.length &&
+            BackgroundTaskManager.#isUtf8Continuation(
+              boundary[startByte - requestedStart]
+            )
+          ) {
+            startByte += 1;
+          }
+        }
+        const droppedBytes = startByte - requestedStart;
+        const availableBytes = totalBytes - startByte;
+        const readCapacity = Math.min(availableBytes, maxBytes + 3);
+        const candidate = Buffer.alloc(readCapacity);
+        if (readCapacity > 0) {
+          await file.read(candidate, 0, readCapacity, startByte);
+        }
+        let bytesRead = BackgroundTaskManager.#completeUtf8PrefixLength(
+          candidate,
+          maxBytes
+        );
+        if (bytesRead === 0 && candidate.length > 0 && readCapacity === availableBytes) {
+          bytesRead = Math.min(candidate.length, maxBytes);
+        }
+        const output = candidate.subarray(0, bytesRead).toString("utf-8");
+        const nextByte = startByte + bytesRead;
+        const truncated = nextByte < totalBytes;
+        const range = `[Bytes ${String(startByte)}-${String(nextByte)} of ${String(totalBytes)}${droppedBytes > 0 ? `; skipped ${String(droppedBytes)} split UTF-8 ${droppedBytes === 1 ? "byte" : "bytes"}` : ""}]`;
+        const body = output || "(no new output)";
+        return {
+          bytesRead,
+          droppedBytes,
+          nextByte,
+          output,
+          startByte,
+          task: BackgroundTaskManager.#snapshot(task),
+          text: `${range}\n\n${body}\n\nFull log: ${task.logPath}`,
+          totalBytes,
+          truncated,
+        };
+      }
+
       const bytesRead = Math.min(totalBytes, maxBytes);
       const buffer = Buffer.alloc(bytesRead);
       if (bytesRead > 0) {
@@ -596,6 +655,45 @@ export class BackgroundTaskManager {
       throw new Error(`Ambiguous task ID prefix: ${query}`);
     }
     throw new Error(`Unknown background task ID: ${query}`);
+  }
+
+  static #isUtf8Continuation(byte: number | undefined): boolean {
+    return byte !== undefined && byte >= 0x80 && byte <= 0xbf;
+  }
+
+  static #completeUtf8PrefixLength(buffer: Buffer, maxBytes: number): number {
+    let offset = 0;
+    while (offset < buffer.length) {
+      const first = buffer[offset];
+      let sequenceLength = 1;
+      if (first !== undefined && first >= 0xc2 && first <= 0xdf) {
+        sequenceLength = 2;
+      } else if (first !== undefined && first >= 0xe0 && first <= 0xef) {
+        sequenceLength = 3;
+      } else if (first !== undefined && first >= 0xf0 && first <= 0xf4) {
+        sequenceLength = 4;
+      }
+      if (offset + sequenceLength > buffer.length) {
+        break;
+      }
+      if (
+        sequenceLength > 1 &&
+        !buffer
+          .subarray(offset + 1, offset + sequenceLength)
+          .every((byte) => BackgroundTaskManager.#isUtf8Continuation(byte))
+      ) {
+        sequenceLength = 1;
+      }
+      const nextOffset = offset + sequenceLength;
+      if (nextOffset > maxBytes && offset > 0) {
+        break;
+      }
+      offset = nextOffset;
+      if (offset >= maxBytes) {
+        break;
+      }
+    }
+    return offset;
   }
 
   static #decodeLogTail(buffer: Buffer, truncated: boolean): string {

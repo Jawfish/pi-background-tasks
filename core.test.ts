@@ -576,6 +576,88 @@ describe("BackgroundTaskManager", () => {
     expect(await pathExists(oldest.logPath)).toBe(false);
   });
 
+  test("reads committed output forward with stable UTF-8 cursors", async () => {
+    const manager = await createManager();
+    const started = await manager.start({
+      command: "printf 'A🙂BC'",
+      cwd: process.cwd(),
+    });
+    await waitForTerminal(manager, started.id);
+
+    const first = await manager.logs(started.id, 2, 0);
+    const second = await manager.logs(started.id, 4, first.nextByte);
+    const third = await manager.logs(started.id, 2, second.nextByte);
+
+    expect(first).toMatchObject({
+      bytesRead: 1,
+      droppedBytes: 0,
+      nextByte: 1,
+      output: "A",
+      startByte: 0,
+      totalBytes: 7,
+      truncated: true,
+    });
+    expect(second).toMatchObject({
+      bytesRead: 4,
+      droppedBytes: 0,
+      nextByte: 5,
+      output: "🙂",
+      startByte: 1,
+      truncated: true,
+    });
+    expect(third).toMatchObject({
+      bytesRead: 2,
+      nextByte: 7,
+      output: "BC",
+      startByte: 5,
+      truncated: false,
+    });
+    expect(first.output + second.output + third.output).toBe("A🙂BC");
+
+    const split = await manager.logs(started.id, 8, 2);
+    expect(split).toMatchObject({
+      droppedBytes: 3,
+      nextByte: 7,
+      output: "BC",
+      startByte: 5,
+    });
+    expect(split.output).not.toContain("�");
+
+    const pastEnd = await manager.logs(started.id, 8, 100);
+    expect(pastEnd).toMatchObject({
+      bytesRead: 0,
+      droppedBytes: 0,
+      nextByte: 7,
+      output: "",
+      startByte: 7,
+      totalBytes: 7,
+      truncated: false,
+    });
+    expect(pastEnd.task.status).toBe("completed");
+    expect(pastEnd.text).toContain("no new output");
+  });
+
+  test("returns an empty cursor result for an empty log", async () => {
+    const manager = await createManager();
+    const started = await manager.start({
+      command: "true",
+      cwd: process.cwd(),
+    });
+    await waitForTerminal(manager, started.id);
+
+    const logs = await manager.logs(started.id, 8, 0);
+
+    expect(logs).toMatchObject({
+      bytesRead: 0,
+      droppedBytes: 0,
+      nextByte: 0,
+      output: "",
+      startByte: 0,
+      totalBytes: 0,
+      truncated: false,
+    });
+  });
+
   test("returns a valid UTF-8 tail when truncation splits a character", async () => {
     const manager = await createManager();
     const started = await manager.start({
