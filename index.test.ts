@@ -75,14 +75,24 @@ type EventHandler = (
 
 interface HarnessOptions {
   hasUI?: boolean;
+  model?: { id: string; provider: string };
   notificationError?: Error;
   sendMessageError?: Error;
+  sessionFile?: string;
+  sessionId?: string;
+  thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 }
 
 const createHarness = function createHarness(options: HarnessOptions = {}) {
   const handlers = new Map<string, EventHandler[]>();
   const sentMessages: { message: unknown; options: unknown }[] = [];
   const notifications: string[] = [];
+  const metadata = {
+    model: options.model,
+    sessionFile: options.sessionFile,
+    sessionId: options.sessionId ?? "test-session",
+    thinkingLevel: options.thinkingLevel,
+  };
   let sendAttempts = 0;
   const notificationReceived = Promise.withResolvers<null>();
   const statuses: (string | undefined)[] = [];
@@ -115,7 +125,17 @@ const createHarness = function createHarness(options: HarnessOptions = {}) {
 
   const ctx = {
     cwd: process.cwd(),
+    get model() {
+      return metadata.model;
+    },
+    get thinkingLevel() {
+      return metadata.thinkingLevel;
+    },
     hasUI: options.hasUI ?? true,
+    sessionManager: {
+      getSessionFile: () => metadata.sessionFile,
+      getSessionId: () => metadata.sessionId,
+    },
     ui: {
       notify(message: string) {
         if (options.notificationError) {
@@ -166,6 +186,9 @@ const createHarness = function createHarness(options: HarnessOptions = {}) {
       return sendAttempts;
     },
     sentMessages,
+    setMetadata(values: Partial<typeof metadata>) {
+      Object.assign(metadata, values);
+    },
     statuses,
   };
 };
@@ -343,6 +366,54 @@ describe("background tasks extension", () => {
       "Execution: configured POSIX shell -c"
     );
     expect(started.content[0]?.text).toContain(`cwd: ${process.cwd()}`);
+    await harness.emit("session_shutdown");
+  });
+
+  test("injects current session metadata into each task environment", async () => {
+    const harness = createHarness({
+      model: { id: "model-one", provider: "provider-one" },
+      sessionFile: "/tmp/session-one.jsonl",
+      sessionId: "session-one",
+      thinkingLevel: "high",
+    });
+    await harness.emit("session_start");
+    const printMetadata =
+      "printf '%s|%s|%s|%s|%s\\n' \"$PI_SESSION_ID\" \"${PI_SESSION_FILE-unset}\" \"$PI_PROVIDER\" \"$PI_MODEL\" \"$PI_REASONING_LEVEL\"";
+
+    const first = await harness.execute({
+      action: "start",
+      command: printMetadata,
+      name: "First metadata",
+    });
+    expect(first.content[0]?.text).not.toContain("provider-one");
+    await waitForNotificationCount(harness.notifications, 1);
+    const firstLogs = await harness.execute({
+      action: "logs",
+      taskId: first.details.task?.id,
+    });
+    expect(firstLogs.content[0]?.text).toContain(
+      "session-one|/tmp/session-one.jsonl|provider-one|model-one|high"
+    );
+
+    harness.setMetadata({
+      model: { id: "model-two", provider: "provider-two" },
+      sessionFile: undefined,
+      thinkingLevel: "low",
+    });
+    const second = await harness.execute({
+      action: "start",
+      command: printMetadata,
+      name: "Changed metadata",
+    });
+    await waitForNotificationCount(harness.notifications, 2);
+    const secondLogs = await harness.execute({
+      action: "logs",
+      taskId: second.details.task?.id,
+    });
+    expect(secondLogs.content[0]?.text).toContain(
+      "session-one|unset|provider-two|model-two|low"
+    );
+
     await harness.emit("session_shutdown");
   });
 

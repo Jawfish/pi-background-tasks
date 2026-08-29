@@ -88,6 +88,7 @@ export interface StartTaskInput {
   command: string;
   cwd: string;
   completionPolicy?: CompletionPolicy;
+  environment?: NodeJS.ProcessEnv;
   timeoutSeconds?: number;
 }
 
@@ -554,7 +555,7 @@ export class BackgroundTaskManager {
         child = spawn(this.#shell, ["-c", command], {
           cwd: input.cwd,
           detached: true,
-          env: process.env,
+          env: input.environment ?? process.env,
           stdio: ["ignore", "pipe", "pipe"],
         });
       } catch (error) {

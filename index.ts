@@ -35,6 +35,36 @@ const MAX_COMPLETION_ERROR_BYTES = 384;
 const MAX_COMPLETION_OUTPUT_BYTES = 768;
 export const MAX_COMPLETION_MESSAGE_BYTES = 32 * 1024;
 
+const TASK_SESSION_ENVIRONMENT = [
+  "PI_SESSION_ID",
+  "PI_SESSION_FILE",
+  "PI_PROVIDER",
+  "PI_MODEL",
+  "PI_REASONING_LEVEL",
+] as const;
+
+const buildTaskEnvironment = function buildTaskEnvironment(
+  ctx: ExtensionContext
+): NodeJS.ProcessEnv {
+  const environment = { ...process.env };
+  for (const name of TASK_SESSION_ENVIRONMENT) {
+    delete environment[name];
+  }
+  environment.PI_SESSION_ID = ctx.sessionManager.getSessionId();
+  const sessionFile = ctx.sessionManager.getSessionFile();
+  if (sessionFile) {
+    environment.PI_SESSION_FILE = sessionFile;
+  }
+  if (ctx.model) {
+    environment.PI_PROVIDER = ctx.model.provider;
+    environment.PI_MODEL = ctx.model.id;
+  }
+  if (ctx.thinkingLevel) {
+    environment.PI_REASONING_LEVEL = ctx.thinkingLevel;
+  }
+  return environment;
+};
+
 const Parameters = Type.Object({
   action: StringEnum(
     ["start", "status", "logs", "stop", "watch", "unwatch"] as const,
@@ -715,6 +745,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
           const task = await manager.start({
             command: params.command,
             cwd: ctx.cwd,
+            environment: buildTaskEnvironment(ctx),
             name: params.name,
             completionPolicy: params.completionPolicy,
             timeoutSeconds: params.timeoutSeconds,
