@@ -575,7 +575,18 @@ describe("background tasks extension", () => {
         completionPolicy: expected.policy,
         name: `${expected.policy} completion`,
       });
-      await waitForCompletion();
+      if (expected.notifications > 0) {
+        await waitForNotificationCount(
+          harness.notifications,
+          expected.notifications
+        );
+      }
+      if (expected.messages > 0) {
+        await waitForMessageCount(harness.sentMessages, expected.messages);
+      }
+      if (expected.notifications === 0 && expected.messages === 0) {
+        await waitForCompletion();
+      }
 
       expect(harness.notifications).toHaveLength(expected.notifications);
       expect(harness.sentMessages).toHaveLength(expected.messages);
@@ -683,7 +694,7 @@ describe("background tasks extension", () => {
       completionPolicy: "wake",
       name: "Delivered failure",
     });
-    await waitForCompletion();
+    await waitForMessageCount(harness.sentMessages, 1);
     const delivered = harness.sentMessages[0]?.message;
     expect(delivered).toBeDefined();
 
@@ -759,7 +770,7 @@ describe("background tasks extension", () => {
       taskId: started.details.task?.id,
       wake: true,
     });
-    await waitForCompletion();
+    await waitForMessageCount(harness.sentMessages, 1);
 
     expect(harness.sentMessages).toHaveLength(1);
     expect(harness.sentMessages[0]?.options).toEqual({
@@ -928,7 +939,7 @@ describe("background tasks extension", () => {
         completionPolicy: "wake",
       }),
     ]);
-    await waitForCompletion();
+    await waitForMessageCount(harness.sentMessages, 1);
 
     expect(harness.sentMessages).toHaveLength(1);
     expect(harness.sentMessages[0]?.options).toEqual({
@@ -1034,7 +1045,7 @@ describe("background tasks extension", () => {
       name: "Failed notification",
       completionPolicy: "wake",
     });
-    await waitForCompletion();
+    await waitForMessageCount(harness.sentMessages, 1);
 
     expect(harness.notifications).toHaveLength(0);
     expect(harness.sendAttempts).toBe(1);
@@ -1063,7 +1074,7 @@ describe("background tasks extension", () => {
     await waitForNotificationCount(harness.notifications, 16);
     await startWave(16);
     await waitForNotificationCount(harness.notifications, 32);
-    await waitForCompletion();
+    await waitForMessageCount(harness.sentMessages, 2);
 
     expect(harness.sentMessages).toHaveLength(2);
     expect(harness.sentMessages.map(({ options }) => options)).toEqual([
@@ -1234,7 +1245,7 @@ describe("background tasks extension", () => {
 
     const after = createHarness({ sessionId });
     await after.emit("session_start");
-    await waitForCompletion();
+    await waitForMessageCount(after.sentMessages, 1);
 
     expect(after.sentMessages).toHaveLength(1);
     const message = after.sentMessages[0]?.message as { content?: string };
@@ -1254,7 +1265,7 @@ describe("background tasks extension", () => {
       completionPolicy: "wake",
       name: "Delivered once",
     });
-    await waitForCompletion();
+    await waitForMessageCount(first.sentMessages, 1);
     expect(first.sentMessages).toHaveLength(1);
     expect(first.notifications).toHaveLength(1);
     await first.emit("session_shutdown", { reason: "reload" });
