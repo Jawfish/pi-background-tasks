@@ -2,6 +2,8 @@
 
 This Pi extension runs POSIX shell commands without blocking the agent. It gives the model a current task list before every model call. Commands use `sh` from `PATH` by default, not the user's interactive login shell. Set `PI_BACKGROUND_TASK_SHELL` to use another POSIX shell.
 
+Task commands run from Pi's current working directory and inherit Pi's environment. The extension passes the command to the configured shell with `-c` without rewriting shell quoting or command escapes. Put quote-heavy or multiline programs in a file or a quoted heredoc. Do not use literal `\uXXXX` sequences as substitutes for shell quotes.
+
 ## Tool
 
 The extension adds one `background_task` tool with four actions.

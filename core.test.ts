@@ -1010,6 +1010,20 @@ describe("task formatting", () => {
     expect(context).toContain("abc12345 [running");
     expect(context).toContain("Build &lt;main&gt;");
     expect(context).toContain("automatic continuation enabled");
+
+    const failedContext = formatModelContext([
+      {
+        ...task,
+        endedAt: 2000,
+        error: "Exited with code 1",
+        exitCode: 1,
+        status: "failed",
+      },
+    ]);
+    expect(failedContext).toContain("inspect the original command");
+    expect(failedContext).toContain("read logs once if needed");
+    expect(failedContext).toContain("retry only when retry is safe");
+    expect(failedContext).toContain("Do not retry an unchanged command");
   });
 
   test("formats an empty and populated task list", () => {

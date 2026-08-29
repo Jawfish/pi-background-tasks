@@ -282,6 +282,11 @@ export const formatModelContext = function formatModelContext(
     }
   }
 
+  if (recent.some((task) => task.status === "failed")) {
+    lines.push(
+      "For a recent failed task, inspect the original command and read logs once if needed. Correct the cause, and retry only when retry is safe. Do not retry an unchanged command or poll."
+    );
+  }
   lines.push(
     "Use background_task for start, status, logs, or stop. This is the current status for this model call.",
     "</background-tasks>"

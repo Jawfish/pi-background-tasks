@@ -53,6 +53,9 @@ interface ToolResult {
 }
 
 interface RegisteredTool {
+  description: string;
+  promptGuidelines?: readonly string[];
+  promptSnippet?: string;
   execute: (
     toolCallId: string,
     params: ToolParams,
@@ -149,6 +152,9 @@ const createHarness = function createHarness(options: HarnessOptions = {}) {
   return {
     emit,
     execute,
+    get registeredTool() {
+      return tool;
+    },
     notificationReceived: notificationReceived.promise,
     notifications,
     get sendAttempts() {
@@ -264,10 +270,39 @@ describe("completion messages", () => {
 
     expect(message).toContain("<output-unavailable");
     expect(message).toContain("when capture succeeds");
+    expect(message).toContain("correct the cause");
+    expect(message).toContain("retry only when retry is safe");
+    expect(message).toContain("Do not retry an unchanged command");
+    expect(message).toContain("read logs once by task ID");
   });
 });
 
 describe("background tasks extension", () => {
+  test("teaches the model how start commands execute", async () => {
+    const harness = createHarness();
+    const tool = harness.registeredTool;
+    const guidance = tool?.promptGuidelines?.join("\n") ?? "";
+
+    expect(tool?.description).toContain("configured POSIX shell");
+    expect(tool?.description).toContain("current working directory");
+    expect(tool?.description).toContain("Shell quoting");
+    expect(guidance).toContain("POSIX shell syntax");
+    expect(guidance).toContain("quoted heredoc");
+    expect(guidance).toContain("literal \\uXXXX sequences");
+
+    await harness.emit("session_start");
+    const started = await harness.execute({
+      action: "start",
+      command: "true",
+      name: "Execution context",
+    });
+    expect(started.content[0]?.text).toContain(
+      "Execution: configured POSIX shell -c"
+    );
+    expect(started.content[0]?.text).toContain(`cwd: ${process.cwd()}`);
+    await harness.emit("session_shutdown");
+  });
+
   test("registers current task state in every model context", async () => {
     const harness = createHarness();
     await harness.emit("session_start");

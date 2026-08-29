@@ -50,7 +50,10 @@ const Parameters = Type.Object({
     })
   ),
   command: Type.Optional(
-    Type.String({ description: "Shell command for action=start" })
+    Type.String({
+      description:
+        "POSIX shell command for action=start. It runs in -c mode under the configured POSIX shell (sh from PATH by default), from Pi's current working directory, with Pi's environment. Shell quoting and command escapes are not rewritten.",
+    })
   ),
   condition: Type.Optional(
     StringEnum(["output", "exit", "inactivity"] as const, {
@@ -421,7 +424,7 @@ export const completionMessage = function completionMessage(
     );
   }
   lines.push(
-    "  <guidance>Task states are terminal. A bounded output tail is included when capture succeeds; output-unavailable reports capture failure. Do not call status only to confirm completion. Use logs only if the task remains in current background status and more output is needed.</guidance>",
+    "  <guidance>Task states are terminal. A bounded output tail is included when capture succeeds; output-unavailable reports capture failure. Do not call status only to confirm completion. For a failed task, compare the error and output tail with the original start command, correct the cause, and retry only when retry is safe. Do not retry an unchanged command. If the tail is truncated or inconclusive, read logs once by task ID before retrying; do not poll.</guidance>",
     "</background-task-completion>"
   );
   const message = lines.join("\n");
@@ -431,7 +434,7 @@ export const completionMessage = function completionMessage(
   return [
     "<background-task-completion>",
     `  <omitted count="${String(completions.length)}">Completion details exceeded the message byte limit.</omitted>`,
-    "  <guidance>Task states are terminal. Inspect current background status for retained task details.</guidance>",
+    "  <guidance>Task states are terminal. Inspect current background status for retained task details. For a failed task, read logs once if needed, correct the cause, and retry only when retry is safe. Do not retry an unchanged command or poll.</guidance>",
     "</background-task-completion>",
   ].join("\n");
 };
@@ -657,6 +660,8 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     description: [
       "Manage session-scoped background shell tasks.",
       "Actions: start, status, logs, stop, watch, unwatch.",
+      "Start commands run in -c mode under the configured POSIX shell (sh from PATH by default), from Pi's current working directory, with Pi's environment.",
+      "Shell quoting and command escapes are not rewritten.",
       "Task status is injected before every model call, so status and logs are not polling tools.",
       `Log reads are capped at ${String(MAX_LOG_READ_BYTES)} bytes. Reuse nextByte as afterByte for incremental reads.`,
     ].join(" "),
@@ -684,6 +689,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
                   `Started ${task.name} (${task.id})`,
                   `PID: ${String(task.pid ?? "unknown")}`,
                   `Log: ${task.logPath}`,
+                  `Execution: configured POSIX shell -c; cwd: ${task.cwd}`,
                   continuation,
                 ].join("\n"),
                 type: "text" as const,
@@ -799,6 +805,8 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     },
     promptGuidelines: [
       "Use background_task with action=start for commands that should run without blocking the agent.",
+      "Use POSIX shell syntax in background_task start commands. Commands run in -c mode under the configured POSIX shell (sh from PATH by default), from Pi's current working directory, with Pi's environment. Shell quoting and command escapes are not rewritten.",
+      "For quote-heavy or multiline programs in another language, write the program to a file or use a quoted heredoc. Do not use literal \\uXXXX sequences as substitutes for shell quotes.",
       "Set background_task wakeOnExit=true only when the agent must continue automatically after that task completes or fails.",
       "Do not poll background_task status or logs merely to wait. Current active status is injected before every model call, and wakeOnExit steers completion into the next model call or starts a turn when idle.",
       "Use background_task logs only when task output is needed. Keep maxBytes modest to protect model context, and reuse a returned nextByte as afterByte for incremental reads.",
