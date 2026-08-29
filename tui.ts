@@ -39,6 +39,7 @@ export interface BackgroundTaskToolParams {
   command?: string;
   completionPolicy?: CompletionPolicy;
   condition?: TaskWatchCondition;
+  cwd?: string;
   inactivitySeconds?: number;
   maxBytes?: number;
   name?: string;
@@ -483,6 +484,7 @@ export const renderBackgroundTaskResult = function renderBackgroundTaskResult(
   });
   const metadata = [
     task.pid === undefined ? undefined : `PID ${String(task.pid)}`,
+    `cwd ${task.cwd}`,
     `policy ${effectiveCompletionPolicy(task, "notify")!}`,
     task.timeoutSeconds === undefined
       ? undefined

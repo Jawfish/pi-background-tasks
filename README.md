@@ -1,6 +1,6 @@
 # Background tasks
 
-This Pi extension runs POSIX shell commands without blocking the agent. It gives the model a current task list before every model call. Commands use `sh` from `PATH` by default, not the user's interactive login shell. Set `PI_BACKGROUND_TASK_SHELL` to use another POSIX shell.
+This Pi extension runs POSIX shell commands without blocking the agent. It gives the model a current task list before every model call. Commands use `sh -c` from `PATH` by default, not the user's interactive login shell.
 
 Task commands run from Pi's current working directory and inherit Pi's environment. The extension passes the command to the configured shell with `-c` without rewriting shell quoting or command escapes. Put quote-heavy or multiline programs in a file or a quoted heredoc. Do not use literal `\uXXXX` sequences as substitutes for shell quotes.
 
@@ -46,6 +46,23 @@ Register or cancel a one-shot task watch:
 ```
 
 `taskId` and `watchId` accept a full ID or a unique prefix.
+
+## Shell configuration
+
+Set `PI_BACKGROUND_TASK_SHELL` to use another POSIX shell. Optional shell
+arguments come from `PI_BACKGROUND_TASK_SHELL_ARGS`, which must be a JSON array
+of strings. The extension passes each item as one argument before `-c`; it does
+not split arguments on whitespace.
+
+For example, use Bash without profile or startup files:
+
+```sh
+export PI_BACKGROUND_TASK_SHELL=bash
+export PI_BACKGROUND_TASK_SHELL_ARGS='["--noprofile","--norc"]'
+```
+
+With no overrides, the launch vector is `sh -c <command>`. The extension does
+not load interactive shell profiles.
 
 ## Interactive monitor
 

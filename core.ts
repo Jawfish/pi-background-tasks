@@ -21,6 +21,7 @@ export const MAX_WATCH_PATTERN_BYTES = 512;
 export const WATCH_REARM_COOLDOWN_MS = 1000;
 export const DEFAULT_SHELL = "sh";
 export const BACKGROUND_TASK_SHELL_ENV = "PI_BACKGROUND_TASK_SHELL";
+export const BACKGROUND_TASK_SHELL_ARGS_ENV = "PI_BACKGROUND_TASK_SHELL_ARGS";
 
 export type TaskStatus =
   | "running"
@@ -88,6 +89,7 @@ export interface StartTaskInput {
   command: string;
   cwd: string;
   completionPolicy?: CompletionPolicy;
+  environment?: NodeJS.ProcessEnv;
   timeoutSeconds?: number;
 }
 
@@ -154,6 +156,7 @@ export interface BackgroundTaskManagerOptions {
   watchRearmCooldownMs?: number;
   killGraceMs?: number;
   shell?: string;
+  shellArgs?: readonly string[];
   writeLogChunk?: (
     stream: WriteStream,
     data: Buffer,
@@ -163,6 +166,32 @@ export interface BackgroundTaskManagerOptions {
   onFinished?: (completion: TaskCompletion) => void;
   onWatchFired?: (event: TaskWatchEvent) => void;
 }
+
+const parseShellArguments = function parseShellArguments(
+  value: string | undefined
+): string[] {
+  if (value === undefined) {
+    return [];
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch (error) {
+    throw new Error(
+      `${BACKGROUND_TASK_SHELL_ARGS_ENV} must be a JSON string array`,
+      { cause: error }
+    );
+  }
+  if (
+    !Array.isArray(parsed) ||
+    !parsed.every((argument) => typeof argument === "string")
+  ) {
+    throw new Error(
+      `${BACKGROUND_TASK_SHELL_ARGS_ENV} must be a JSON string array`
+    );
+  }
+  return parsed;
+};
 
 const isActiveStatus = function isActiveStatus(status: TaskStatus): boolean {
   return status === "running" || status === "stopping";
@@ -310,6 +339,7 @@ export class BackgroundTaskManager {
   readonly #watchRearmCooldownMs: number;
   readonly #killGraceMs: number;
   readonly #shell: string;
+  readonly #shellArgs: readonly string[];
   readonly #writeLogChunk: (
     stream: WriteStream,
     data: Buffer,
@@ -343,6 +373,10 @@ export class BackgroundTaskManager {
     this.#shell =
       options.shell ??
       (process.env[BACKGROUND_TASK_SHELL_ENV]?.trim() || DEFAULT_SHELL);
+    this.#shellArgs = [
+      ...(options.shellArgs ??
+        parseShellArguments(process.env[BACKGROUND_TASK_SHELL_ARGS_ENV])),
+    ];
     this.#writeLogChunk =
       options.writeLogChunk ??
       ((stream, data, callback) => stream.write(data, callback));
@@ -551,10 +585,10 @@ export class BackgroundTaskManager {
 
       let child: ChildProcessByStdio<null, Readable, Readable>;
       try {
-        child = spawn(this.#shell, ["-c", command], {
+        child = spawn(this.#shell, [...this.#shellArgs, "-c", command], {
           cwd: input.cwd,
           detached: true,
-          env: process.env,
+          env: input.environment ?? process.env,
           stdio: ["ignore", "pipe", "pipe"],
         });
       } catch (error) {
