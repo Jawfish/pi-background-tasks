@@ -3,7 +3,7 @@ import {
   fauxProvider,
   InMemoryCredentialStore,
 } from "@earendil-works/pi-ai";
-import type { FauxResponseStep } from "@earendil-works/pi-ai";
+import type { Context, FauxResponseStep } from "@earendil-works/pi-ai";
 import {
   createAgentSessionFromServices,
   createAgentSessionRuntime,
@@ -125,6 +125,7 @@ export const waitFor = async function waitFor(
 export type IntegrationMode = "json" | "print" | "rpc" | "tui";
 
 export interface PiIntegrationHarnessOptions {
+  extensionPathsBefore?: readonly string[];
   mode?: IntegrationMode;
   persistedSession?: boolean;
 }
@@ -133,6 +134,7 @@ export class PiIntegrationHarness {
   readonly agentEvents: AgentSessionEvent[] = [];
   readonly extensionErrors: ExtensionError[] = [];
   readonly lifecycleEvents: BackgroundTaskLifecycleEvent[] = [];
+  readonly modelContexts: Context[] = [];
   readonly rootDir: string;
   readonly cwd: string;
   readonly agentDir: string;
@@ -146,6 +148,7 @@ export class PiIntegrationHarness {
   latestService: BackgroundTaskService | undefined;
 
   #disposed = false;
+  #extensionPathsBefore: readonly string[];
   #sessionUnsubscribe: (() => void) | undefined;
   #serviceUnsubscribe: (() => void) | undefined;
   #trackedPids = new Set<number>();
@@ -155,7 +158,8 @@ export class PiIntegrationHarness {
     modelRuntime: ModelRuntime,
     faux: ReturnType<typeof fauxProvider>,
     eventBus: ReturnType<typeof createEventBus>,
-    mode: IntegrationMode
+    mode: IntegrationMode,
+    extensionPathsBefore: readonly string[]
   ) {
     this.rootDir = rootDir;
     this.cwd = path.join(rootDir, "project");
@@ -165,6 +169,7 @@ export class PiIntegrationHarness {
     this.faux = faux;
     this.eventBus = eventBus;
     this.mode = mode;
+    this.#extensionPathsBefore = extensionPathsBefore;
   }
 
   static async create(
@@ -195,7 +200,8 @@ export class PiIntegrationHarness {
       modelRuntime,
       faux,
       eventBus,
-      options.mode ?? "print"
+      options.mode ?? "print",
+      options.extensionPathsBefore ?? []
     );
     activeHarnesses.add(harness);
 
@@ -213,7 +219,17 @@ export class PiIntegrationHarness {
   }
 
   queueResponses(responses: FauxResponseStep[]): void {
-    this.faux.appendResponses(responses);
+    this.faux.appendResponses(
+      responses.map((response) => async (context, options, state, model) => {
+        this.modelContexts.push({
+          messages: structuredClone(context.messages),
+          systemPrompt: context.systemPrompt,
+        });
+        return typeof response === "function"
+          ? await response(context, options, state, model)
+          : response;
+      })
+    );
   }
 
   getService(): BackgroundTaskService {
@@ -307,7 +323,10 @@ export class PiIntegrationHarness {
         cwd,
         modelRuntime: this.modelRuntime,
         resourceLoaderOptions: {
-          additionalExtensionPaths: [EXTENSION_PATH],
+          additionalExtensionPaths: [
+            ...this.#extensionPathsBefore,
+            EXTENSION_PATH,
+          ],
           eventBus: this.eventBus,
           noContextFiles: true,
           noPromptTemplates: true,
