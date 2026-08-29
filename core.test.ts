@@ -1,10 +1,19 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { access, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import {
+  access,
+  chmod,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import {
+  BACKGROUND_TASK_SHELL_ARGS_ENV,
   BACKGROUND_TASK_SHELL_ENV,
   BackgroundTaskManager,
   DEFAULT_SHELL,
@@ -259,6 +268,78 @@ describe("BackgroundTaskManager", () => {
 
     expect(terminal.status).toBe("failed");
     expect(terminal.error).toContain("ENOENT");
+  });
+
+  test("passes configured shell arguments without whitespace splitting", async () => {
+    const wrapperDir = await mkdtemp(path.join(tmpdir(), "pi-bg-shell-"));
+    runtimeDirs.push(wrapperDir);
+    const wrapper = path.join(wrapperDir, "shell-wrapper");
+    await writeFile(
+      wrapper,
+      [
+        "#!/bin/sh",
+        '[ "$1" = "argument with spaces" ] || exit 64',
+        '[ "$2" = "--literal" ] || exit 65',
+        '[ "$3" = "-c" ] || exit 66',
+        "shift 2",
+        'exec /bin/sh "$@"',
+      ].join("\n")
+    );
+    await chmod(wrapper, 0o755);
+
+    const previousShell = process.env[BACKGROUND_TASK_SHELL_ENV];
+    const previousArguments = process.env[BACKGROUND_TASK_SHELL_ARGS_ENV];
+    let manager: BackgroundTaskManager;
+    try {
+      process.env[BACKGROUND_TASK_SHELL_ENV] = wrapper;
+      process.env[BACKGROUND_TASK_SHELL_ARGS_ENV] = JSON.stringify([
+        "argument with spaces",
+        "--literal",
+      ]);
+      manager = await createManager();
+    } finally {
+      if (previousShell === undefined) {
+        Reflect.deleteProperty(process.env, BACKGROUND_TASK_SHELL_ENV);
+      } else {
+        process.env[BACKGROUND_TASK_SHELL_ENV] = previousShell;
+      }
+      if (previousArguments === undefined) {
+        Reflect.deleteProperty(process.env, BACKGROUND_TASK_SHELL_ARGS_ENV);
+      } else {
+        process.env[BACKGROUND_TASK_SHELL_ARGS_ENV] = previousArguments;
+      }
+    }
+
+    const started = await manager.start({
+      command: "printf shell-args-ok",
+      cwd: process.cwd(),
+    });
+    const terminal = await waitForTerminal(manager, started.id);
+    const logs = await manager.logs(started.id);
+
+    expect(terminal.status).toBe("completed");
+    expect(logs.output).toContain("shell-args-ok");
+  });
+
+  test("rejects malformed shell argument configuration", () => {
+    const previous = process.env[BACKGROUND_TASK_SHELL_ARGS_ENV];
+    try {
+      for (const value of ["not-json", "{}", '["valid", 1]']) {
+        process.env[BACKGROUND_TASK_SHELL_ARGS_ENV] = value;
+        expect(
+          () =>
+            new BackgroundTaskManager({
+              runtimeDir: path.join(tmpdir(), "unused-background-runtime"),
+            })
+        ).toThrow("must be a JSON string array");
+      }
+    } finally {
+      if (previous === undefined) {
+        Reflect.deleteProperty(process.env, BACKGROUND_TASK_SHELL_ARGS_ENV);
+      } else {
+        process.env[BACKGROUND_TASK_SHELL_ARGS_ENV] = previous;
+      }
+    }
   });
 
   test("cleans the log after a synchronous spawn failure", async () => {
