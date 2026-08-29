@@ -16,6 +16,12 @@
     "url": "git+https://github.com/jawfish/pi-background-tasks.git"
   },
   "type": "module",
+  "files": [
+    "core.ts",
+    "index.ts",
+    "service.ts",
+    "tui.ts"
+  ],
   "publishConfig": {
     "access": "public"
   },
