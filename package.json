@@ -18,6 +18,8 @@
   "type": "module",
   "files": [
     "core.ts",
+    "herdr-dashboard-viewer.js",
+    "herdr-dashboard.ts",
     "index.ts",
     "service.ts",
     "tui.ts"
@@ -28,7 +30,7 @@
   "scripts": {
     "test": "bun test",
     "test:integration": "bun test integration --timeout 20000",
-    "test:unit": "bun test core.test.ts index.test.ts service.test.ts tui.test.ts",
+    "test:unit": "bun test core.test.ts herdr-dashboard.test.ts index.test.ts service.test.ts tui.test.ts",
     "typecheck": "tsc --noEmit",
     "verify:package": "./scripts/verify-package.sh"
   },

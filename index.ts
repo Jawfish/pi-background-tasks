@@ -39,6 +39,10 @@ import type {
   CompletionDisplayDetails,
 } from "./tui.ts";
 import {
+  BackgroundTasksHerdrDashboard,
+  type BackgroundTasksHerdrSurface,
+} from "./herdr-dashboard.ts";
+import {
   BACKGROUND_TASK_DISCOVERY_CHANNEL,
   BACKGROUND_TASK_SERVICE_CHANNEL,
   BACKGROUND_TASK_SERVICE_VERSION,
@@ -54,6 +58,7 @@ import type {
 } from "./service.ts";
 
 const WAKE_BATCH_MS = 100;
+const HERDR_SHUTDOWN_GRACE_MS = 500;
 const MAX_COMPLETION_TASKS = 16;
 const MAX_COMPLETION_NAME_BYTES = 384;
 const MAX_COMPLETION_ERROR_BYTES = 384;
@@ -638,14 +643,21 @@ const claimHandoff = function claimHandoff(
   return entry;
 };
 
+export interface BackgroundTasksExtensionDependencies {
+  herdrDashboard?: BackgroundTasksHerdrSurface;
+}
+
 const backgroundTasksExtension = function backgroundTasksExtension(
-  pi: ExtensionAPI
+  pi: ExtensionAPI,
+  dependencies: BackgroundTasksExtensionDependencies = {}
 ): void {
   let currentCtx: ExtensionContext | undefined;
   let shuttingDown = false;
   let wakeHandle: NodeJS.Timeout | undefined;
   let activeDashboard: TaskDashboardComponent | undefined;
   let dashboardReadState = new TaskDashboardReadState();
+  let herdrDashboard: BackgroundTasksHerdrSurface;
+  let stopHerdrConnectionListener: (() => void) | undefined;
   let deliveryLedger = new CompletionDeliveryLedger();
   const unacknowledgedFailures = new Map<string, TaskSnapshot>();
   const serviceListeners = new Set<
@@ -673,9 +685,12 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     ].filter((part): part is string => part !== undefined);
     ctx.ui.setStatus(
       "background-tasks",
-      activeCount > 0 ? `bg: ${parts.join(" · ")}` : undefined
+      activeCount > 0 && !herdrDashboard.connected()
+        ? `bg: ${parts.join(" · ")}`
+        : undefined
     );
     activeDashboard?.refresh();
+    herdrDashboard.refresh();
   };
 
   const flushWake = (): void => {
@@ -893,9 +908,18 @@ const backgroundTasksExtension = function backgroundTasksExtension(
 
   const handleStarted = (task: TaskSnapshot): void => {
     publishServiceEvent({ task, type: "started" });
+    const ctx = currentCtx;
+    if (ctx?.hasUI) {
+      void herdrDashboard.ensureStarted(ctx).then((connected) => {
+        if (connected) {
+          updateUi();
+        }
+      });
+    }
   };
 
   const handleOutput = (event: TaskOutputEvent): void => {
+    herdrDashboard.recordOutput(event);
     publishServiceEvent({
       nextByte: event.nextByte,
       preview: event.preview,
@@ -1055,6 +1079,15 @@ const backgroundTasksExtension = function backgroundTasksExtension(
   };
 
   manager = new BackgroundTaskManager(managerCallbacks);
+  herdrDashboard =
+    dependencies.herdrDashboard ??
+    new BackgroundTasksHerdrDashboard({
+      list: () => manager.list(),
+      stop: (idOrPrefix) => manager.stop(idOrPrefix),
+    });
+  stopHerdrConnectionListener = herdrDashboard.onConnectionChange(() => {
+    updateUi();
+  });
 
   pi.registerMessageRenderer<CompletionDisplayDetails>(
     "background-task-completion",
@@ -1235,6 +1268,9 @@ const backgroundTasksExtension = function backgroundTasksExtension(
         ctx.ui.notify("/background-tasks requires TUI mode", "error");
         return;
       }
+      if (await herdrDashboard.focus(ctx)) {
+        return;
+      }
 
       let dashboard: TaskDashboardComponent | undefined;
       try {
@@ -1383,6 +1419,17 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     }
     await manager.initialize();
     updateUi();
+    if (
+      manager
+        .list()
+        .some((task) => task.status === "running" || task.status === "stopping")
+    ) {
+      void herdrDashboard.ensureStarted(ctx).then((connected) => {
+        if (connected) {
+          updateUi();
+        }
+      });
+    }
     if (deliveryLedger.wakeCandidates().length > 0) {
       scheduleWake();
     }
@@ -1433,25 +1480,49 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     serviceListeners.clear();
     discoverySubscription?.();
     discoverySubscription = undefined;
+    stopHerdrConnectionListener?.();
+    stopHerdrConnectionListener = undefined;
 
     try {
       dashboard?.dispose();
+    } catch (error) {
+      console.error(
+        `[background-tasks] dashboard cleanup failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+    const herdrCleanup = herdrDashboard.dispose().catch((error: unknown) => {
+      console.error(
+        `[background-tasks] Herdr dashboard cleanup failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    });
+
+    try {
+      if (reload && sessionId) {
+        manager.detachCallbacks();
+        storeHandoff(sessionId, {
+          deliveryLedger,
+          manager,
+          readState: dashboardReadState,
+          unacknowledgedFailures: new Map(unacknowledgedFailures),
+        });
+      } else {
+        await manager.shutdown();
+      }
     } finally {
+      currentCtx = undefined;
+      ctx?.ui.setStatus("background-tasks", undefined);
+      let cleanupTimeout: ReturnType<typeof setTimeout> | undefined;
       try {
-        if (reload && sessionId) {
-          manager.detachCallbacks();
-          storeHandoff(sessionId, {
-            deliveryLedger,
-            manager,
-            readState: dashboardReadState,
-            unacknowledgedFailures: new Map(unacknowledgedFailures),
-          });
-        } else {
-          await manager.shutdown();
-        }
+        await Promise.race([
+          herdrCleanup,
+          new Promise<void>((resolve) => {
+            cleanupTimeout = setTimeout(resolve, HERDR_SHUTDOWN_GRACE_MS);
+          }),
+        ]);
       } finally {
-        currentCtx = undefined;
-        ctx?.ui.setStatus("background-tasks", undefined);
+        if (cleanupTimeout) {
+          clearTimeout(cleanupTimeout);
+        }
       }
     }
   });

@@ -205,6 +205,27 @@ time, process details, watches, and a bounded log tail.
 The TUI keeps read cursors when it closes and reopens. It removes terminal
 control sequences from command text and logs before it renders them.
 
+### Herdr side panel
+
+When Pi runs interactively inside [Herdr](https://herdr.dev), the extension
+lazily opens a reusable panel on the right when the first background task
+starts. The panel shows active tasks first, followed by recent tasks, with live
+status, elapsed time, process details, and bounded committed-output previews.
+While it is connected, the normal `bg: …` footer status is hidden.
+
+- Use Up and Down, or `j` and `k`, to select a task.
+- Press `x` twice to stop an active task.
+- Press `r` to refresh, `p` to focus the parent Pi pane, and `?` for help.
+- Press `q` or Ctrl+C to close the panel and restore the normal footer status.
+- `/background-tasks` focuses or opens the panel instead of showing the modal.
+
+Herdr is detected through `HERDR_ENV=1` and the inherited pane context; it is
+not a package dependency. Missing Herdr commands, pane startup failures, or a
+disconnected viewer fall back to the existing footer and modal. Set
+`PI_BACKGROUND_TASK_HERDR_DASHBOARD=0` to disable the integration. The panel
+uses `node` by default; set `PI_BACKGROUND_TASK_NODE` to override the runtime
+command.
+
 ## Know what survives a session change
 
 `/reload` keeps live tasks for the same Pi session. The replacement extension

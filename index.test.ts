@@ -10,6 +10,7 @@ import type {
 
 import { BackgroundTaskManager } from "./core.ts";
 import type { TaskCompletion } from "./core.ts";
+import type { BackgroundTasksHerdrSurface } from "./herdr-dashboard.ts";
 import backgroundTasksExtension, {
   CompletionDeliveryLedger,
   completionMessage,
@@ -139,6 +140,7 @@ const createEventBus = function createEventBus(): TestEventBus {
 
 interface HarnessOptions {
   events?: TestEventBus;
+  herdrDashboard?: BackgroundTasksHerdrSurface;
   hasUI?: boolean;
   model?: { id: string; provider: string };
   notificationError?: Error;
@@ -188,7 +190,9 @@ const createHarness = function createHarness(options: HarnessOptions = {}) {
       sentMessages.push({ message, options: sendOptions });
     },
   } as unknown as ExtensionAPI;
-  backgroundTasksExtension(pi);
+  backgroundTasksExtension(pi, {
+    herdrDashboard: options.herdrDashboard,
+  });
 
   const ctx = {
     cwd: process.cwd(),
@@ -1163,6 +1167,57 @@ describe("background tasks extension", () => {
     await harness.emit("session_shutdown");
   });
 
+  test("moves active status out of the footer while Herdr is connected", async () => {
+    let connected = false;
+    let connectionListener: ((value: boolean) => void) | undefined;
+    let ensureCalls = 0;
+    let refreshCalls = 0;
+    const herdrDashboard: BackgroundTasksHerdrSurface = {
+      connected: () => connected,
+      dispose: async () => {},
+      ensureStarted: async () => {
+        ensureCalls += 1;
+        connected = true;
+        connectionListener?.(true);
+        return true;
+      },
+      focus: async () => connected,
+      onConnectionChange: (listener) => {
+        connectionListener = listener;
+        return () => {
+          connectionListener = undefined;
+        };
+      },
+      recordOutput: () => {},
+      refresh: () => {
+        refreshCalls += 1;
+      },
+    };
+    const harness = createHarness({ herdrDashboard });
+    await harness.emit("session_start");
+    const started = await harness.execute({
+      action: "start",
+      command: "sleep 30",
+      name: "Shown in Herdr",
+    });
+    await Promise.resolve();
+
+    expect(ensureCalls).toBe(1);
+    expect(refreshCalls).toBeGreaterThan(0);
+    expect(harness.statuses).toContain("bg: 1 running");
+    expect(harness.statuses.at(-1)).toBeUndefined();
+
+    connected = false;
+    connectionListener?.(false);
+    expect(harness.statuses.at(-1)).toBe("bg: 1 running");
+
+    await harness.execute({
+      action: "stop",
+      taskId: started.details.task?.id,
+    });
+    await harness.emit("session_shutdown");
+  });
+
   test("adopts live task state across a reload", async () => {
     const sessionId = `reload-${crypto.randomUUID()}`;
     const before = createHarness({ sessionId });
@@ -1575,6 +1630,37 @@ describe("background tasks extension", () => {
     await waitForCompletion();
 
     expect(harness.sentMessages).toHaveLength(0);
+  });
+
+  test("bounds stalled Herdr cleanup after task shutdown", async () => {
+    const never = new Promise<void>(() => {});
+    const herdrDashboard: BackgroundTasksHerdrSurface = {
+      connected: () => false,
+      dispose: async () => await never,
+      ensureStarted: async () => false,
+      focus: async () => false,
+      onConnectionChange: () => () => {},
+      recordOutput: () => {},
+      refresh: () => {},
+    };
+    const harness = createHarness({ herdrDashboard });
+    await harness.emit("session_start");
+    const started = await harness.execute({
+      action: "start",
+      command: "sleep 30",
+      name: "Shutdown before Herdr",
+    });
+    const pid = started.details.task?.pid;
+    expect(pid).toBeNumber();
+
+    await Promise.race([
+      harness.emit("session_shutdown"),
+      Bun.sleep(1200).then(() => {
+        throw new Error("Session shutdown did not bound Herdr cleanup");
+      }),
+    ]);
+    await waitForDeadProcessGroup(pid!);
+    expect(isProcessGroupAlive(pid!)).toBe(false);
   });
 
   test("clears UI and context when manager shutdown fails", async () => {
