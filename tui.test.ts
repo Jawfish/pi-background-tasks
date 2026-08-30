@@ -137,6 +137,41 @@ describe("background task dashboard", () => {
     }
   });
 
+  test("does not consume output when the terminal cannot show it", async () => {
+    const selected = task({ bytesWritten: 64 });
+    const readState = new TaskDashboardReadState();
+    let logCalls = 0;
+    const manager = {
+      list: () => [{ ...selected }],
+      logs: (): Promise<TaskLogs> => {
+        logCalls += 1;
+        return Promise.resolve({
+          bytesRead: 64,
+          output: "hidden output",
+          task: selected,
+          text: "unused",
+          totalBytes: 64,
+          truncated: false,
+        });
+      },
+      stop: () => ({ ...selected, status: "stopping" as const }),
+    };
+    const { tui } = createTui(14);
+    const component = new TaskDashboardComponent({
+      keybindings: new KeybindingsManager(TUI_KEYBINDINGS),
+      manager,
+      onClose() {},
+      readState,
+      theme,
+      tui,
+    });
+    components.push(component);
+    await Promise.resolve();
+
+    expect(logCalls).toBe(0);
+    expect(readState.cursor(selected.id)).toBe(0);
+  });
+
   test("shows quiet duration only for active tasks after the threshold", () => {
     const now = Date.now();
     const quiet = createDashboard({
@@ -284,23 +319,17 @@ describe("background task dashboard", () => {
     expect(rendered).not.toContain("Could not read log");
   });
 
-  test("preserves read cursors across reopen and releases pruned tasks", async () => {
+  test("preserves read markers across reopen and releases pruned tasks", async () => {
     const selected = task({ bytesWritten: 12 });
     const readState = new TaskDashboardReadState();
-    const requestedCursors: number[] = [];
+    const requestedTails: number[] = [];
     const manager = {
       list: () => [{ ...selected }],
-      logs: (
-        _id: string,
-        _requestedBytes?: number,
-        afterByte = 0
-      ): Promise<TaskLogs> => {
-        requestedCursors.push(afterByte);
+      logs: (): Promise<TaskLogs> => {
+        requestedTails.push(selected.bytesWritten);
         return Promise.resolve({
-          bytesRead: selected.bytesWritten - afterByte,
-          nextByte: selected.bytesWritten,
-          output: `bytes after ${String(afterByte)}`,
-          startByte: afterByte,
+          bytesRead: selected.bytesWritten,
+          output: `tail through ${String(selected.bytesWritten)}`,
           task: { ...selected },
           text: "unused",
           totalBytes: selected.bytesWritten,
@@ -320,14 +349,13 @@ describe("background task dashboard", () => {
         tui,
       });
       components.push(component);
-      component.handleInput("\r");
       return component;
     };
 
     const first = openDashboard();
     await Promise.resolve();
     await Promise.resolve();
-    expect(requestedCursors).toEqual([0]);
+    expect(requestedTails).toEqual([12]);
     expect(readState.cursor(selected.id)).toBe(12);
     first.dispose();
 
@@ -335,7 +363,7 @@ describe("background task dashboard", () => {
     const reopened = openDashboard();
     await Promise.resolve();
     await Promise.resolve();
-    expect(requestedCursors).toEqual([0, 12]);
+    expect(requestedTails).toEqual([12, 20]);
     expect(readState.cursor(selected.id)).toBe(20);
     reopened.dispose();
 
@@ -355,21 +383,15 @@ describe("background task dashboard", () => {
     const readState = new TaskDashboardReadState();
     readState.markRead(first.id, 4);
     readState.markRead(second.id, 5);
-    const requests: { afterByte: number; taskId: string }[] = [];
+    const requests: string[] = [];
     const manager = {
       list: () => source.map((item) => ({ ...item })),
-      logs: (
-        taskId: string,
-        _requestedBytes?: number,
-        afterByte = 0
-      ): Promise<TaskLogs> => {
+      logs: (taskId: string): Promise<TaskLogs> => {
         const selected = source.find((item) => item.id === taskId)!;
-        requests.push({ afterByte, taskId });
+        requests.push(taskId);
         return Promise.resolve({
-          bytesRead: selected.bytesWritten - afterByte,
-          nextByte: selected.bytesWritten,
+          bytesRead: selected.bytesWritten,
           output: `new ${taskId}`,
-          startByte: afterByte,
           task: { ...selected },
           text: "unused",
           totalBytes: selected.bytesWritten,
@@ -394,34 +416,84 @@ describe("background task dashboard", () => {
     expect(rendered).toContain("+8 B unread");
     expect(rendered).toContain("+15 B unread");
 
-    component.handleInput("\r");
     await Promise.resolve();
     await Promise.resolve();
     rendered = stripTerminalSequences(component.render(100).join("\n"));
-    expect(rendered).toContain("read through byte 12 of 12");
+    expect(rendered).toContain("Output tail · 12 B");
+    expect(rendered).toContain("new first001");
     expect(readState.cursor(first.id)).toBe(12);
     expect(readState.cursor(second.id)).toBe(5);
 
-    component.handleInput("\r");
     first.bytesWritten = 18;
     component.refresh();
     rendered = stripTerminalSequences(component.render(100).join("\n"));
     expect(rendered).toContain("+6 B unread");
 
-    component.handleInput("\r");
     await Promise.resolve();
     await Promise.resolve();
     component.handleInput("j");
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(requests).toEqual([
-      { afterByte: 4, taskId: first.id },
-      { afterByte: 12, taskId: first.id },
-      { afterByte: 5, taskId: second.id },
-    ]);
+    expect(requests).toEqual([first.id, first.id, second.id]);
     expect(readState.cursor(first.id)).toBe(18);
     expect(readState.cursor(second.id)).toBe(20);
+  });
+
+  test("keeps the newest long-line output and skips unchanged tail reads", async () => {
+    let output = `${"oldest-".repeat(30)}NEWEST-END`;
+    const selected = task({ bytesWritten: Buffer.byteLength(output) });
+    let logCalls = 0;
+    const manager = {
+      list: () => [{ ...selected }],
+      logs: (): Promise<TaskLogs> => {
+        logCalls += 1;
+        const captured = output;
+        return Promise.resolve({
+          bytesRead: Buffer.byteLength(captured),
+          output: captured,
+          task: { ...selected },
+          text: "unused",
+          totalBytes: Buffer.byteLength(captured),
+          truncated: false,
+        });
+      },
+      stop: () => ({ ...selected, status: "stopping" as const }),
+    };
+    const { tui } = createTui(30, 44);
+    const component = new TaskDashboardComponent({
+      keybindings: new KeybindingsManager(TUI_KEYBINDINGS),
+      manager,
+      onClose() {},
+      theme,
+      tui,
+    });
+    components.push(component);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    let rendered = stripTerminalSequences(component.render(44).join("\n"));
+    expect(rendered).toContain("NEWEST-END");
+    expect(rendered).not.toContain("oldest-".repeat(10));
+    expect(rendered).toContain("expand output");
+    expect(logCalls).toBe(1);
+
+    component.refresh();
+    await Promise.resolve();
+    expect(logCalls).toBe(1);
+
+    output = `${"next-".repeat(60)}FRESH-END`;
+    selected.bytesWritten = Buffer.byteLength(output);
+    component.refresh();
+    await Promise.resolve();
+    await Promise.resolve();
+    rendered = stripTerminalSequences(component.render(44).join("\n"));
+    expect(logCalls).toBe(2);
+    expect(rendered).toContain("FRESH-END");
+
+    component.handleInput("\r");
+    rendered = stripTerminalSequences(component.render(44).join("\n"));
+    expect(rendered).toContain("balanced view");
   });
 
   test("renders bounded active and historical watch state", () => {

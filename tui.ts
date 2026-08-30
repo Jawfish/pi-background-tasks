@@ -164,6 +164,49 @@ const cleanInline = function cleanInline(value: string): string {
   return cleanDisplay(value).replaceAll(/\s*\n\s*/gu, " ↵ ").trim();
 };
 
+const graphemeSegmenter = new Intl.Segmenter(undefined, {
+  granularity: "grapheme",
+});
+
+const compactPath = function compactPath(value: string): string {
+  const home = process.env.HOME;
+  if (home && (value === home || value.startsWith(`${home}/`))) {
+    return `~${value.slice(home.length)}`;
+  }
+  return value;
+};
+
+export const tailToWidth = function tailToWidth(
+  value: string,
+  width: number
+): string {
+  const text = cleanDisplay(value).replaceAll(/\s*\n\s*/gu, " ↵ ");
+  if (width <= 0) {
+    return "";
+  }
+  if (visibleWidth(text) <= width) {
+    return text;
+  }
+  if (width === 1) {
+    return "…";
+  }
+  const selected: string[] = [];
+  let selectedWidth = 0;
+  const graphemes = Array.from(
+    graphemeSegmenter.segment(text),
+    ({ segment }) => segment
+  );
+  for (const character of graphemes.reverse()) {
+    const characterWidth = visibleWidth(character);
+    if (selectedWidth + characterWidth > width - 1) {
+      break;
+    }
+    selected.push(character);
+    selectedWidth += characterWidth;
+  }
+  return `…${selected.reverse().join("")}`;
+};
+
 export const sanitizeUiInline = function sanitizeUiInline(
   value: string
 ): string {
@@ -725,7 +768,7 @@ export class TaskDashboardComponent implements Component {
   readonly #readState: TaskDashboardReadState;
   #tasks: TaskSnapshot[] = [];
   #selectedIndex = 0;
-  #showLogs = false;
+  #expandOutput = false;
   #logs: TaskLogs | undefined;
   #logsTaskId: string | undefined;
   #loadingLogs = false;
@@ -774,7 +817,7 @@ export class TaskDashboardComponent implements Component {
         0,
         Math.max(0, this.#tasks.length - 1)
       );
-      if (this.#showLogs) {
+      if (this.#tasks.length > 0 && this.#canShowOutput()) {
         void this.#loadLogs(forceLogs);
       }
       if (this.#flash && this.#flash.expiresAt <= Date.now()) {
@@ -790,6 +833,12 @@ export class TaskDashboardComponent implements Component {
       );
     }
     this.#tui.requestRender();
+  }
+
+  #canShowOutput(): boolean {
+    return (
+      Math.floor(Math.max(1, this.#tui.terminal.rows) * 0.9) >= 16
+    );
   }
 
   handleInput(data: string): void {
@@ -838,13 +887,7 @@ export class TaskDashboardComponent implements Component {
       matchesKey(data, "l")
     ) {
       if (this.#tasks.length > 0) {
-        this.#showLogs = !this.#showLogs;
-        this.#logRequestSequence += 1;
-        this.#logs = undefined;
-        this.#logsTaskId = undefined;
-        if (this.#showLogs) {
-          void this.#loadLogs(true);
-        }
+        this.#expandOutput = !this.#expandOutput;
         this.#tui.requestRender();
       }
       return;
@@ -864,20 +907,36 @@ export class TaskDashboardComponent implements Component {
       1,
       Math.floor(Math.max(1, this.#tui.terminal.rows) * 0.9)
     );
-    if (maxHeight < 13) {
+    if (maxHeight < 16) {
       return this.#renderCompact(width, maxHeight);
     }
 
-    const usableRows = maxHeight - 9;
-    const listRows = clamp(
-      Math.floor(usableRows * 0.5),
-      2,
-      Math.min(8, Math.max(2, this.#tasks.length))
+    const usableRows = maxHeight - 10;
+    const maximumListRows = Math.min(
+      7,
+      Math.max(2, this.#tasks.length)
     );
-    const detailRows = Math.max(
-      2,
-      Math.min(this.#showLogs ? 8 : 10, usableRows - listRows)
+    const listRows = this.#expandOutput
+      ? Math.min(2, maximumListRows)
+      : clamp(
+          Math.floor(usableRows * 0.32),
+          2,
+          maximumListRows
+        );
+    const remainingRows = Math.max(2, usableRows - listRows);
+    const selected = this.#tasks[this.#selectedIndex];
+    const desiredDetailRows = Math.min(
+      10,
+      4 + (selected?.watches?.length ?? 0)
     );
+    const detailRows = this.#expandOutput
+      ? Math.min(2, Math.max(1, remainingRows - 1))
+      : clamp(
+          Math.floor(remainingRows * 0.35),
+          2,
+          Math.min(desiredDetailRows, Math.max(2, remainingRows - 1))
+        );
+    const outputRows = Math.max(1, usableRows - listRows - detailRows);
     this.#lastListRows = listRows;
 
     const lines = [
@@ -889,6 +948,8 @@ export class TaskDashboardComponent implements Component {
       this.#horizontal(width, "middle"),
       this.#frame(width, this.#detailTitle()),
       ...this.#detailLines(width, detailRows),
+      this.#frame(width, this.#outputTitle()),
+      ...this.#logDetailLines(width, outputRows),
       this.#horizontal(width, "middle"),
       this.#frame(width, this.#footer()),
       this.#horizontal(width, "bottom"),
@@ -934,11 +995,9 @@ export class TaskDashboardComponent implements Component {
     if (width <= 1) {
       return this.#theme.fg("borderMuted", "-".slice(0, width));
     }
-    const left = "+";
-    const right = "+";
     return this.#theme.fg(
       position === "middle" ? "borderMuted" : "border",
-      `${left}${"-".repeat(Math.max(0, width - 2))}${right}`
+      `+${"-".repeat(Math.max(0, width - 2))}+`
     );
   }
 
@@ -960,7 +1019,7 @@ export class TaskDashboardComponent implements Component {
 
   #title(width: number): string {
     const left = ` ${this.#theme.fg("accent", this.#theme.bold("Background tasks"))}`;
-    const right = this.#theme.fg("dim", "auto-refresh 1s ");
+    const right = this.#theme.fg("dim", "live · 1s ");
     const innerWidth = Math.max(0, width - 2);
     if (visibleWidth(left) + visibleWidth(right) + 2 > innerWidth) {
       return left;
@@ -971,18 +1030,21 @@ export class TaskDashboardComponent implements Component {
   #summary(): string {
     const count = (status: TaskStatus) =>
       this.#tasks.filter((task) => task.status === status).length;
+    const statusCount = (status: TaskStatus, label: string): string => {
+      const presentation = STATUS_PRESENTATION[status];
+      return this.#theme.fg(
+        presentation.color,
+        `${presentation.symbol} ${String(count(status))} ${label}`
+      );
+    };
     const parts = [
-      `${STATUS_PRESENTATION.running.symbol} ${String(count("running"))} running`,
+      statusCount("running", "running"),
       count("stopping") > 0
-        ? `${STATUS_PRESENTATION.stopping.symbol} ${String(count("stopping"))} stopping`
+        ? statusCount("stopping", "stopping")
         : undefined,
-      `${STATUS_PRESENTATION.completed.symbol} ${String(count("completed"))} completed`,
-      count("failed") > 0
-        ? `${STATUS_PRESENTATION.failed.symbol} ${String(count("failed"))} failed`
-        : undefined,
-      count("stopped") > 0
-        ? `${STATUS_PRESENTATION.stopped.symbol} ${String(count("stopped"))} stopped`
-        : undefined,
+      statusCount("completed", "completed"),
+      count("failed") > 0 ? statusCount("failed", "failed") : undefined,
+      count("stopped") > 0 ? statusCount("stopped", "stopped") : undefined,
     ].filter((value): value is string => value !== undefined);
     const position =
       this.#tasks.length === 0
@@ -1064,22 +1126,7 @@ export class TaskDashboardComponent implements Component {
   #detailTitle(): string {
     const task = this.#tasks[this.#selectedIndex];
     if (!task) {
-      return ` ${this.#theme.fg("dim", "Task details")}`;
-    }
-    if (this.#showLogs) {
-      const committedBytes = Math.max(
-        task.bytesWritten,
-        this.#logsTaskId === task.id ? (this.#logs?.totalBytes ?? 0) : 0
-      );
-      const cursor = Math.min(
-        committedBytes,
-        this.#readState.cursor(task.id)
-      );
-      const unreadBytes = this.#readState.unreadBytes(task, committedBytes);
-      const range = ` · read through byte ${String(cursor)} of ${String(committedBytes)}`;
-      const unread =
-        unreadBytes > 0 ? ` · ${formatUiBytes(unreadBytes)} unread` : "";
-      return ` ${this.#theme.fg("accent", this.#theme.bold("Task log"))} · ${this.#theme.fg("text", cleanInline(task.name))}${this.#theme.fg("dim", `${range}${unread}`)}`;
+      return ` ${this.#theme.fg("dim", "Selected task")}`;
     }
     return ` ${styledStatus(task.status, this.#theme)} · ${this.#theme.fg("text", this.#theme.bold(cleanInline(task.name)))}`;
   }
@@ -1088,9 +1135,12 @@ export class TaskDashboardComponent implements Component {
     const task = this.#tasks[this.#selectedIndex];
     let details: string[];
     if (!task) {
-      details = [this.#theme.fg("dim", " Start a background task to inspect it here.")];
-    } else if (this.#showLogs) {
-      details = this.#logDetailLines(task, rows);
+      details = [
+        this.#theme.fg(
+          "dim",
+          " Start a background task to inspect it here."
+        ),
+      ];
     } else {
       const metadata = [
         `ID ${task.id}`,
@@ -1105,12 +1155,14 @@ export class TaskDashboardComponent implements Component {
         formatDashboardWatch(watch, this.#theme)
       );
       details = [
-        task.error ? ` ${this.#theme.fg("error", cleanInline(task.error))}` : undefined,
+        task.error
+          ? ` ${this.#theme.fg("error", cleanInline(task.error))}`
+          : undefined,
         ` ${this.#theme.fg("dim", "Command")}  ${cleanInline(task.command)}`,
         ` ${this.#theme.fg("dim", "Process")}  ${metadata.join(" · ")}`,
         ...watchDetails,
-        ` ${this.#theme.fg("dim", "Folder")}   ${cleanInline(task.cwd)}`,
-        ` ${this.#theme.fg("dim", "Log")}      ${cleanInline(task.logPath)}`,
+        ` ${this.#theme.fg("dim", "Folder")}   ${cleanInline(compactPath(task.cwd))}`,
+        ` ${this.#theme.fg("dim", "Log")}      ${cleanInline(compactPath(task.logPath))}`,
       ].filter((value): value is string => value !== undefined);
     }
 
@@ -1121,42 +1173,80 @@ export class TaskDashboardComponent implements Component {
     return visible.map((line) => this.#frame(width, line));
   }
 
-  #logDetailLines(task: TaskSnapshot, rows: number): string[] {
-    if (this.#loadingLogs && this.#logsTaskId !== task.id) {
-      return [` ${this.#theme.fg("warning", "◐ Loading log tail…")}`];
+  #outputTitle(): string {
+    const task = this.#tasks[this.#selectedIndex];
+    if (!task) {
+      return ` ${this.#theme.fg("dim", "Output tail")}`;
     }
-    if (!this.#logs || this.#logsTaskId !== task.id) {
-      return [` ${this.#theme.fg("dim", "No log preview loaded.")}`];
-    }
-    const output = cleanDisplay(this.#logs.output).split("\n");
-    const selected = output.slice(-rows);
-    if (output.length > selected.length && selected.length > 0) {
-      selected[0] = `… ${plural(output.length - selected.length + 1, "earlier line")} hidden`;
-    }
-    return selected.map(
-      (line) =>
-        ` ${this.#theme.fg("borderMuted", ">")} ${this.#theme.fg("toolOutput", line || " ")}`
+    const committedBytes = Math.max(
+      task.bytesWritten,
+      this.#logsTaskId === task.id ? (this.#logs?.totalBytes ?? 0) : 0
     );
+    const unreadBytes = this.#readState.unreadBytes(task, committedBytes);
+    const unread =
+      unreadBytes > 0 ? ` · ${formatUiBytes(unreadBytes)} unread` : "";
+    const loading = this.#loadingLogs ? " · loading" : "";
+    return ` ${this.#theme.fg("accent", this.#theme.bold("Output tail"))}${this.#theme.fg("dim", ` · ${formatUiBytes(committedBytes)}${unread}${loading}`)}`;
+  }
+
+  #logDetailLines(width: number, rows: number): string[] {
+    const task = this.#tasks[this.#selectedIndex];
+    let outputLines: string[];
+    if (!task) {
+      outputLines = [this.#theme.fg("dim", " No task selected.")];
+    } else if (
+      this.#loadingLogs &&
+      (!this.#logs || this.#logsTaskId !== task.id)
+    ) {
+      outputLines = [this.#theme.fg("warning", " ◐ Loading log tail…")];
+    } else if (!this.#logs || this.#logsTaskId !== task.id) {
+      outputLines = [this.#theme.fg("dim", " No output loaded.")];
+    } else {
+      const output = cleanDisplay(this.#logs.output).split("\n");
+      while (output.length > 1 && output.at(-1) === "") {
+        output.pop();
+      }
+      const hidden = Math.max(0, output.length - rows);
+      const selected =
+        hidden > 0 && rows > 1
+          ? [
+              `… ${plural(hidden + 1, "earlier line")} hidden`,
+              ...output.slice(-(rows - 1)),
+            ]
+          : output.slice(-rows);
+      const outputWidth = Math.max(1, width - 5);
+      outputLines = selected.map(
+        (line) =>
+          ` ${this.#theme.fg("borderMuted", ">")} ${this.#theme.fg("toolOutput", tailToWidth(line || " ", outputWidth))}`
+      );
+    }
+    while (outputLines.length < rows) {
+      outputLines.push("");
+    }
+    return outputLines.slice(0, rows).map((line) => this.#frame(width, line));
   }
 
   #footer(): string {
     if (this.#flash && this.#flash.expiresAt > Date.now()) {
       return ` ${this.#theme.fg(this.#flash.color, this.#flash.text)}`;
     }
-    const firstKey = (binding: Parameters<KeybindingsManager["getKeys"]>[0], fallback: string) =>
-      keyLabel(this.#keybindings.getKeys(binding)[0] ?? fallback);
+    const firstKey = (
+      binding: Parameters<KeybindingsManager["getKeys"]>[0],
+      fallback: string
+    ) => keyLabel(this.#keybindings.getKeys(binding)[0] ?? fallback);
     const up = firstKey("tui.select.up", "up");
     const down = firstKey("tui.select.down", "down");
     const confirm = firstKey("tui.select.confirm", "enter");
     const cancel = firstKey("tui.select.cancel", "escape");
-    const detailAction = this.#showLogs ? "details" : "logs";
-    return ` ${this.#theme.fg("dim", `${up}/${down} or j/k select · ${confirm} ${detailAction} · x stop · r refresh · ${cancel} close`)}`;
+    const outputAction = this.#expandOutput ? "balanced view" : "expand output";
+    return ` ${this.#theme.fg("dim", `${up}/${down} or j/k select · ${confirm} ${outputAction} · x stop · r refresh · ${cancel} close`)}`;
   }
 
   #moveSelection(delta: number): void {
     if (this.#tasks.length === 0) {
       return;
     }
+    const previousIndex = this.#selectedIndex;
     this.#selectedIndex = clamp(
       this.#selectedIndex + delta,
       0,
@@ -1164,11 +1254,13 @@ export class TaskDashboardComponent implements Component {
     );
     this.#confirmStopTaskId = undefined;
     this.#flash = undefined;
-    if (this.#showLogs) {
+    if (this.#selectedIndex !== previousIndex) {
       this.#logRequestSequence += 1;
       this.#logs = undefined;
       this.#logsTaskId = undefined;
-      void this.#loadLogs(true);
+      if (this.#canShowOutput()) {
+        void this.#loadLogs(true);
+      }
     }
     this.#tui.requestRender();
   }
@@ -1232,16 +1324,20 @@ export class TaskDashboardComponent implements Component {
       return;
     }
     const taskId = task.id;
+    if (
+      !force &&
+      this.#logsTaskId === taskId &&
+      this.#logs !== undefined &&
+      this.#logs.totalBytes >= task.bytesWritten
+    ) {
+      return;
+    }
     this.#logRequestSequence += 1;
     const requestSequence = this.#logRequestSequence;
     this.#activeLogRequests += 1;
     this.#loadingLogs = true;
     try {
-      const logs = await this.#manager.logs(
-        taskId,
-        16 * 1024,
-        this.#readState.cursor(taskId)
-      );
+      const logs = await this.#manager.logs(taskId, 16 * 1024);
       if (
         this.#disposed ||
         requestSequence !== this.#logRequestSequence ||
@@ -1251,7 +1347,7 @@ export class TaskDashboardComponent implements Component {
       }
       this.#logs = logs;
       this.#logsTaskId = taskId;
-      this.#readState.markRead(taskId, logs.nextByte ?? logs.totalBytes);
+      this.#readState.markRead(taskId, logs.totalBytes);
       const current = this.#tasks[this.#selectedIndex];
       if (current) {
         this.#tasks[this.#selectedIndex] = {

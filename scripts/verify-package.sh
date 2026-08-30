@@ -25,8 +25,6 @@ main() {
 		LICENSE
 		README.md
 		core.ts
-		herdr-dashboard-viewer.js
-		herdr-dashboard.ts
 		index.ts
 		package.json
 		service.ts
