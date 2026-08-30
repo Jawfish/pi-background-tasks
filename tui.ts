@@ -18,6 +18,7 @@ import {
 import type {
   BackgroundTaskManager,
   CompletionPolicy,
+  CreateTaskWatchInput,
   TaskLogs,
   TaskSnapshot,
   TaskStatus,
@@ -47,6 +48,7 @@ export interface BackgroundTaskToolParams {
   taskId?: string;
   timeoutSeconds?: number;
   wake?: boolean;
+  watch?: CreateTaskWatchInput;
   watchId?: string;
 }
 
@@ -148,6 +150,7 @@ const COLLAPSED_LOG_LINES = 8;
 const EXPANDED_LOG_LINES = 80;
 const EXPANDED_COMPLETION_OUTPUT_LINES = 12;
 const MAX_COMPLETION_OUTPUT_LINES = 48;
+const QUIET_DURATION_THRESHOLD_MS = 30_000;
 
 const cleanDisplay = function cleanDisplay(value: string): string {
   return stripTerminalSequences(value)
@@ -201,6 +204,20 @@ const taskDuration = function taskDuration(
   now = Date.now()
 ): string {
   return formatUiDuration((task.endedAt ?? now) - task.startedAt);
+};
+
+const taskQuietDuration = function taskQuietDuration(
+  task: TaskSnapshot,
+  now = Date.now()
+): string | undefined {
+  if (task.status !== "running" && task.status !== "stopping") {
+    return undefined;
+  }
+  const quietMilliseconds = now - (task.lastOutputAt ?? task.startedAt);
+  if (quietMilliseconds < QUIET_DURATION_THRESHOLD_MS) {
+    return undefined;
+  }
+  return `quiet ${formatUiDuration(quietMilliseconds)}`;
 };
 
 const styledStatus = function styledStatus(
@@ -280,6 +297,7 @@ const renderTaskRow = function renderTaskRow(
   options: { expanded: boolean; now?: number }
 ): string[] {
   const terminal = terminalSummary(task);
+  const quiet = taskQuietDuration(task, options.now);
   const completionPolicy = effectiveCompletionPolicy(task, "notify")!;
   const policy = theme.fg(
     completionPolicy === "wake" ? "accent" : "muted",
@@ -291,6 +309,7 @@ const renderTaskRow = function renderTaskRow(
     theme.fg("accent", task.id),
     theme.fg("text", cleanInline(task.name)),
     theme.fg("muted", taskDuration(task, options.now)),
+    quiet ? theme.fg("muted", quiet) : "",
     terminal ? theme.fg("muted", terminal) : "",
   ]
     .filter(Boolean)
@@ -338,6 +357,9 @@ export const renderBackgroundTaskCall = function renderBackgroundTaskCall(
       args.timeoutSeconds === undefined
         ? undefined
         : `timeout ${formatUiDuration(args.timeoutSeconds * 1000)}`,
+      args.watch === undefined
+        ? undefined
+        : `initial ${args.watch.condition} watch${args.watch.wake ? " + wake" : ""}`,
     ].filter((value): value is string => value !== undefined);
     if (options.length > 0) {
       text += theme.fg("dim", ` · ${options.join(" · ")}`);
@@ -1000,6 +1022,7 @@ export class TaskDashboardComponent implements Component {
           ? this.#theme.fg("accent", " ↻")
           : "";
       const terminal = terminalSummary(task);
+      const quiet = taskQuietDuration(task);
       const unreadBytes = this.#readState.unreadBytes(task);
       const unread =
         unreadBytes > 0
@@ -1022,6 +1045,7 @@ export class TaskDashboardComponent implements Component {
         this.#theme.fg("muted", taskDuration(task).padStart(6)),
         this.#theme.fg("accent", task.id),
         this.#theme.fg("text", cleanInline(task.name)),
+        quiet ? this.#theme.fg("muted", quiet) : "",
         terminal ? this.#theme.fg("muted", `(${terminal})`) : "",
         unread,
         watches,
@@ -1075,6 +1099,7 @@ export class TaskDashboardComponent implements Component {
         task.timeoutSeconds === undefined
           ? undefined
           : `timeout ${formatUiDuration(task.timeoutSeconds * 1000)}`,
+        taskQuietDuration(task),
       ].filter((value): value is string => value !== undefined);
       const watchDetails = (task.watches ?? []).map((watch) =>
         formatDashboardWatch(watch, this.#theme)

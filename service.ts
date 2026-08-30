@@ -13,11 +13,11 @@ import type {
  *
  * Compatibility rules for the `v1` contract:
  * - Channel names, the `version` value, and existing field meanings never
- *   change while `v1` is published.
+ *   change while `v1` is supported.
  * - New optional request fields, response fields, and lifecycle event types may
  *   be added, so consumers must ignore unknown event types.
- * - A breaking change ships as a new `v2` channel set, published alongside
- *   `v1` for at least one minor release before `v1` is removed.
+ * - A breaking change ships as a new `v2` channel set, exposed alongside
+ *   `v1` for a documented transition period before `v1` is removed.
  * - The service exposes immutable snapshots only. It never exposes child
  *   processes, file handles, write streams, or Pi-internal objects.
  */
@@ -50,6 +50,7 @@ export interface BackgroundTaskStartRequest {
   readonly cwd?: string;
   readonly name?: string;
   readonly timeoutSeconds?: number;
+  readonly watch?: BackgroundTaskWatchRequest;
 }
 
 export interface BackgroundTaskLogRequest {

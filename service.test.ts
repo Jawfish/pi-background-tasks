@@ -89,7 +89,10 @@ describe("background task service contract", () => {
       received.push(event);
     });
 
-    const started = await service.start({ command: "true" });
+    const started = await service.start({
+      command: "true",
+      watch: { condition: "exit" },
+    });
     const logs = await service.logs({ afterByte: 0, taskId: started.id });
     const watch = service.watch(started.id, { condition: "exit", wake: true });
 

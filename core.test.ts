@@ -6,6 +6,7 @@ import {
   readFile,
   readdir,
   rm,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -65,6 +66,17 @@ const pathExists = async function pathExists(
 ): Promise<boolean> {
   try {
     await access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const processGroupIsAlive = function processGroupIsAlive(
+  pid: number
+): boolean {
+  try {
+    process.kill(-pid, 0);
     return true;
   } catch {
     return false;
@@ -163,6 +175,23 @@ describe("BackgroundTaskManager", () => {
     expect(finished[0]?.id).toBe(started.id);
   });
 
+  test("creates private runtime directories and task logs", async () => {
+    const manager = new BackgroundTaskManager({ killGraceMs: 100 });
+    managers.push(manager);
+    const runtimeDir = await manager.initialize();
+    const runtimeMode = (await stat(runtimeDir)).mode & 0o777;
+
+    const started = await manager.start({
+      command: "true",
+      cwd: process.cwd(),
+    });
+    await waitForTerminal(manager, started.id);
+    const logMode = (await stat(started.logPath)).mode & 0o777;
+
+    expect(runtimeMode & 0o077).toBe(0);
+    expect(logMode & 0o077).toBe(0);
+  });
+
   test("reports only committed output and waits for write callbacks", async () => {
     const delayedCallbacks: (() => void)[] = [];
     let releaseWrites = false;
@@ -215,6 +244,53 @@ describe("BackgroundTaskManager", () => {
     expect(logs.totalBytes).toBe(11);
     expect(logs.output).toContain("first");
     expect(logs.output).toContain("second");
+  });
+
+  test("fails and cleans up after an asynchronous log write failure", async () => {
+    const manager = await createManager({
+      killGraceMs: 25,
+      writeLogChunk(_stream, _data, callback) {
+        queueMicrotask(() => {
+          const error = new Error(
+            "ENOSPC: no space left on device"
+          ) as NodeJS.ErrnoException;
+          error.code = "ENOSPC";
+          callback(error);
+        });
+        return true;
+      },
+    });
+    const started = await manager.start({
+      command: "trap '' TERM; printf output; while :; do sleep 1; done",
+      cwd: process.cwd(),
+    });
+    const terminal = await waitForTerminal(manager, started.id);
+
+    expect(terminal.status).toBe("failed");
+    expect(terminal.error).toContain("Log write failed: ENOSPC");
+    expect(terminal.bytesWritten).toBe(0);
+    expect(processGroupIsAlive(started.pid!)).toBe(false);
+  });
+
+  test("contains synchronous log writer failures", async () => {
+    const manager = await createManager({
+      killGraceMs: 25,
+      writeLogChunk() {
+        throw new Error("injected synchronous writer failure");
+      },
+    });
+    const started = await manager.start({
+      command: "printf output; sleep 30",
+      cwd: process.cwd(),
+    });
+    const terminal = await waitForTerminal(manager, started.id);
+
+    expect(terminal.status).toBe("failed");
+    expect(terminal.error).toContain(
+      "Log write failed: injected synchronous writer failure"
+    );
+    expect(terminal.bytesWritten).toBe(0);
+    expect(processGroupIsAlive(started.pid!)).toBe(false);
   });
 
   test("truncates names without splitting a Unicode character", async () => {
@@ -551,6 +627,84 @@ describe("BackgroundTaskManager", () => {
     expect(terminal.status).toBe("stopped");
     expect(terminal.error).toContain("Could not inspect the process group");
     expect(terminal.error).toContain("Could not confirm process-group cleanup");
+  });
+
+  test("registers an initial watch before immediate task output", async () => {
+    const fired = Promise.withResolvers<TaskWatchEvent>();
+    const startedEvents: TaskSnapshot[] = [];
+    const manager = await createManager({
+      onStarted: (task) => startedEvents.push(task),
+      onWatchFired: (event) => fired.resolve(event),
+    });
+    const started = await manager.start({
+      command: "printf ready; sleep 30",
+      cwd: process.cwd(),
+      watch: {
+        condition: "output",
+        pattern: "ready",
+        wake: true,
+      },
+    });
+    const initialWatch = started.watches?.[0];
+    const event = await Promise.race([
+      fired.promise,
+      sleep(2000).then(() => {
+        throw new Error("Initial output watch did not fire");
+      }),
+    ]);
+
+    expect(initialWatch).toMatchObject({
+      condition: "output",
+      pattern: "ready",
+      status: "active",
+      wake: true,
+    });
+    expect(startedEvents[0]?.watches?.[0]?.id).toBe(initialWatch?.id);
+    expect(event.watch).toMatchObject({
+      id: initialWatch?.id,
+      matchedOutput: "ready",
+      status: "fired",
+    });
+
+    manager.stop(started.id);
+    await waitForTerminal(manager, started.id);
+  });
+
+  test("rejects an invalid initial watch before spawning a task", async () => {
+    const manager = await createManager();
+    const runtimeDir = runtimeDirs.at(-1)!;
+
+    await expect(
+      manager.start({
+        command: "sleep 30",
+        cwd: process.cwd(),
+        watch: { condition: "output" },
+      })
+    ).rejects.toThrow("pattern is required");
+
+    expect(manager.list()).toEqual([]);
+    expect(await readdir(runtimeDir)).toEqual([]);
+  });
+
+  test("rejects an initial watch at zero capacity before spawning", async () => {
+    const startedEvents: TaskSnapshot[] = [];
+    const manager = await createManager({
+      maxWatchesPerTask: 0,
+      onStarted: (task) => startedEvents.push(task),
+    });
+    const runtimeDir = runtimeDirs.at(-1)!;
+
+    await expect(
+      manager.start({
+        command: "sleep 30",
+        cwd: process.cwd(),
+        watch: { condition: "exit" },
+      })
+    ).rejects.toThrow("At most 0 watches");
+
+    expect(manager.list()).toEqual([]);
+    expect(startedEvents).toEqual([]);
+    expect(await readdir(runtimeDir)).toEqual([]);
   });
 
   test("registers, inspects, and cancels bounded task watches", async () => {

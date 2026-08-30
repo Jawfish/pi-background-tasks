@@ -63,6 +63,12 @@ interface ToolParams {
   taskId?: string;
   timeoutSeconds?: number;
   wake?: boolean;
+  watch?: {
+    condition: "output" | "exit" | "inactivity";
+    inactivitySeconds?: number;
+    pattern?: string;
+    wake?: boolean;
+  };
   completionPolicy?: "silent" | "notify" | "wake";
   wakeOnExit?: boolean;
   watchId?: string;
@@ -450,10 +456,13 @@ describe("background tasks extension", () => {
       action: "start",
       command: "true",
       name: "Execution context",
+      watch: { condition: "exit" },
     });
     expect(started.content[0]?.text).toContain(
       "Execution: configured POSIX shell -c"
     );
+    expect(started.content[0]?.text).toContain("Initial watch: exit");
+    expect(started.details.task?.watches).toHaveLength(1);
     expect(started.content[0]?.text).toContain(`cwd: ${process.cwd()}`);
     await harness.emit("session_shutdown");
   });
@@ -1423,8 +1432,19 @@ describe("background tasks extension", () => {
     const started = await service!.start({
       command: "printf service-output; sleep 30",
       name: "Service task",
+      watch: {
+        condition: "output",
+        pattern: "service-output",
+      },
     });
     expect(started.cwd).toBe(process.cwd());
+    expect(started.watches).toEqual([
+      expect.objectContaining({
+        condition: "output",
+        pattern: "service-output",
+        status: "active",
+      }),
+    ]);
     expect(service!.list()).toHaveLength(1);
     expect(service!.status(started.id.slice(0, 4))[0]?.id).toBe(started.id);
 
@@ -1433,8 +1453,11 @@ describe("background tasks extension", () => {
     expect(logs.output).toContain("service-output");
     expect(logs.nextByte).toBeGreaterThan(0);
 
+    expect(service!.watchStatus(started.id)).toEqual([
+      expect.objectContaining({ condition: "output", status: "fired" }),
+    ]);
     const watch = service!.watch(started.id, { condition: "exit", wake: false });
-    expect(service!.watchStatus(started.id)).toHaveLength(1);
+    expect(service!.watchStatus(started.id)).toHaveLength(2);
     expect(service!.unwatch(watch.id).status).toBe("cancelled");
 
     expect(() => service!.watch(started.id, { condition: "output" })).toThrow(

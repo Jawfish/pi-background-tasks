@@ -137,6 +137,39 @@ describe("background task dashboard", () => {
     }
   });
 
+  test("shows quiet duration only for active tasks after the threshold", () => {
+    const now = Date.now();
+    const quiet = createDashboard({
+      tasks: [
+        task({
+          lastOutputAt: now - 90_500,
+          name: "Quiet worker",
+          startedAt: now - 180_000,
+        }),
+      ],
+    });
+    const quietText = stripTerminalSequences(
+      quiet.component.render(100).join("\n")
+    );
+    expect(quietText).toContain("quiet 1m 30s");
+
+    const completed = createDashboard({
+      tasks: [
+        task({
+          endedAt: now - 60_000,
+          lastOutputAt: now - 120_000,
+          name: "Completed worker",
+          startedAt: now - 180_000,
+          status: "completed",
+        }),
+      ],
+    });
+    const completedText = stripTerminalSequences(
+      completed.component.render(100).join("\n")
+    );
+    expect(completedText).not.toContain("quiet");
+  });
+
   test("requires a deliberate second stop keypress", () => {
     const dashboard = createDashboard({});
 
@@ -585,6 +618,11 @@ describe("background task transcript rendering", () => {
         name: "Test suite",
         timeoutSeconds: 120,
         completionPolicy: "wake",
+        watch: {
+          condition: "output",
+          pattern: "ready",
+          wake: true,
+        },
       },
       theme,
       { expanded: false }
@@ -622,9 +660,10 @@ describe("background task transcript rendering", () => {
       const lines = component.render(48);
       expect(lines.every((line) => visibleWidth(line) <= 48)).toBe(true);
     }
-    expect(stripTerminalSequences(call.render(80).join("\n"))).toContain(
-      "policy wake"
-    );
+    const callText = stripTerminalSequences(call.render(80).join("\n"));
+    const inlineCallText = callText.replaceAll(/\s+/gu, " ");
+    expect(inlineCallText).toContain("policy wake");
+    expect(inlineCallText).toContain("initial output watch + wake");
     expect(stripTerminalSequences(result.render(80).join("\n"))).toContain(
       "Running"
     );

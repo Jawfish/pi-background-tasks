@@ -179,6 +179,15 @@ const bytes = (value) => {
 const isActive = (task) =>
   task?.status === "running" || task?.status === "stopping";
 
+const quietDuration = (task) => {
+  if (!isActive(task)) return undefined;
+  const quietSince = Number(task.lastOutputAt ?? task.startedAt);
+  if (!Number.isFinite(quietSince) || Date.now() - quietSince < 30_000) {
+    return undefined;
+  }
+  return `quiet ${duration(quietSince)}`;
+};
+
 const statusMark = (status) => {
   if (status === "running") {
     const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -299,7 +308,8 @@ const render = () => {
             : task.signal
               ? ` · ${task.signal}`
               : "";
-        const text = `${active ? ">" : " "} ${task.status === "running" ? "●" : task.status === "stopping" ? "◐" : task.status === "completed" ? "✓" : task.status === "failed" ? "✕" : "■"} ${task.name} · ${duration(task.startedAt, task.endedAt)}${terminal}`;
+        const quiet = quietDuration(task);
+        const text = `${active ? ">" : " "} ${task.status === "running" ? "●" : task.status === "stopping" ? "◐" : task.status === "completed" ? "✓" : task.status === "failed" ? "✕" : "■"} ${task.name} · ${duration(task.startedAt, task.endedAt)}${quiet ? ` · ${quiet}` : ""}${terminal}`;
         const row = pad(text, inner);
         lines.push(
           ` ${index === selectedTaskIndex() ? color.selected(row) : styleStatus(task.status, row)}`
@@ -325,6 +335,7 @@ const render = () => {
           task.id,
           task.pid === undefined ? undefined : `PID ${task.pid}`,
           duration(task.startedAt, task.endedAt),
+          quietDuration(task),
           bytes(task.bytesWritten),
           task.completionPolicy,
           task.watchCount ? `${task.watchCount} watch${task.watchCount === 1 ? "" : "es"}` : undefined,

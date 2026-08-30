@@ -211,28 +211,14 @@ describe("background tasks through Pi lifecycles", () => {
             command: gatedOutputCommand(outputGate, "alpha😀omega"),
             completionPolicy: "silent",
             name: "Cursor and watch",
+            watch: {
+              condition: "output",
+              pattern: "😀ome",
+              wake: true,
+            },
           }),
           { stopReason: "toolUse" }
         ),
-        () => {
-          const task = harness
-            .getService()
-            .list()
-            .find(({ name }) => name === "Cursor and watch");
-          if (!task) {
-            throw new Error("The cursor task was not started");
-          }
-          return fauxAssistantMessage(
-            fauxToolCall("background_task", {
-              action: "watch",
-              condition: "output",
-              pattern: "😀ome",
-              taskId: task.id,
-              wake: true,
-            }),
-            { stopReason: "toolUse" }
-          );
-        },
         async () => {
           await writeFile(outputGate, "release");
           await waitFor(
@@ -245,7 +231,7 @@ describe("background tasks through Pi lifecycles", () => {
       ]);
 
       await harness.session.prompt("Start and watch the cursor task");
-      await waitForCalls(harness, 4);
+      await waitForCalls(harness, 3);
 
       const task = harness
         .getService()
@@ -257,7 +243,7 @@ describe("background tasks through Pi lifecycles", () => {
       expect(watches).toHaveLength(1);
       expect(watches[0]?.status).toBe("fired");
       expect(watches[0]?.matchedOutput).toBe("😀ome");
-      expect(contextContains(harness.modelContexts[3], WATCH_MARKER)).toBe(true);
+      expect(contextContains(harness.modelContexts[2], WATCH_MARKER)).toBe(true);
 
       harness.queueResponses([
         fauxAssistantMessage(
@@ -272,7 +258,7 @@ describe("background tasks through Pi lifecycles", () => {
         fauxAssistantMessage("The first log page was read"),
       ]);
       await harness.session.prompt("Read the first committed log page");
-      await waitForCalls(harness, 6);
+      await waitForCalls(harness, 5);
 
       const firstPage = backgroundToolResults(harness).find(
         (details) => details.output === "alpha😀"
@@ -299,7 +285,7 @@ describe("background tasks through Pi lifecycles", () => {
         fauxAssistantMessage("The second log page was read"),
       ]);
       await harness.session.prompt("Continue from the returned log cursor");
-      await waitForCalls(harness, 8);
+      await waitForCalls(harness, 7);
 
       const secondPage = backgroundToolResults(harness).find(
         (details) => details.output === "omega"

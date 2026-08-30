@@ -118,6 +118,37 @@ const resolveTaskCwd = async function resolveTaskCwd(
   return resolved;
 };
 
+const InitialWatchParameters = Type.Object(
+  {
+    condition: StringEnum(["output", "exit", "inactivity"] as const, {
+      description: "One-shot condition registered atomically during start",
+    }),
+    inactivitySeconds: Type.Optional(
+      Type.Integer({
+        description: "Quiet period for an initial inactivity watch",
+        maximum: 86_400,
+        minimum: 1,
+      })
+    ),
+    pattern: Type.Optional(
+      Type.String({
+        description: "Literal UTF-8 text for an initial output watch",
+        maxLength: MAX_WATCH_PATTERN_BYTES,
+        minLength: 1,
+      })
+    ),
+    wake: Type.Optional(
+      Type.Boolean({
+        description: "Wake the model when the initial watch fires",
+      })
+    ),
+  },
+  {
+    description:
+      "Optional one-shot watch for action=start. It is registered before task output can be observed.",
+  }
+);
+
 const Parameters = Type.Object({
   action: StringEnum(
     ["start", "status", "logs", "stop", "watch", "unwatch"] as const,
@@ -206,6 +237,7 @@ const Parameters = Type.Object({
       minimum: 1,
     })
   ),
+  watch: Type.Optional(InitialWatchParameters),
 });
 
 type BackgroundTaskParameters = Static<typeof Parameters>;
@@ -972,6 +1004,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
           environment: buildTaskEnvironment(ctx),
           name: input.name,
           timeoutSeconds: input.timeoutSeconds,
+          watch: input.watch,
         });
         requireCurrentService();
         return freezeServiceTask(task);
@@ -1118,7 +1151,9 @@ const backgroundTasksExtension = function backgroundTasksExtension(
             name: params.name,
             completionPolicy: params.completionPolicy,
             timeoutSeconds: params.timeoutSeconds,
+            watch: params.watch,
           });
+          const initialWatch = params.watch ? task.watches?.[0] : undefined;
           const continuation =
             task.completionPolicy === "wake"
               ? "Completion policy: wake. Do not poll or sleep to wait."
@@ -1131,8 +1166,13 @@ const backgroundTasksExtension = function backgroundTasksExtension(
                   `PID: ${String(task.pid ?? "unknown")}`,
                   `Log: ${task.logPath}`,
                   `Execution: configured POSIX shell -c; cwd: ${task.cwd}`,
+                  initialWatch
+                    ? `Initial watch: ${initialWatch.condition} (${initialWatch.id}); wake: ${String(initialWatch.wake)}.`
+                    : undefined,
                   continuation,
-                ].join("\n"),
+                ]
+                  .filter((line): line is string => line !== undefined)
+                  .join("\n"),
                 type: "text" as const,
               },
             ],
@@ -1255,7 +1295,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       "Set background_task completionPolicy=wake only when the agent must continue automatically after the task completes or fails. Use notify for a user alert without a model turn, or silent for no automatic message.",
       "Do not poll background_task status or logs merely to wait. Current active status is injected before every model call, and completionPolicy=wake steers completion into the next model call or starts a turn when idle.",
       "Use background_task logs only when task output is needed. Keep maxBytes modest to protect model context, and reuse a returned nextByte as afterByte for incremental reads.",
-      "Use one-shot watches for output, exit, or inactivity conditions instead of polling. Cancel an active watch with action=unwatch.",
+      "Use one-shot watches for output, exit, or inactivity conditions instead of polling. For readiness output that may appear immediately, pass one initial watch to action=start so registration is atomic. Cancel an active watch with action=unwatch.",
     ],
     promptSnippet:
       "Start, inspect, read, or stop session-scoped background shell tasks",

@@ -6,23 +6,34 @@ model when work finishes.
 
 ## Install the extension
 
-Install the package for your Pi user:
+Install the extension from Git for your Pi user:
 
 ```sh
-pi install npm:@jawfish/pi-background-tasks
+pi install git:github.com/Jawfish/pi-background-tasks
 ```
 
-Try it for one Pi run without changing your settings:
+Append `@<commit-or-tag>` to pin a revision. Try it for one Pi run without
+changing your settings:
 
 ```sh
-pi -e npm:@jawfish/pi-background-tasks
+pi -e git:github.com/Jawfish/pi-background-tasks
 ```
 
-Update or remove it with Pi's package commands:
+Update unpinned Git-installed extensions or remove this one with Pi's package
+commands:
 
 ```sh
-pi update npm:@jawfish/pi-background-tasks
-pi remove npm:@jawfish/pi-background-tasks
+pi update --extensions
+pi remove git:github.com/Jawfish/pi-background-tasks
+```
+
+A pinned revision remains fixed during updates. Install the same source with a
+new `@<commit-or-tag>` to move the pin.
+
+A local checkout can be installed by absolute or relative path:
+
+```sh
+pi install /absolute/path/to/pi-background-tasks
 ```
 
 The package requires Node.js 22 or later. It supports POSIX systems such as
@@ -49,6 +60,26 @@ Start a task with a name, working directory, timeout, and completion policy:
 A relative `cwd` starts from Pi's current working directory. The directory must
 exist when the task starts. `timeoutSeconds` must be an integer from 1 through
 86400.
+
+A start can atomically register one initial watch. Use this for readiness output
+that a fast process could emit before a later tool call can register a watch:
+
+```json
+{
+  "action": "start",
+  "command": "bun run dev",
+  "name": "Development server",
+  "completionPolicy": "silent",
+  "watch": {
+    "condition": "output",
+    "pattern": "Listening on",
+    "wake": true
+  }
+}
+```
+
+The initial watch uses the same output, exit, and inactivity conditions as the
+`watch` action. It is registered before task output can be observed.
 
 List all tasks or inspect one task:
 
@@ -97,8 +128,9 @@ keeps cursor reads and watches on the same byte sequence.
 Watches are one-shot conditions. Use them instead of polling `status` or
 `logs`. One task can have at most eight watches.
 
-An output watch matches literal UTF-8 text in committed output. It can match
-across output chunks. The pattern limit is 512 bytes.
+An output watch matches literal UTF-8 text committed after registration. It can
+match across output chunks. The pattern limit is 512 bytes. Use the nested
+`watch` field on `start` when readiness output could be emitted immediately.
 
 ```json
 {
@@ -188,13 +220,28 @@ export PI_BACKGROUND_TASK_SHELL=bash
 export PI_BACKGROUND_TASK_SHELL_ARGS='["--noprofile","--norc"]'
 ```
 
+The extension deliberately has no resource-priority subsystem. Put standard
+POSIX priority tools directly in the command when a background job should yield
+CPU time:
+
+```sh
+nice -n 10 bun test
+```
+
+On Linux, `ionice` can additionally request idle I/O priority:
+
+```sh
+nice -n 10 ionice -c 3 bun test
+```
+
 Put quote-heavy or multiline programs in a script file or a quoted heredoc.
 Do not use literal `\uXXXX` text as a replacement for shell quoting.
 
 ## Monitor tasks in the TUI
 
 Run `/background-tasks` to open the task monitor. It shows task state, elapsed
-time, process details, watches, and a bounded log tail.
+time, quiet duration after 30 seconds without output, process details, watches,
+and a bounded log tail.
 
 - Use the configured up and down keys, or `j` and `k`, to select a task.
 - Press Enter or `l` to switch between task details and its log tail.
@@ -272,8 +319,9 @@ pi.events.emit(BACKGROUND_TASK_DISCOVERY_CHANNEL, { onService: accept });
 ```
 
 The service supports start, list, status, logs, stop, watch, unwatch, and watch
-status. `subscribe` emits immutable `started`, `output-committed`,
-`watch-fired`, and `finished` events. It does not expose child processes, file
+status. A start request can include one optional initial `watch`. `subscribe`
+emits immutable `started`, `output-committed`, `watch-fired`, and `finished`
+events. It does not expose child processes, file
 handles, or Pi objects.
 
 Call returned unsubscribe functions during consumer shutdown. A service becomes
@@ -282,8 +330,8 @@ replacement instead of keeping a stale service.
 
 The `v1` channel names, version value, and current field meanings are stable.
 Consumers must ignore unknown optional fields and event types. A breaking
-change uses a new `v2` channel set. The package will publish `v1` and `v2`
-together for at least one minor release before it removes `v1`.
+change uses a new `v2` channel set. The service will expose `v1` and `v2`
+together for a documented transition period before it removes `v1`.
 
 ## Treat commands and output as untrusted
 
@@ -330,6 +378,6 @@ bun run test:integration
 bun run verify:package
 ```
 
-`verify:package` checks the exact npm archive file list, extracts the archive,
-and loads it through Pi in offline mode. CI runs these gates on Linux and
-macOS.
+`verify:package` checks the exact package archive file list, extracts the
+archive, and loads it through Pi in offline mode. CI runs these gates on Linux
+and macOS.
