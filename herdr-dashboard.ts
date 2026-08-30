@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import type { TaskOutputEvent, TaskSnapshot } from "./core.ts";
+import type { TaskLogs, TaskOutputEvent, TaskSnapshot } from "./core.ts";
 
 const execFileAsync = promisify(execFile);
 const MAX_INCOMING_FRAME = 64 * 1024;
@@ -17,6 +17,8 @@ const MAX_COMMAND = 4_000;
 const MAX_CWD = 1_000;
 const MAX_ERROR = 1_000;
 const MAX_OUTPUT_PREVIEW = 8_000;
+const MAX_OUTPUT_EVENTS_DURING_LOAD = 256;
+const OUTPUT_HYDRATION_QUIET_MS = 250;
 const UPDATE_DELAY_MS = 100;
 const REPORT_DELAY_MS = 250;
 const VIEWER_CONNECT_TIMEOUT_MS = 3_000;
@@ -24,6 +26,11 @@ const DEFAULT_SPLIT_RATIO = 0.62;
 
 interface DashboardTaskSource {
   list(): TaskSnapshot[];
+  logs?(
+    idOrPrefix: string,
+    requestedBytes?: number,
+    afterByte?: number
+  ): Promise<TaskLogs>;
   stop(idOrPrefix: string): TaskSnapshot;
 }
 
@@ -40,6 +47,29 @@ interface SocketWriteState {
   blocked: boolean;
   pendingMessages: string[];
   pendingSnapshot?: string;
+}
+
+interface OutputPreviewState {
+  endByte: number;
+  hydrateAfter?: number;
+  hydrated: boolean;
+  observedBytes: number;
+  startByte: number;
+  text: string;
+}
+
+interface PendingOutputEvent {
+  endByte: number;
+  preview: string;
+  previewTruncated: boolean;
+  startByte: number;
+}
+
+interface OutputEventsDuringLoad {
+  droppedThroughByte?: number;
+  events: PendingOutputEvent[];
+  observedBytes: number;
+  previewCharacters: number;
 }
 
 export interface BackgroundTasksHerdrDashboardDependencies {
@@ -97,6 +127,149 @@ const taskDetails = (task: TaskSnapshot, output?: string) => ({
   output: shortText(output, MAX_OUTPUT_PREVIEW),
   timeoutSeconds: task.timeoutSeconds,
 });
+
+const boundOutputPreview = (text: string): string =>
+  text.length <= MAX_OUTPUT_PREVIEW
+    ? text
+    : `…${text.slice(-(MAX_OUTPUT_PREVIEW - 1))}`;
+
+const appendOutputEvent = (
+  previous: OutputPreviewState | undefined,
+  event: TaskOutputEvent
+): OutputPreviewState => {
+  if (previous && event.nextByte <= previous.endByte) {
+    return {
+      ...previous,
+      observedBytes: Math.max(
+        previous.observedBytes,
+        event.task.bytesWritten
+      ),
+    };
+  }
+  const separator =
+    previous && event.startByte !== previous.endByte ? "…" : "";
+  const hydrated =
+    (previous?.hydrated ?? false) &&
+    !event.previewTruncated &&
+    event.startByte === previous?.endByte;
+  const deferHydration =
+    !hydrated &&
+    (previous?.hydrated === true || previous?.hydrateAfter !== undefined);
+  return {
+    endByte: event.nextByte,
+    ...(deferHydration
+      ? { hydrateAfter: Date.now() + OUTPUT_HYDRATION_QUIET_MS }
+      : {}),
+    hydrated,
+    observedBytes: Math.max(event.nextByte, event.task.bytesWritten),
+    startByte: previous?.startByte ?? event.startByte,
+    text: boundOutputPreview(
+      `${previous?.text ?? ""}${separator}${event.preview}${event.previewTruncated ? "…" : ""}`
+    ),
+  };
+};
+
+const accumulateOutputEvent = (
+  previous: OutputEventsDuringLoad | undefined,
+  event: TaskOutputEvent
+): OutputEventsDuringLoad => {
+  const next: PendingOutputEvent = {
+    endByte: event.nextByte,
+    preview: event.preview,
+    previewTruncated: event.previewTruncated,
+    startByte: event.startByte,
+  };
+  const events = [...(previous?.events ?? []), next];
+  let droppedThroughByte = previous?.droppedThroughByte;
+  let previewCharacters =
+    (previous?.previewCharacters ?? 0) + event.preview.length;
+  while (
+    events.length > 1 &&
+    (events.length > MAX_OUTPUT_EVENTS_DURING_LOAD ||
+      previewCharacters > MAX_OUTPUT_PREVIEW)
+  ) {
+    const dropped = events.shift()!;
+    droppedThroughByte = Math.max(
+      droppedThroughByte ?? 0,
+      dropped.endByte
+    );
+    previewCharacters -= dropped.preview.length;
+  }
+  return {
+    ...(droppedThroughByte === undefined ? {} : { droppedThroughByte }),
+    events,
+    observedBytes: Math.max(
+      previous?.observedBytes ?? 0,
+      event.nextByte,
+      event.task.bytesWritten
+    ),
+    previewCharacters,
+  };
+};
+
+const isUtf8ContinuationByte = (value: number): boolean =>
+  (value & 0xc0) === 0x80;
+
+const mergePendingOutputEvents = (
+  hydrated: OutputPreviewState,
+  pending: OutputEventsDuringLoad
+): OutputPreviewState => {
+  let cursor = hydrated.endByte;
+  let incomplete = false;
+  let text = hydrated.text;
+  if (
+    pending.droppedThroughByte !== undefined &&
+    pending.droppedThroughByte > cursor
+  ) {
+    incomplete = true;
+    text += "\n…\n";
+    cursor = pending.droppedThroughByte;
+  }
+  for (const event of pending.events) {
+    if (event.endByte <= cursor) {
+      continue;
+    }
+    if (event.startByte > cursor) {
+      incomplete = true;
+      text += "\n…\n";
+      cursor = event.startByte;
+    }
+    const preview = Buffer.from(event.preview, "utf8");
+    const previewEndByte = event.startByte + preview.length;
+    if (previewEndByte > cursor) {
+      const requestedOffset = Math.max(0, cursor - event.startByte);
+      let offset = requestedOffset;
+      while (
+        offset < preview.length &&
+        isUtf8ContinuationByte(preview[offset]!)
+      ) {
+        offset += 1;
+      }
+      if (offset !== requestedOffset) {
+        incomplete = true;
+      }
+      text += preview.subarray(offset).toString("utf8");
+    }
+    if (event.previewTruncated || event.endByte > previewEndByte) {
+      incomplete = true;
+      text += "…";
+    }
+    cursor = event.endByte;
+  }
+  return {
+    endByte: cursor,
+    ...(incomplete
+      ? { hydrateAfter: Date.now() + OUTPUT_HYDRATION_QUIET_MS }
+      : {}),
+    hydrated: !incomplete,
+    observedBytes: Math.max(
+      hydrated.observedBytes,
+      pending.observedBytes
+    ),
+    startByte: hydrated.startByte,
+    text: boundOutputPreview(text),
+  };
+};
 
 const defaultViewerPath = fileURLToPath(
   new URL("./herdr-dashboard-viewer.js", import.meta.url)
@@ -156,7 +329,16 @@ export class BackgroundTasksHerdrDashboard
   readonly #connectionListeners = new Set<(connected: boolean) => void>();
   readonly #connectTimeoutMs: number;
   readonly #exec: (args: string[]) => Promise<string>;
-  readonly #outputPreviews = new Map<string, string>();
+  readonly #outputEventsDuringLoad = new Map<
+    string,
+    OutputEventsDuringLoad
+  >();
+  readonly #outputHydrationTimers = new Map<
+    string,
+    ReturnType<typeof setTimeout>
+  >();
+  readonly #outputLoads = new Map<string, Promise<void>>();
+  readonly #outputPreviews = new Map<string, OutputPreviewState>();
   readonly #runtimePath?: () => string;
   readonly #sockets = new Set<net.Socket>();
   readonly #source: DashboardTaskSource;
@@ -252,21 +434,168 @@ export class BackgroundTasksHerdrDashboard
     if (!this.connected() && !this.#starting) {
       return;
     }
-    const previous = this.#outputPreviews.get(event.task.id) ?? "";
-    const marker = event.previewTruncated ? "…" : "";
-    const combined = `${previous}${event.preview}${marker}`;
+    const previous = this.#outputPreviews.get(event.task.id);
+    if (this.#outputLoads.has(event.task.id) || !previous?.hydrated) {
+      this.#outputEventsDuringLoad.set(
+        event.task.id,
+        accumulateOutputEvent(
+          this.#outputEventsDuringLoad.get(event.task.id),
+          event
+        )
+      );
+      if (!this.#outputLoads.has(event.task.id)) {
+        this.#outputPreviews.set(
+          event.task.id,
+          appendOutputEvent(previous, event)
+        );
+        this.#scheduleSnapshot();
+      }
+      return;
+    }
+    if (event.startByte < previous.endByte) {
+      if (event.nextByte > previous.endByte) {
+        this.#outputEventsDuringLoad.set(
+          event.task.id,
+          accumulateOutputEvent(undefined, event)
+        );
+        this.#loadOutputPreview(event.task);
+      }
+      return;
+    }
     this.#outputPreviews.set(
       event.task.id,
-      combined.length <= MAX_OUTPUT_PREVIEW
-        ? combined
-        : combined.slice(-MAX_OUTPUT_PREVIEW)
+      appendOutputEvent(previous, event)
     );
     this.#scheduleSnapshot();
+  }
+
+  #loadOutputPreview(task: TaskSnapshot): void {
+    if (
+      this.#disposed ||
+      !this.#source.logs ||
+      task.bytesWritten <= 0 ||
+      this.#outputLoads.has(task.id)
+    ) {
+      return;
+    }
+    this.#clearOutputHydrationTimer(task.id);
+    const generation = this.#generation;
+    let load: Promise<void>;
+    load = this.#source
+      .logs(task.id, MAX_OUTPUT_PREVIEW)
+      .then((logs) => {
+        if (
+          !this.#current(generation) ||
+          this.#outputLoads.get(task.id) !== load
+        ) {
+          return;
+        }
+        const pending = this.#outputEventsDuringLoad.get(task.id);
+        this.#outputEventsDuringLoad.delete(task.id);
+        const previous = this.#outputPreviews.get(task.id);
+        const observedBytes = Math.max(
+          task.bytesWritten,
+          previous?.observedBytes ?? 0
+        );
+        let hydrated: OutputPreviewState;
+        if (
+          previous?.hydrated &&
+          logs.totalBytes < previous.endByte
+        ) {
+          hydrated = {
+            ...previous,
+            observedBytes,
+          };
+        } else {
+          const unavailable =
+            logs.totalBytes < task.bytesWritten
+              ? "\n… newer output unavailable."
+              : "";
+          hydrated = {
+            endByte: logs.totalBytes,
+            hydrated: true,
+            observedBytes,
+            startByte: Math.max(0, logs.totalBytes - logs.bytesRead),
+            text: boundOutputPreview(`${logs.output}${unavailable}`),
+          };
+        }
+        this.#outputPreviews.set(
+          task.id,
+          pending
+            ? mergePendingOutputEvents(hydrated, pending)
+            : hydrated
+        );
+      })
+      .catch(() => {
+        // Output may be pruned between the task snapshot and this bounded read.
+        if (
+          !this.#current(generation) ||
+          this.#outputLoads.get(task.id) !== load
+        ) {
+          return;
+        }
+        const pending = this.#outputEventsDuringLoad.get(task.id);
+        this.#outputEventsDuringLoad.delete(task.id);
+        const previous = this.#outputPreviews.get(task.id);
+        const pendingStartByte =
+          pending?.events[0]?.startByte ?? task.bytesWritten;
+        const unavailable: OutputPreviewState = previous?.hydrated
+          ? {
+              ...previous,
+              observedBytes: Math.max(
+                previous.observedBytes,
+                task.bytesWritten
+              ),
+              text: boundOutputPreview(
+                `${previous.text}\n… output preview unavailable.`
+              ),
+            }
+          : {
+              endByte: Math.min(task.bytesWritten, pendingStartByte),
+              hydrated: true,
+              observedBytes: task.bytesWritten,
+              startByte: 0,
+              text: "Output preview unavailable.\n",
+            };
+        this.#outputPreviews.set(
+          task.id,
+          pending
+            ? mergePendingOutputEvents(unavailable, pending)
+            : unavailable
+        );
+      })
+      .finally(() => {
+        if (this.#outputLoads.get(task.id) === load) {
+          this.#outputLoads.delete(task.id);
+          this.#scheduleSnapshot();
+        }
+      });
+    this.#outputLoads.set(task.id, load);
   }
 
   refresh(): void {
     this.#scheduleSnapshot();
     this.#scheduleAgentReport();
+  }
+
+  #clearOutputHydrationTimer(taskId: string): void {
+    const timer = this.#outputHydrationTimers.get(taskId);
+    if (timer) {
+      clearTimeout(timer);
+      this.#outputHydrationTimers.delete(taskId);
+    }
+  }
+
+  #scheduleOutputHydration(taskId: string, deadline: number): void {
+    this.#clearOutputHydrationTimer(taskId);
+    const timer = setTimeout(() => {
+      if (this.#outputHydrationTimers.get(taskId) === timer) {
+        this.#outputHydrationTimers.delete(taskId);
+        this.#scheduleSnapshot();
+      }
+    }, Math.max(0, deadline - Date.now()));
+    timer.unref?.();
+    this.#outputHydrationTimers.set(taskId, timer);
   }
 
   #scheduleSnapshot(): void {
@@ -669,9 +998,44 @@ export class BackgroundTasksHerdrDashboard
         this.#outputPreviews.delete(taskId);
       }
     }
+    for (const taskId of this.#outputEventsDuringLoad.keys()) {
+      if (!retained.has(taskId)) {
+        this.#outputEventsDuringLoad.delete(taskId);
+      }
+    }
+    for (const taskId of this.#outputLoads.keys()) {
+      if (!retained.has(taskId)) {
+        this.#outputLoads.delete(taskId);
+      }
+    }
+    for (const taskId of this.#outputHydrationTimers.keys()) {
+      if (!retained.has(taskId)) {
+        this.#clearOutputHydrationTimer(taskId);
+      }
+    }
     const selected =
       tasks.find((task) => task.id === client.selection.taskId) ?? tasks[0];
     client.selection = { taskId: selected?.id };
+    if (selected) {
+      const preview = this.#outputPreviews.get(selected.id);
+      if (!preview) {
+        this.#loadOutputPreview(selected);
+      } else if (
+        !preview.hydrated ||
+        preview.observedBytes < selected.bytesWritten
+      ) {
+        const hydrateAfter = preview.hydrateAfter;
+        if (
+          isActive(selected) &&
+          hydrateAfter !== undefined &&
+          hydrateAfter > Date.now()
+        ) {
+          this.#scheduleOutputHydration(selected.id, hydrateAfter);
+        } else {
+          this.#loadOutputPreview(selected);
+        }
+      }
+    }
     this.#send(
       client.socket,
       {
@@ -680,7 +1044,10 @@ export class BackgroundTasksHerdrDashboard
         paneId: this.#paneId,
         parentPaneId: process.env.HERDR_PANE_ID,
         selected: selected
-          ? taskDetails(selected, this.#outputPreviews.get(selected.id))
+          ? taskDetails(
+              selected,
+              this.#outputPreviews.get(selected.id)?.text
+            )
           : undefined,
         selectedTaskId: selected?.id,
         tasks: tasks.map(taskSummary),
@@ -901,6 +1268,12 @@ export class BackgroundTasksHerdrDashboard
       }
       this.#clients.clear();
       this.#sockets.clear();
+      for (const timer of this.#outputHydrationTimers.values()) {
+        clearTimeout(timer);
+      }
+      this.#outputHydrationTimers.clear();
+      this.#outputEventsDuringLoad.clear();
+      this.#outputLoads.clear();
       this.#outputPreviews.clear();
       if (wasConnected) {
         this.#publishConnection(false);

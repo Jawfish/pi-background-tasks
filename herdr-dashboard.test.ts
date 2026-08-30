@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import type { TaskSnapshot } from "./core.ts";
+import type { TaskLogs, TaskSnapshot } from "./core.ts";
 import {
   BackgroundTasksHerdrDashboard,
   isHerdrDashboardAvailable,
@@ -91,7 +91,9 @@ describe("Herdr background task dashboard", () => {
     const connectionStates: boolean[] = [];
     let client: net.Socket | undefined;
     let clientBuffer = "";
+    let logCalls = 0;
     let stopCalls = 0;
+    const logResult = Promise.withResolvers<TaskLogs>();
     const tasks = [
       task(),
       task({
@@ -102,9 +104,29 @@ describe("Herdr background task dashboard", () => {
         status: "completed",
       }),
     ];
+    const taskBeforeLiveOutput = { ...tasks[0]! };
     const dashboard = new BackgroundTasksHerdrDashboard(
       {
         list: () => tasks.map((item) => ({ ...item })),
+        logs: async (id) => {
+          logCalls += 1;
+          const selected = tasks.find((item) => item.id === id);
+          if (!selected) {
+            throw new Error("missing task");
+          }
+          if (logCalls === 1) {
+            return logResult.promise;
+          }
+          const totalBytes = logCalls === 2 ? selected.bytesWritten : 400;
+          return {
+            bytesRead: totalBytes,
+            output: "latest hydrated tail",
+            task: { ...selected },
+            text: "unused",
+            totalBytes,
+            truncated: false,
+          };
+        },
         stop: (id) => {
           stopCalls += 1;
           const selected = tasks.find((item) => item.id === id);
@@ -122,6 +144,14 @@ describe("Herdr background task dashboard", () => {
             return JSON.stringify({ result: { pane: { pane_id: "w1:p2" } } });
           }
           if (args[0] === "pane" && args[1] === "run") {
+            tasks[0]!.bytesWritten = 24;
+            dashboard.recordOutput({
+              nextByte: 24,
+              preview: "live output\n",
+              previewTruncated: false,
+              startByte: 12,
+              task: { ...tasks[0]! },
+            });
             client = net.createConnection(socketPath);
             client.setEncoding("utf8");
             client.on("data", (chunk: string) => {
@@ -162,6 +192,57 @@ describe("Herdr background task dashboard", () => {
     expect(firstSnapshot.selectedTaskId).toBe("abc12345");
     expect(firstSnapshot.tasks).toHaveLength(2);
     expect(connectionStates).toEqual([true]);
+    await waitFor(() => logCalls === 1);
+    for (let byte = 24; byte < 64; byte += 1) {
+      tasks[0]!.bytesWritten = byte + 1;
+      dashboard.recordOutput({
+        nextByte: byte + 1,
+        preview: "x",
+        previewTruncated: false,
+        startByte: byte,
+        task: { ...tasks[0]! },
+      });
+    }
+    tasks[0]!.bytesWritten = 300;
+    dashboard.recordOutput({
+      nextByte: 300,
+      preview: "�".repeat(100),
+      previewTruncated: true,
+      startByte: 64,
+      task: { ...tasks[0]! },
+    });
+    logResult.resolve({
+      bytesRead: 30,
+      output: `output captured before viewer startuplive output\n${"x".repeat(6)}`,
+      task: { ...taskBeforeLiveOutput, bytesWritten: 30 },
+      text: "unused",
+      totalBytes: 30,
+      truncated: false,
+    });
+    await waitFor(() =>
+      messages.some(
+        (message) =>
+          message.type === "snapshot" &&
+          (message.selected as { output?: string } | undefined)?.output ===
+            `output captured before viewer startuplive output\n${"x".repeat(40)}${"�".repeat(100)}…`
+      )
+    );
+    await Bun.sleep(150);
+    expect(logCalls).toBe(1);
+    await waitFor(() =>
+      messages.some(
+        (message) =>
+          message.type === "snapshot" &&
+          (message.selected as { output?: string } | undefined)?.output ===
+            "latest hydrated tail"
+      )
+    );
+    expect(logCalls).toBe(2);
+    tasks[0]!.bytesWritten = 410;
+    dashboard.refresh();
+    await waitFor(() => logCalls === 3);
+    await Bun.sleep(250);
+    expect(logCalls).toBe(3);
     expect(
       calls.some(
         (args) =>
@@ -180,22 +261,6 @@ describe("Herdr background task dashboard", () => {
           args.join(" ").includes("background-viewer.js")
       )
     ).toBe(true);
-
-    dashboard.recordOutput({
-      nextByte: 24,
-      preview: "live output",
-      previewTruncated: false,
-      startByte: 12,
-      task: tasks[0]!,
-    });
-    await waitFor(() =>
-      messages.some(
-        (message) =>
-          message.type === "snapshot" &&
-          (message.selected as { output?: string } | undefined)?.output ===
-            "live output"
-      )
-    );
 
     client!.write(
       `${JSON.stringify({ action: "stop-task", id: "stop-1", taskId: "abc12345", type: "action" })}\n`
@@ -239,13 +304,31 @@ describe("Herdr background task dashboard", () => {
     const socketPath = `${directory}/dashboard.sock`;
     const calls: string[][] = [];
     const clients: net.Socket[] = [];
+    const messages: Array<Record<string, unknown>> = [];
     const listBlocked = Promise.withResolvers<void>();
     const releaseList = Promise.withResolvers<void>();
+    const staleLog = Promise.withResolvers<TaskLogs>();
     let blockLists = false;
+    let logCalls = 0;
     let splitCount = 0;
     const dashboard = new BackgroundTasksHerdrDashboard(
       {
         list: () => [task()],
+        logs: async () => {
+          logCalls += 1;
+          if (logCalls === 1) {
+            return staleLog.promise;
+          }
+          const selected = task();
+          return {
+            bytesRead: selected.bytesWritten,
+            output: "replacement output",
+            task: selected,
+            text: "unused",
+            totalBytes: selected.bytesWritten,
+            truncated: false,
+          };
+        },
         stop: () => task({ status: "stopping" }),
       },
       {
@@ -260,6 +343,22 @@ describe("Herdr background task dashboard", () => {
           if (args[0] === "pane" && args[1] === "run") {
             const client = net.createConnection(socketPath);
             clients.push(client);
+            client.setEncoding("utf8");
+            let buffer = "";
+            client.on("data", (chunk: string) => {
+              buffer += chunk;
+              for (;;) {
+                const newline = buffer.indexOf("\n");
+                if (newline < 0) {
+                  break;
+                }
+                const line = buffer.slice(0, newline);
+                buffer = buffer.slice(newline + 1);
+                if (line.trim()) {
+                  messages.push(JSON.parse(line) as Record<string, unknown>);
+                }
+              }
+            });
             await new Promise<void>((resolve) => client.once("connect", resolve));
             client.write(`${JSON.stringify({ type: "hello", version: 1 })}\n`);
           }
@@ -275,6 +374,7 @@ describe("Herdr background task dashboard", () => {
     );
 
     expect(await dashboard.ensureStarted(context(directory))).toBe(true);
+    await waitFor(() => logCalls === 1);
     blockLists = true;
     clients[0]!.destroy();
     await listBlocked.promise;
@@ -286,6 +386,33 @@ describe("Herdr background task dashboard", () => {
     expect(await replacement).toBe(true);
     expect(splitCount).toBe(2);
     expect(dashboard.connected()).toBe(true);
+    await waitFor(() =>
+      messages.some(
+        (message) =>
+          message.type === "snapshot" &&
+          (message.selected as { output?: string } | undefined)?.output ===
+            "replacement output"
+      )
+    );
+    expect(logCalls).toBe(2);
+    const staleTask = task();
+    staleLog.resolve({
+      bytesRead: staleTask.bytesWritten,
+      output: "stale output",
+      task: staleTask,
+      text: "unused",
+      totalBytes: staleTask.bytesWritten,
+      truncated: false,
+    });
+    await Bun.sleep(250);
+    expect(
+      messages.some(
+        (message) =>
+          message.type === "snapshot" &&
+          (message.selected as { output?: string } | undefined)?.output ===
+            "stale output"
+      )
+    ).toBe(false);
 
     await dashboard.dispose();
     expect(

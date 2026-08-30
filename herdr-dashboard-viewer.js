@@ -14,10 +14,10 @@ const STOP_CONFIRM_MS = 3500;
 const ESC = "\x1b[";
 const color = {
   accent: (text) => `${ESC}36m${text}${ESC}0m`,
+  bold: (text) => `${ESC}1m${text}${ESC}0m`,
   dim: (text) => `${ESC}2m${text}${ESC}0m`,
   error: (text) => `${ESC}31m${text}${ESC}0m`,
   muted: (text) => `${ESC}90m${text}${ESC}0m`,
-  selected: (text) => `${ESC}7m${text}${ESC}0m`,
   success: (text) => `${ESC}32m${text}${ESC}0m`,
   warning: (text) => `${ESC}33m${text}${ESC}0m`,
 };
@@ -126,6 +126,24 @@ const plainTruncate = (value, width) => {
   return `${result}…`;
 };
 
+const plainTail = (value, width) => {
+  const text = clean(value).replaceAll(/\s*\n\s*/gu, " ↵ ");
+  if (width <= 0) return "";
+  if (cellWidth(text) <= width) return text;
+  if (width === 1) return "…";
+  let result = "";
+  let resultWidth = 0;
+  const parts = graphemes(text);
+  for (let index = parts.length - 1; index >= 0; index -= 1) {
+    const part = parts[index];
+    const partWidth = graphemeWidth(part);
+    if (resultWidth + partWidth > width - 1) break;
+    result = `${part}${result}`;
+    resultWidth += partWidth;
+  }
+  return `…${result}`;
+};
+
 const pad = (value, width) => {
   const text = plainTruncate(value, width);
   return `${text}${" ".repeat(Math.max(0, width - cellWidth(text)))}`;
@@ -157,17 +175,21 @@ const wrap = (value, width) => {
   return lines;
 };
 
-const duration = (startedAt, endedAt) => {
-  if (!startedAt) return "";
-  const seconds = Math.max(
-    0,
-    Math.floor(((endedAt ?? Date.now()) - startedAt) / 1000)
-  );
+const formatDuration = (milliseconds) => {
+  const seconds = Math.max(0, Math.floor(milliseconds / 1000));
   if (seconds < 60) return `${seconds}s`;
   const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
-  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+  if (minutes < 60) {
+    const remainingSeconds = seconds % 60;
+    return remainingSeconds ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
 };
+
+const duration = (startedAt, endedAt) =>
+  startedAt ? formatDuration((endedAt ?? Date.now()) - startedAt) : "";
 
 const bytes = (value) => {
   const count = Number(value ?? 0);
@@ -188,16 +210,25 @@ const quietDuration = (task) => {
   return `quiet ${duration(quietSince)}`;
 };
 
-const statusMark = (status) => {
+const statusSymbol = (status) => {
   if (status === "running") {
     const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    return color.accent(frames[Math.floor(Date.now() / 120) % frames.length]);
+    return frames[Math.floor(Date.now() / 120) % frames.length];
   }
-  if (status === "stopping") return color.warning("◐");
-  if (status === "completed") return color.success("✓");
-  if (status === "failed") return color.error("✕");
-  if (status === "stopped") return color.muted("■");
-  return color.muted("○");
+  if (status === "stopping") return "◐";
+  if (status === "completed") return "✓";
+  if (status === "failed") return "✕";
+  if (status === "stopped") return "■";
+  return "○";
+};
+
+const statusLabel = (status) => {
+  if (status === "running") return "RUNNING";
+  if (status === "stopping") return "STOPPING";
+  if (status === "completed") return "COMPLETED";
+  if (status === "failed") return "FAILED";
+  if (status === "stopped") return "STOPPED";
+  return String(status ?? "UNKNOWN").toUpperCase();
 };
 
 const styleStatus = (status, text) => {
@@ -237,6 +268,72 @@ const setNotice = (text, durationMs = 2000) => {
 const currentNotice = () =>
   Date.now() < noticeUntil && notice !== "ready" ? notice : undefined;
 
+const columns = (left, right, width, minimumLeftWidth = 0) => {
+  let cleanRight = clean(right).replaceAll(/\s*\n\s*/gu, " ").trim();
+  if (!cleanRight) return pad(left, width);
+  const maximumRightWidth = Math.max(0, width - minimumLeftWidth - 1);
+  if (minimumLeftWidth > 0 && maximumRightWidth === 0) {
+    return pad(left, width);
+  }
+  if (minimumLeftWidth > 0 && cellWidth(cleanRight) > maximumRightWidth) {
+    cleanRight = plainTruncate(cleanRight, maximumRightWidth);
+  }
+  const rightWidth = Math.min(width, cellWidth(cleanRight));
+  const gap = rightWidth < width ? 1 : 0;
+  const leftWidth = Math.max(0, width - rightWidth - gap);
+  return `${pad(left, leftWidth)}${gap ? " " : ""}${plainTruncate(cleanRight, rightWidth)}`;
+};
+
+const sectionLine = (label, right, width) => {
+  const prefix = `─ ${clean(label)} `;
+  const suffix = right ? ` ${clean(right)} ` : "";
+  const fill = "─".repeat(
+    Math.max(0, width - cellWidth(prefix) - cellWidth(suffix))
+  );
+  return plainTruncate(`${prefix}${fill}${suffix}`, width);
+};
+
+const compactPath = (value) => {
+  const home = process.env.HOME;
+  if (home && (value === home || value.startsWith(`${home}/`))) {
+    return `~${value.slice(home.length)}`;
+  }
+  return value;
+};
+
+const terminalSummary = (task) => {
+  if (typeof task.exitCode === "number") return `exit ${task.exitCode}`;
+  return task.signal || undefined;
+};
+
+const taskRowSummary = (task, availableWidth) => {
+  const elapsed = duration(task.startedAt, task.endedAt);
+  const quiet = quietDuration(task);
+  const terminal = terminalSummary(task);
+  const candidates = terminal
+    ? [
+        [elapsed, quiet, terminal],
+        [elapsed, terminal],
+        [terminal],
+        [elapsed],
+      ]
+    : [[elapsed, quiet], [elapsed]];
+  for (const candidate of candidates) {
+    const summary = candidate.filter(Boolean).join(" · ");
+    if (cellWidth(summary) <= availableWidth) {
+      return summary;
+    }
+  }
+  return "";
+};
+
+const styledTaskRow = (row, status, selected) => {
+  const marker = row.slice(0, 1);
+  const symbol = row.slice(2, 3);
+  const remainder = row.slice(3);
+  return `${selected ? color.accent(marker) : marker} ${styleStatus(status, symbol)}${selected ? color.bold(remainder) : remainder}`;
+};
+
 const render = () => {
   if (closed || !process.stdout.isTTY) return;
   const width = Math.max(1, process.stdout.columns ?? 80);
@@ -244,137 +341,253 @@ const render = () => {
   const inner = Math.max(1, width - 2);
   const lines = [];
   const activeCount = Number(snapshot.activeCount ?? 0);
+  const taskCount = snapshot.tasks.length;
 
-  if (width < 20 || height < 9) {
+  const headerSummary = activeCount
+    ? `${activeCount} active · ${taskCount} total`
+    : taskCount
+      ? `${taskCount} recent`
+      : "idle";
+
+  if (width < 36 || height < 14) {
+    const compactHeaderSummary =
+      inner >= 25
+        ? activeCount
+          ? `${activeCount} active`
+          : taskCount
+            ? `${taskCount} recent`
+            : "idle"
+        : "";
     const compactLines = [
-      plainTruncate(
-        `Background tasks${activeCount ? ` · ${activeCount} active` : ""}`,
-        width
-      ),
+      ` ${color.accent(color.bold(columns("Background tasks", compactHeaderSummary, inner)))}`,
     ];
-    if (height > 1) {
-      compactLines.push(plainTruncate("Resize pane for dashboard", width));
+    if (help) {
+      compactLines.push(` ${color.dim(sectionLine("Help", "", inner))}`);
+      for (const line of [
+        "j/k select · x x stop",
+        "r refresh · p parent",
+        "? back · q close",
+      ]) {
+        compactLines.push(` ${plainTruncate(line, inner)}`);
+      }
+    } else if (snapshot.selected) {
+      const task = snapshot.selected;
+      const symbol = statusSymbol(task.status);
+      compactLines.push(
+        ` ${color.dim(sectionLine("Selected", statusLabel(task.status), inner))}`
+      );
+      compactLines.push(
+        ` ${styleStatus(task.status, symbol)} ${color.bold(plainTruncate(task.name, Math.max(1, inner - 2)))}`
+      );
+      const compactMetadata = [
+        duration(task.startedAt, task.endedAt),
+        quietDuration(task),
+        terminalSummary(task),
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      if (compactMetadata) {
+        compactLines.push(
+          ` ${color.muted(plainTruncate(compactMetadata, inner))}`
+        );
+      }
+    } else {
+      compactLines.push(` ${color.muted("No background tasks yet.")}`);
     }
-    while (compactLines.length < height) compactLines.push("");
-    draw(compactLines.slice(0, height));
+    const visibleLines = compactLines.slice(0, Math.max(0, height - 1));
+    while (visibleLines.length < height - 1) visibleLines.push("");
+    const activeNotice = currentNotice();
+    const compactFooter = activeNotice ?? "j/k · x stop · ? help · q close";
+    visibleLines.push(
+      (activeNotice ? color.warning : color.dim)(
+        plainTruncate(` ${compactFooter}`, width - 1)
+      )
+    );
+    draw(visibleLines);
     return;
   }
 
   lines.push(
-    color.accent(
-      plainTruncate(
-        ` Background tasks · ${activeCount > 0 ? `${activeCount} active` : "ready"}`,
-        width - 1
-      )
-    )
+    ` ${color.accent(color.bold(columns("Background tasks", headerSummary, inner)))}`
   );
-  lines.push("");
 
   if (help) {
+    lines.push(` ${color.dim(sectionLine("Help", "", inner))}`);
     const helpLines = [
-      "Background task dashboard keys",
-      "",
-      "↑ ↓ / j k    select task",
-      "x            stop active task (twice)",
-      "r            refresh",
-      "p            focus parent Pi pane",
-      "?            toggle this help",
-      "q / ctrl+c   close dashboard pane",
-      "",
-      "Active tasks appear first, followed by recent tasks.",
+      ["↑ ↓ / j k", "select task"],
+      ["x x", "stop active task"],
+      ["r", "refresh"],
+      ["p", "focus parent Pi pane"],
+      ["? / h", "toggle help"],
+      ["q / ctrl+c", "close dashboard"],
     ];
-    for (const line of helpLines.slice(0, height - 4)) {
-      lines.push(` ${plainTruncate(line, inner)}`);
+    for (const [keys, description] of helpLines) {
+      lines.push(
+        ` ${color.accent(pad(keys, 14))}${plainTruncate(description, Math.max(1, inner - 14))}`
+      );
     }
+    lines.push("");
+    lines.push(
+      ` ${color.muted(plainTruncate("Active tasks appear first, followed by recent tasks.", inner))}`
+    );
   } else {
     const taskRows = Math.min(
-      Math.max(3, Math.floor((height - 8) * 0.35)),
-      10
+      8,
+      Math.max(2, Math.floor(height * 0.25))
     );
-    lines.push(` ${color.accent("Tasks")} ${color.dim(`(${snapshot.tasks.length})`)}`);
-    if (snapshot.tasks.length === 0) {
-      lines.push(` ${color.muted("No background tasks yet")}`);
-      for (let index = 1; index < taskRows; index += 1) lines.push("");
+    lines.push(
+      ` ${color.dim(sectionLine("Tasks", String(taskCount), inner))}`
+    );
+    if (taskCount === 0) {
+      lines.push(` ${color.muted("No background tasks yet.")}`);
     } else {
-      for (const { index, item: task } of visibleWindow(
+      const visibleTasks = visibleWindow(
         snapshot.tasks,
         selectedTaskIndex(),
         taskRows
-      )) {
-        const active = task.id === snapshot.selectedTaskId;
-        const terminal =
-          typeof task.exitCode === "number"
-            ? ` · exit ${task.exitCode}`
-            : task.signal
-              ? ` · ${task.signal}`
-              : "";
-        const quiet = quietDuration(task);
-        const text = `${active ? ">" : " "} ${task.status === "running" ? "●" : task.status === "stopping" ? "◐" : task.status === "completed" ? "✓" : task.status === "failed" ? "✕" : "■"} ${task.name} · ${duration(task.startedAt, task.endedAt)}${quiet ? ` · ${quiet}` : ""}${terminal}`;
-        const row = pad(text, inner);
-        lines.push(
-          ` ${index === selectedTaskIndex() ? color.selected(row) : styleStatus(task.status, row)}`
+      );
+      for (const { index, item: task } of visibleTasks) {
+        const selected = index === selectedTaskIndex();
+        const minimumIdentityWidth = Math.min(
+          inner,
+          Math.max(14, Math.floor(inner * 0.55))
         );
+        const right = taskRowSummary(
+          task,
+          Math.max(0, inner - minimumIdentityWidth - 1)
+        );
+        const row = columns(
+          `${selected ? "›" : " "} ${statusSymbol(task.status)} ${task.name}`,
+          right,
+          inner,
+          minimumIdentityWidth
+        );
+        lines.push(` ${styledTaskRow(row, task.status, selected)}`);
       }
-      for (
-        let index = Math.min(taskRows, snapshot.tasks.length);
-        index < taskRows;
-        index += 1
-      ) {
-        lines.push("");
+      if (taskCount > visibleTasks.length) {
+        lines.push(
+          ` ${color.dim(`  … ${taskCount - visibleTasks.length} more tasks`)}`
+        );
       }
     }
 
     lines.push("");
     const task = snapshot.selected;
-    const detailBudget = Math.max(1, height - lines.length - 2);
-    const details = [];
     if (task) {
-      details.push(`${statusMark(task.status)} ${task.name} · ${task.status}`);
-      details.push(
-        [
-          task.id,
-          task.pid === undefined ? undefined : `PID ${task.pid}`,
-          duration(task.startedAt, task.endedAt),
-          quietDuration(task),
-          bytes(task.bytesWritten),
-          task.completionPolicy,
-          task.watchCount ? `${task.watchCount} watch${task.watchCount === 1 ? "" : "es"}` : undefined,
-        ]
-          .filter(Boolean)
-          .join(" · ")
+      lines.push(
+        ` ${color.dim(sectionLine("Selected task", statusLabel(task.status), inner))}`
       );
-      if (task.error) details.push(`error: ${task.error}`);
-      if (task.command && details.length < detailBudget) {
-        details.push("command:");
-        details.push(
-          ...wrap(task.command, Math.max(1, inner - 2))
-            .slice(0, Math.max(1, Math.min(3, detailBudget - details.length)))
-            .map((line) => `  ${line}`)
+      const symbol = statusSymbol(task.status);
+      const title = columns(
+        task.name,
+        terminalSummary(task) ?? "",
+        Math.max(1, inner - 2)
+      );
+      lines.push(
+        ` ${styleStatus(task.status, symbol)} ${color.bold(title)}`
+      );
+      const identityMetadata = [
+        task.id,
+        task.pid === undefined ? undefined : `pid ${task.pid}`,
+        duration(task.startedAt, task.endedAt),
+        bytes(task.bytesWritten),
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      const behaviorParts = [
+        `policy ${task.completionPolicy}`,
+        task.timeoutSeconds === undefined
+          ? undefined
+          : `timeout ${formatDuration(task.timeoutSeconds * 1000)}`,
+        task.watchCount
+          ? `${task.watchCount} watch${task.watchCount === 1 ? "" : "es"}`
+          : undefined,
+        quietDuration(task),
+      ].filter(Boolean);
+      while (
+        behaviorParts.length > 1 &&
+        cellWidth(behaviorParts.join(" · ")) > inner
+      ) {
+        behaviorParts.pop();
+      }
+      const behaviorMetadata = behaviorParts.join(" · ");
+      lines.push(
+        ` ${color.muted(plainTruncate(identityMetadata, inner))}`
+      );
+      if (behaviorMetadata) {
+        lines.push(
+          ` ${color.muted(plainTruncate(behaviorMetadata, inner))}`
         );
       }
-      if (task.cwd && details.length < detailBudget) {
-        details.push(`cwd: ${task.cwd}`);
+
+      if (task.error && lines.length < height - 4) {
+        lines.push(` ${color.error(sectionLine("Error", "", inner))}`);
+        for (const line of wrap(task.error, Math.max(1, inner - 2)).slice(0, 3)) {
+          lines.push(` ${color.error(`  ${plainTruncate(line, inner - 2)}`)}`);
+        }
       }
-      if (task.output && details.length < detailBudget) {
-        details.push("recent output:");
-        const outputBudget = Math.max(1, detailBudget - details.length);
-        details.push(
-          ...wrap(task.output, Math.max(1, inner - 2))
-            .slice(-outputBudget)
-            .map((line) => `  ${line}`)
+
+      if (task.command && lines.length < height - 4) {
+        lines.push(` ${color.dim(sectionLine("Command", "", inner))}`);
+        for (const line of wrap(task.command, Math.max(1, inner - 2)).slice(0, 3)) {
+          lines.push(`   ${plainTruncate(line, Math.max(1, inner - 2))}`);
+        }
+      }
+      if (task.cwd && lines.length < height - 3) {
+        const cwd = compactPath(task.cwd);
+        lines.push(
+          ` ${color.dim("cwd")} ${plainTruncate(cwd, Math.max(1, inner - 4))}`
         );
+      }
+
+      if (lines.length < height - 2) {
+        lines.push(
+          ` ${color.dim(sectionLine("Output", bytes(task.bytesWritten), inner))}`
+        );
+        const outputRoom = Math.max(0, height - 1 - lines.length);
+        if (task.output && outputRoom > 0) {
+          const outputLines = clean(task.output).split("\n");
+          while (outputLines.length > 1 && outputLines.at(-1) === "") {
+            outputLines.pop();
+          }
+          let visibleOutput = outputLines.slice(-outputRoom);
+          if (outputRoom > 1 && outputLines.length > outputRoom) {
+            const omittedLines = outputLines.length - outputRoom + 1;
+            visibleOutput = [
+              `… ${omittedLines} earlier lines`,
+              ...outputLines.slice(-(outputRoom - 1)),
+            ];
+          }
+          for (const line of visibleOutput) {
+            lines.push(
+              ` ${color.muted("│")} ${plainTail(line, Math.max(1, inner - 2))}`
+            );
+          }
+        } else if (outputRoom > 0) {
+          const emptyOutput = task.bytesWritten > 0
+            ? "Loading committed output…"
+            : isActive(task)
+              ? "Waiting for output…"
+              : "No output captured.";
+          lines.push(` ${color.muted(emptyOutput)}`);
+        }
       }
     } else {
-      details.push("Start a task in the parent Pi pane.");
-    }
-    for (const line of details.slice(0, detailBudget)) {
-      lines.push(` ${plainTruncate(line, inner)}`);
+      lines.push(
+        ` ${color.muted("Start a task in the parent Pi pane to see it here.")}`
+      );
     }
   }
 
   while (lines.length < height - 1) lines.push("");
-  const footer = currentNotice() ?? "↑↓ select · x stop · ? help · p parent · q close";
-  lines.push(color.dim(plainTruncate(` ${footer}`, width - 1)));
+  const activeNotice = currentNotice();
+  const footer =
+    activeNotice ?? "j/k select · x stop · r refresh · p parent · ? help · q close";
+  lines.push(
+    (activeNotice ? color.warning : color.dim)(
+      plainTruncate(` ${footer}`, width - 1)
+    )
+  );
   draw(lines.slice(0, height));
 };
 

@@ -1116,6 +1116,8 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     dependencies.herdrDashboard ??
     new BackgroundTasksHerdrDashboard({
       list: () => manager.list(),
+      logs: (idOrPrefix, requestedBytes, afterByte) =>
+        manager.logs(idOrPrefix, requestedBytes, afterByte),
       stop: (idOrPrefix) => manager.stop(idOrPrefix),
     });
   stopHerdrConnectionListener = herdrDashboard.onConnectionChange(() => {

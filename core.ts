@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import { rmSync } from "node:fs";
 import type { WriteStream } from "node:fs";
 import { mkdir, mkdtemp, open, rm } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Readable } from "node:stream";
@@ -719,9 +720,14 @@ export class BackgroundTaskManager {
           const boundary = Buffer.alloc(
             Math.min(3, totalBytes - startByte)
           );
-          await file.read(boundary, 0, boundary.length, startByte);
+          const boundaryBytesRead =
+            await BackgroundTaskManager.#readFully(
+              file,
+              boundary,
+              startByte
+            );
           while (
-            startByte - requestedStart < boundary.length &&
+            startByte - requestedStart < boundaryBytesRead &&
             BackgroundTaskManager.#isUtf8Continuation(
               boundary[startByte - requestedStart]
             )
@@ -733,15 +739,25 @@ export class BackgroundTaskManager {
         const availableBytes = totalBytes - startByte;
         const readCapacity = Math.min(availableBytes, maxBytes + 3);
         const candidate = Buffer.alloc(readCapacity);
-        if (readCapacity > 0) {
-          await file.read(candidate, 0, readCapacity, startByte);
-        }
+        const candidateBytesRead =
+          readCapacity > 0
+            ? await BackgroundTaskManager.#readFully(
+                file,
+                candidate,
+                startByte
+              )
+            : 0;
+        const populatedCandidate = candidate.subarray(0, candidateBytesRead);
         let bytesRead = BackgroundTaskManager.#completeUtf8PrefixLength(
-          candidate,
+          populatedCandidate,
           maxBytes
         );
-        if (bytesRead === 0 && candidate.length > 0 && readCapacity === availableBytes) {
-          bytesRead = Math.min(candidate.length, maxBytes);
+        if (
+          bytesRead === 0 &&
+          populatedCandidate.length > 0 &&
+          candidateBytesRead === availableBytes
+        ) {
+          bytesRead = Math.min(populatedCandidate.length, maxBytes);
         }
         const output = candidate.subarray(0, bytesRead).toString("utf-8");
         const nextByte = startByte + bytesRead;
@@ -761,21 +777,25 @@ export class BackgroundTaskManager {
         };
       }
 
-      const bytesRead = Math.min(totalBytes, maxBytes);
-      const buffer = Buffer.alloc(bytesRead);
-      if (bytesRead > 0) {
-        await file.read(
-          buffer,
-          0,
-          bytesRead,
-          Math.max(0, totalBytes - bytesRead)
-        );
-      }
+      const requestedBytes = Math.min(totalBytes, maxBytes);
+      const buffer = Buffer.alloc(requestedBytes);
+      const bytesRead =
+        requestedBytes > 0
+          ? await BackgroundTaskManager.#readFully(
+              file,
+              buffer,
+              Math.max(0, totalBytes - requestedBytes)
+            )
+          : 0;
+      const populatedBuffer = buffer.subarray(0, bytesRead);
       const truncated = totalBytes > bytesRead;
       const prefix = truncated
         ? `[Showing last ${String(bytesRead)} of ${String(totalBytes)} bytes]\n\n`
         : "";
-      const decoded = BackgroundTaskManager.#decodeLogTail(buffer, truncated);
+      const decoded = BackgroundTaskManager.#decodeLogTail(
+        populatedBuffer,
+        truncated
+      );
       const body =
         decoded ||
         (totalBytes === 0
@@ -999,6 +1019,27 @@ export class BackgroundTaskManager {
       throw new Error(`Ambiguous task ID prefix: ${query}`);
     }
     throw new Error(`Unknown background task ID: ${query}`);
+  }
+
+  static async #readFully(
+    file: FileHandle,
+    buffer: Buffer,
+    position: number
+  ): Promise<number> {
+    let offset = 0;
+    while (offset < buffer.length) {
+      const result = await file.read(
+        buffer,
+        offset,
+        buffer.length - offset,
+        position + offset
+      );
+      if (result.bytesRead === 0) {
+        break;
+      }
+      offset += result.bytesRead;
+    }
+    return offset;
   }
 
   static #isUtf8Continuation(byte: number | undefined): boolean {
