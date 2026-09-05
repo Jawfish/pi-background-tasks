@@ -239,6 +239,10 @@ Do not use literal `\uXXXX` text as a replacement for shell quoting.
 
 ## Monitor tasks in the TUI
 
+While tasks are active, Pi shows a live summary above the input editor with each
+task's state, elapsed time, output size, completion policy, quiet time, and
+active watch count. The summary disappears when no task is running or stopping.
+
 Run `/background-tasks` to open the task monitor. It shows task state, elapsed
 time, quiet duration after 30 seconds without output, process details, watches,
 and the selected task's live committed-output tail in one responsive view.

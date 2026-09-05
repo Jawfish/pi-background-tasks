@@ -146,6 +146,7 @@ const createEventBus = function createEventBus(): TestEventBus {
 interface HarnessOptions {
   events?: TestEventBus;
   hasUI?: boolean;
+  mode?: "tui" | "rpc" | "json" | "print";
   model?: { id: string; provider: string };
   notificationError?: Error;
   sendMessageError?: Error;
@@ -167,6 +168,11 @@ const createHarness = function createHarness(options: HarnessOptions = {}) {
   let sendAttempts = 0;
   const notificationReceived = Promise.withResolvers<null>();
   const statuses: (string | undefined)[] = [];
+  const widgets: {
+    content: unknown;
+    key: string;
+    options?: { placement?: string };
+  }[] = [];
   let tool: RegisteredTool | undefined;
 
   const events = options.events ?? createEventBus();
@@ -205,6 +211,7 @@ const createHarness = function createHarness(options: HarnessOptions = {}) {
       return metadata.thinkingLevel;
     },
     hasUI: options.hasUI ?? true,
+    mode: options.mode ?? "tui",
     sessionManager: {
       getSessionFile: () => metadata.sessionFile,
       getSessionId: () => metadata.sessionId,
@@ -219,6 +226,13 @@ const createHarness = function createHarness(options: HarnessOptions = {}) {
       },
       setStatus(_id: string, status: string | undefined) {
         statuses.push(status);
+      },
+      setWidget(
+        key: string,
+        content: unknown,
+        widgetOptions?: { placement?: string }
+      ) {
+        widgets.push({ content, key, options: widgetOptions });
       },
     },
   } as unknown as ExtensionContext;
@@ -267,6 +281,7 @@ const createHarness = function createHarness(options: HarnessOptions = {}) {
       Object.assign(metadata, values);
     },
     statuses,
+    widgets,
   };
 };
 
@@ -1162,7 +1177,15 @@ describe("background tasks extension", () => {
     await waitForCompletion();
 
     expect(harness.sentMessages).toHaveLength(0);
-    expect(harness.statuses).toContain("bg: 1 running");
+    expect(harness.statuses.filter(Boolean)).toHaveLength(0);
+    expect(
+      harness.widgets.some(
+        (update) =>
+          update.key === "background-tasks" &&
+          typeof update.content === "function" &&
+          update.options?.placement === "aboveEditor"
+      )
+    ).toBe(true);
 
     const context = (await harness.emit("context", {
       messages: [],
@@ -1613,6 +1636,10 @@ describe("background tasks extension", () => {
         "manager shutdown failed"
       );
       expect(harness.statuses.at(-1)).toBeUndefined();
+      expect(harness.widgets.at(-1)).toMatchObject({
+        content: undefined,
+        key: "background-tasks",
+      });
       const context = (await harness.emit("context", {
         messages: [],
       })) as { messages: unknown[] };
@@ -1637,6 +1664,10 @@ describe("background tasks extension", () => {
         "runtime removal failed"
       );
       expect(harness.statuses.at(-1)).toBeUndefined();
+      expect(harness.widgets.at(-1)).toMatchObject({
+        content: undefined,
+        key: "background-tasks",
+      });
       const context = (await harness.emit("context", {
         messages: [],
       })) as { messages: unknown[] };

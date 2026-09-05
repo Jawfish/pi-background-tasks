@@ -151,6 +151,9 @@ const EXPANDED_LOG_LINES = 80;
 const EXPANDED_COMPLETION_OUTPUT_LINES = 12;
 const MAX_COMPLETION_OUTPUT_LINES = 48;
 const QUIET_DURATION_THRESHOLD_MS = 30_000;
+const STATUS_WIDGET_REFRESH_MS = 500;
+const STATUS_WIDGET_TASK_ROWS = 4;
+const STATUS_WIDGET_FRAMES = ["◐", "◓", "◑", "◒"] as const;
 
 const cleanDisplay = function cleanDisplay(value: string): string {
   return stripTerminalSequences(value)
@@ -698,6 +701,137 @@ export const renderCompletionMessage = function renderCompletionMessage(
   box.addChild(new Text(lines.join("\n"), 0, 0));
   return box;
 };
+
+interface StatusWidgetManager {
+  list(): TaskSnapshot[];
+}
+
+const padStatusWidgetLine = function padStatusWidgetLine(
+  line: string,
+  width: number
+): string {
+  if (width <= 0) {
+    return "";
+  }
+  if (width <= 2) {
+    return " ".repeat(width);
+  }
+  const innerWidth = width - 2;
+  const body = truncateToWidth(line, innerWidth, "", true);
+  return ` ${body}${" ".repeat(Math.max(0, innerWidth - visibleWidth(body)))} `;
+};
+
+const widgetStatus = function widgetStatus(
+  task: TaskSnapshot,
+  theme: Theme
+): string {
+  const presentation = STATUS_PRESENTATION[task.status];
+  return theme.fg(
+    presentation.color,
+    `${presentation.symbol} ${task.status}`
+  );
+};
+
+/** Persistent above-editor summary of active background tasks. */
+export class TaskStatusWidget implements Component {
+  readonly #manager: StatusWidgetManager;
+  readonly #theme: Theme;
+  readonly #tui: TUI;
+  #disposed = false;
+  #interval: NodeJS.Timeout;
+
+  constructor(options: {
+    manager: BackgroundTaskManager | StatusWidgetManager;
+    theme: Theme;
+    tui: TUI;
+  }) {
+    this.#manager = options.manager;
+    this.#theme = options.theme;
+    this.#tui = options.tui;
+    this.#interval = setInterval(
+      () => this.#tui.requestRender(),
+      STATUS_WIDGET_REFRESH_MS
+    );
+    this.#interval.unref();
+  }
+
+  refresh(): void {
+    if (!this.#disposed) {
+      this.#tui.requestRender();
+    }
+  }
+
+  render(width: number): string[] {
+    const tasks = this.#manager.list();
+    const running = tasks.filter((task) => task.status === "running");
+    const stopping = tasks.filter((task) => task.status === "stopping");
+    const active = [...running, ...stopping];
+    if (active.length === 0) {
+      return [];
+    }
+
+    const frame = STATUS_WIDGET_FRAMES[
+      Math.floor(Date.now() / STATUS_WIDGET_REFRESH_MS) %
+        STATUS_WIDGET_FRAMES.length
+    ]!;
+    const counts = [
+      running.length > 0 ? `${plural(running.length, "running task")}` : undefined,
+      stopping.length > 0
+        ? `${plural(stopping.length, "stopping task")}`
+        : undefined,
+    ].filter((value): value is string => value !== undefined);
+    const lines = [
+      `${this.#theme.fg("accent", frame)} ${this.#theme.fg("accent", this.#theme.bold("Background tasks"))} ${this.#theme.fg("dim", `· background · ${counts.join(" · ")}`)}`,
+    ];
+
+    const visible = active.slice(0, STATUS_WIDGET_TASK_ROWS);
+    const hidden = active.length - visible.length;
+    for (const [index, task] of visible.entries()) {
+      const hasMore = index < visible.length - 1 || hidden > 0;
+      const marker = hasMore ? "•" : "↳";
+      const quiet = taskQuietDuration(task);
+      const watches = task.watches?.filter((watch) => watch.status === "active").length ?? 0;
+      const policy = effectiveCompletionPolicy(task, "notify")!;
+      const metadata = [
+        widgetStatus(task, this.#theme),
+        this.#theme.fg("dim", taskDuration(task)),
+        task.bytesWritten > 0
+          ? this.#theme.fg("dim", formatUiBytes(task.bytesWritten))
+          : undefined,
+        quiet ? this.#theme.fg("muted", quiet) : undefined,
+        watches > 0
+          ? this.#theme.fg("accent", plural(watches, "watch"))
+          : undefined,
+        this.#theme.fg(policy === "wake" ? "accent" : "dim", policy),
+      ].filter((value): value is string => value !== undefined);
+      lines.push(
+        `${this.#theme.fg("dim", marker)} ${this.#theme.fg("text", this.#theme.bold(cleanInline(task.name)))} ${this.#theme.fg("dim", "·")} ${metadata.join(` ${this.#theme.fg("dim", "·")} `)}`
+      );
+    }
+    if (hidden > 0) {
+      lines.push(
+        `${this.#theme.fg("dim", "↳")} ${this.#theme.fg("dim", `+${String(hidden)} more active ${hidden === 1 ? "task" : "tasks"}`)}`
+      );
+    }
+    lines.push(
+      `   ${this.#theme.fg("accent", "/background-tasks")} ${this.#theme.fg("dim", "for live logs and controls")}`
+    );
+
+    return lines.map((line) => padStatusWidgetLine(line, width));
+  }
+
+  invalidate(): void {
+    // Theme colors are computed during every render, so there is no themed cache.
+  }
+
+  dispose(): void {
+    if (this.#disposed) {
+      return;
+    }
+    this.#disposed = true;
+    clearInterval(this.#interval);
+  }
+}
 
 interface DashboardManager {
   list(): TaskSnapshot[];

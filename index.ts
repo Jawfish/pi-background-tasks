@@ -33,6 +33,7 @@ import {
   sanitizeUiInline,
   TaskDashboardComponent,
   TaskDashboardReadState,
+  TaskStatusWidget,
 } from "./tui.ts";
 import type {
   BackgroundTaskToolDetails,
@@ -54,6 +55,7 @@ import type {
 } from "./service.ts";
 
 const WAKE_BATCH_MS = 100;
+const BACKGROUND_TASK_WIDGET_KEY = "background-tasks";
 const MAX_COMPLETION_TASKS = 16;
 const MAX_COMPLETION_NAME_BYTES = 384;
 const MAX_COMPLETION_ERROR_BYTES = 384;
@@ -677,6 +679,8 @@ const backgroundTasksExtension = function backgroundTasksExtension(
   let shuttingDown = false;
   let wakeHandle: NodeJS.Timeout | undefined;
   let activeDashboard: TaskDashboardComponent | undefined;
+  let taskStatusWidget: TaskStatusWidget | undefined;
+  let taskStatusWidgetRegistered = false;
   let dashboardReadState = new TaskDashboardReadState();
   let deliveryLedger = new CompletionDeliveryLedger();
   const unacknowledgedFailures = new Map<string, TaskSnapshot>();
@@ -690,6 +694,15 @@ const backgroundTasksExtension = function backgroundTasksExtension(
   // Callbacks close over the manager, so initialization follows their definitions.
   let manager: BackgroundTaskManager;
 
+  const clearTaskStatusWidget = (ctx: ExtensionContext): void => {
+    if (taskStatusWidgetRegistered) {
+      ctx.ui.setWidget(BACKGROUND_TASK_WIDGET_KEY, undefined);
+    }
+    taskStatusWidget?.dispose();
+    taskStatusWidget = undefined;
+    taskStatusWidgetRegistered = false;
+  };
+
   const updateUi = (): void => {
     const ctx = currentCtx;
     if (!ctx?.hasUI) {
@@ -699,15 +712,40 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     const running = tasks.filter((task) => task.status === "running").length;
     const stopping = tasks.filter((task) => task.status === "stopping").length;
     const activeCount = running + stopping;
-    const parts = [
-      running > 0 ? `${String(running)} running` : undefined,
-      stopping > 0 ? `${String(stopping)} stopping` : undefined,
-    ].filter((part): part is string => part !== undefined);
-    ctx.ui.setStatus(
-      "background-tasks",
-      activeCount > 0 ? `bg: ${parts.join(" · ")}` : undefined
-    );
     activeDashboard?.refresh();
+
+    if (ctx.mode === "rpc") {
+      const parts = [
+        running > 0 ? `${String(running)} running` : undefined,
+        stopping > 0 ? `${String(stopping)} stopping` : undefined,
+      ].filter((part): part is string => part !== undefined);
+      ctx.ui.setWidget(
+        BACKGROUND_TASK_WIDGET_KEY,
+        activeCount > 0 ? [`Background tasks · ${parts.join(" · ")}`] : undefined,
+        { placement: "aboveEditor" }
+      );
+      return;
+    }
+
+    if (activeDashboard || activeCount === 0) {
+      clearTaskStatusWidget(ctx);
+      return;
+    }
+    if (taskStatusWidgetRegistered) {
+      taskStatusWidget?.refresh();
+      return;
+    }
+
+    taskStatusWidgetRegistered = true;
+    ctx.ui.setWidget(
+      BACKGROUND_TASK_WIDGET_KEY,
+      (tui, theme) => {
+        const widget = new TaskStatusWidget({ manager, theme, tui });
+        taskStatusWidget = widget;
+        return widget;
+      },
+      { placement: "aboveEditor" }
+    );
   };
 
   const flushWake = (): void => {
@@ -1288,6 +1326,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
               tui,
             });
             activeDashboard = dashboard;
+            updateUi();
             return dashboard;
           },
           {
@@ -1305,6 +1344,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
         dashboard?.dispose();
         if (activeDashboard === dashboard) {
           activeDashboard = undefined;
+          updateUi();
         }
       }
     },
@@ -1401,6 +1441,9 @@ const backgroundTasksExtension = function backgroundTasksExtension(
   pi.on("session_start", async (_event, ctx) => {
     shuttingDown = false;
     currentCtx = ctx;
+    if (ctx.hasUI) {
+      ctx.ui.setStatus(BACKGROUND_TASK_WIDGET_KEY, undefined);
+    }
     const adopted = claimHandoff(ctx.sessionManager?.getSessionId());
     if (adopted) {
       const discarded = manager;
@@ -1456,8 +1499,12 @@ const backgroundTasksExtension = function backgroundTasksExtension(
   pi.on("session_shutdown", async (event) => {
     shuttingDown = true;
     const dashboard = activeDashboard;
+    const statusWidget = taskStatusWidget;
     const ctx = currentCtx;
     activeDashboard = undefined;
+    taskStatusWidget = undefined;
+    taskStatusWidgetRegistered = false;
+    statusWidget?.dispose();
     if (wakeHandle) {
       clearTimeout(wakeHandle);
       wakeHandle = undefined;
@@ -1494,7 +1541,10 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       }
     } finally {
       currentCtx = undefined;
-      ctx?.ui.setStatus("background-tasks", undefined);
+      if (ctx?.hasUI) {
+        ctx.ui.setStatus(BACKGROUND_TASK_WIDGET_KEY, undefined);
+        ctx.ui.setWidget(BACKGROUND_TASK_WIDGET_KEY, undefined);
+      }
     }
   });
 };

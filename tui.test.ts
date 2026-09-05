@@ -19,9 +19,11 @@ import {
   renderCompletionMessage,
   TaskDashboardComponent,
   TaskDashboardReadState,
+  TaskStatusWidget,
 } from "./tui.ts";
 
 const components: TaskDashboardComponent[] = [];
+const statusWidgets: TaskStatusWidget[] = [];
 
 const theme = {
   bg(_color: string, text: string) {
@@ -113,6 +115,82 @@ afterEach(() => {
   for (const component of components.splice(0)) {
     component.dispose();
   }
+  for (const widget of statusWidgets.splice(0)) {
+    widget.dispose();
+  }
+});
+
+describe("background task status widget", () => {
+  test("renders a rich above-editor summary of active tasks", () => {
+    const now = Date.now();
+    const tasks = [
+      task({
+        bytesWritten: 2048,
+        id: "running1",
+        lastOutputAt: now - 45_000,
+        name: "Build project",
+        startedAt: now - 90_000,
+        watches: [
+          {
+            condition: "exit",
+            createdAt: now,
+            id: "watch001",
+            status: "active",
+            taskId: "running1",
+            wake: true,
+          },
+        ],
+      }),
+      task({
+        id: "stopping",
+        name: "Development server",
+        status: "stopping",
+      }),
+      task({
+        id: "finished",
+        name: "Old completed task",
+        status: "completed",
+      }),
+    ];
+    const { tui } = createTui(30);
+    const widget = new TaskStatusWidget({
+      manager: { list: () => tasks },
+      theme,
+      tui,
+    });
+    statusWidgets.push(widget);
+
+    const rendered = stripTerminalSequences(widget.render(80).join("\n"));
+    expect(rendered).toContain("Background tasks");
+    expect(rendered).toContain("1 running task");
+    expect(rendered).toContain("1 stopping task");
+    expect(rendered).toContain("Build project");
+    expect(rendered).toContain("quiet 45s");
+    expect(rendered).toContain("1 watch");
+    expect(rendered).toContain("Development server");
+    expect(rendered).toContain("/background-tasks");
+    expect(rendered).not.toContain("Old completed task");
+  });
+
+  test("keeps task summaries inside the available width", () => {
+    const unsafe = task({
+      command: "unused",
+      name: `Long ${"name ".repeat(30)}\u001b]2;owned\u0007`,
+    });
+    const { tui } = createTui(30);
+    const widget = new TaskStatusWidget({
+      manager: { list: () => [unsafe] },
+      theme,
+      tui,
+    });
+    statusWidgets.push(widget);
+
+    for (const width of [0, 1, 2, 18, 44, 80]) {
+      const lines = widget.render(width);
+      expect(lines.every((line) => visibleWidth(line) === width)).toBe(true);
+      expect(stripTerminalSequences(lines.join("\n"))).not.toContain("owned");
+    }
+  });
 });
 
 describe("background task dashboard", () => {
