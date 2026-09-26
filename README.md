@@ -271,7 +271,8 @@ groups and deletes the log directory. Set
 
 All other session replacement events stop tasks. This rule includes `new`,
 `resume`, `fork`, and `quit`. Tasks do not survive a Pi process restart. The
-extension does not store task state for a later Pi process.
+extension does not restore task state in a later Pi process. The task journal
+keeps history only.
 
 ## Share the manager with another extension
 
@@ -318,6 +319,157 @@ Consumers must ignore unknown optional fields and event types. A breaking
 change uses a new `v2` channel set. The service will expose `v1` and `v2`
 together for a documented transition period before it removes `v1`.
 
+## Inspect the task journal
+
+The extension records task history in a local SQLite journal. The default
+file is `$XDG_STATE_HOME/pi-background-tasks/journal.sqlite`, or
+`~/.local/state/pi-background-tasks/journal.sqlite` when `XDG_STATE_HOME` is
+not set. Set `PI_BACKGROUND_TASK_JOURNAL` to another file path, or to `off` to
+disable the journal.
+
+The journal uses WAL mode and a 250-millisecond lock timeout, so several Pi
+processes can share one file. Schema migrations are forward-only. A journal
+with a newer schema is not changed; the extension disables its journal for
+that session. A journal error never changes a task or a tool result. The
+extension reports the first write error on stderr.
+
+The journal contains commands, arguments, and complete command output. The
+file mode is `0600`. Treat the file as sensitive.
+
+### Tables
+
+Keys are stable across `/reload`. A `task_key` is `<manager-id>/<task-id>`,
+and a `watch_key` is `<manager-id>/<watch-id>`. The manager moves to the
+replacement instance during reload, so a task keeps its key when a new
+instance records its finish.
+
+| Table | Contents |
+| --- | --- |
+| `instances` | One row per extension instance: Pi session ID and file, cwd, package version, source hash, runtime, and process ID. |
+| `tasks` | One row per task: origin (`tool` or `service`), command, cwd, policy, timeout, PID, start and end times, status, `terminal_reason`, exit code, signal, and error. |
+| `task_outputs` | Output capture for each task: `capture` (`complete`, `partial`, or `missing`), committed and stored sizes, output limit, and log or file errors. |
+| `output_blobs` | Content-addressed committed output, keyed by SHA-256. |
+| `actions` | Each `background_task` call, including calls Pi rejects before execution, and each service or dashboard action that changes state. It has the arguments, the model-visible outcome, and valid task and watch links. |
+| `log_reads` | Each log read: caller, tool call ID, requested and returned cursors, bytes, truncation, and error. Dashboard reads are limited to one row per task each second; `coalesced_reads` counts skipped reads. |
+| `watches` | Watch registration (`start` or `watch` origin), condition, wake, pattern or interval, one end state, the matched output, and its byte cursors. |
+| `deliveries` | One notification and wake decision for each finished task or fired watch. `notify` is `shown`, `failed`, `silent`, `no-ui`, or `suppressed`. |
+| `delivery_events` | Wake delivery steps: `enqueue-attempted`, `enqueued`, `enqueue-failed`, `fallback-injected`, and `observed` with `via` (`context`, `fallback`, `tool:status`, or `tool:logs`). A shared `batch_id` marks one continuation message. |
+
+`terminal_reason` is `exit`, `user`, `shutdown`, `timeout`, `output_limit`, or
+`log_failure`. The `task_outcomes` view adds `duration_ms` and `observation`.
+A task that started but has no recorded finish has `observation =
+'incomplete'` and no status. For example, this occurs when Pi crashes. Do not
+read it as a failure.
+
+The journal stores only bytes that the log writer committed. A capture is
+`partial` when a log write failed or the log is shorter than the committed
+size. It is `missing` when the log could not be read. Capture state does not
+change the task outcome.
+
+An `observed` event means that the delivery entered model context or a tool
+result. It does not prove that the model acted on it. An enqueued continuation
+is not an observation.
+
+### Example queries
+
+Task outcomes, with incomplete observation kept separate:
+
+```sql
+SELECT observation, status, terminal_reason, count(*) AS tasks
+FROM task_outcomes
+GROUP BY observation, status, terminal_reason
+ORDER BY tasks DESC;
+```
+
+Output sizes and missing output evidence:
+
+```sql
+SELECT t.name, o.capture, o.size_bytes, o.output_limit_reached,
+  coalesce(o.log_error, o.file_error) AS problem
+FROM tasks t LEFT JOIN task_outputs o USING (task_key)
+WHERE o.task_key IS NULL OR o.capture != 'complete' OR o.output_limit_reached
+ORDER BY t.started_at DESC;
+```
+
+Status polling while a task runs:
+
+```sql
+SELECT t.name, count(a.action_id) AS status_calls
+FROM tasks t
+JOIN instances ti ON ti.instance_id = t.started_by_instance
+JOIN actions a
+  ON a.source = 'tool' AND a.action = 'status'
+  AND a.at BETWEEN t.started_at AND coalesce(t.ended_at, a.at)
+JOIN instances ai ON ai.instance_id = a.instance_id
+  AND ai.pi_session_id = ti.pi_session_id
+GROUP BY t.task_key
+HAVING status_calls > 2
+ORDER BY status_calls DESC;
+```
+
+Log read patterns: rereads of bytes already returned, and tail reads:
+
+```sql
+SELECT task_key,
+  count(*) AS reads,
+  sum(requested_after_byte IS NULL) AS tail_reads,
+  sum(requested_after_byte < (
+    SELECT max(p.next_byte) FROM log_reads p
+    WHERE p.task_key = r.task_key AND p.caller = r.caller
+      AND p.read_id < r.read_id AND p.requested_after_byte IS NOT NULL
+  )) AS rereads
+FROM log_reads r
+WHERE caller = 'tool' AND task_key IS NOT NULL
+GROUP BY task_key;
+```
+
+Watch use by condition and end state:
+
+```sql
+SELECT condition, origin, status, count(*) AS watches
+FROM watches
+GROUP BY condition, origin, status;
+```
+
+Missed readiness: a later output watch whose pattern already occurred in
+committed output before registration:
+
+```sql
+SELECT w.watch_key, w.pattern, w.status
+FROM watches w
+JOIN task_outputs o USING (task_key)
+JOIN output_blobs b USING (sha256)
+WHERE w.condition = 'output' AND w.origin = 'watch'
+  AND instr(CAST(b.content AS TEXT), w.pattern) > 0
+  AND w.status != 'fired';
+```
+
+Wake deliveries that were never observed:
+
+```sql
+SELECT d.delivery_key, d.kind, d.decided_at,
+  group_concat(e.event, ' > ') AS events
+FROM deliveries d
+LEFT JOIN delivery_events e USING (delivery_key)
+WHERE d.wake_requested
+  AND NOT EXISTS (
+    SELECT 1 FROM delivery_events o
+    WHERE o.delivery_key = d.delivery_key AND o.event = 'observed'
+  )
+GROUP BY d.delivery_key;
+```
+
+Wake frequency per Pi session and day:
+
+```sql
+SELECT i.pi_session_id, date(e.at / 1000, 'unixepoch') AS day,
+  count(DISTINCT e.batch_id) AS continuations,
+  count(*) AS delivered_events
+FROM delivery_events e JOIN instances i USING (instance_id)
+WHERE e.event = 'enqueued'
+GROUP BY i.pi_session_id, day;
+```
+
 ## Treat commands and output as untrusted
 
 This extension does not sandbox commands. Tasks have Pi's file, network,
@@ -341,7 +493,8 @@ must manage its own shutdown.
 - One task can have at most eight active watches.
 - An output watch pattern can contain at most 512 UTF-8 bytes.
 - Logs use a temporary session directory. Pruning removes old logs, and normal
-  session shutdown removes the directory.
+  session shutdown removes the directory. The task journal keeps a copy of the
+  committed output.
 - The extension supports POSIX commands and process groups only.
 - The extension does not provide a PTY or send input to a running process.
 - The extension is not a terminal multiplexer, process supervisor, or sandbox.

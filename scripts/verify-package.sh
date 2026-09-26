@@ -26,6 +26,7 @@ main() {
 		README.md
 		core.ts
 		index.ts
+		journal.ts
 		package.json
 		service.ts
 		tui.ts

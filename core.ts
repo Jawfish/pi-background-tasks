@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import type { ChildProcessByStdio } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { rmSync } from "node:fs";
 import type { WriteStream } from "node:fs";
 import { mkdir, mkdtemp, open, rm } from "node:fs/promises";
@@ -96,6 +96,8 @@ export interface TaskSnapshot {
 
 export interface StartTaskInput {
   name?: string;
+  /** Free-form start origin, such as "tool" or "service", passed to the recorder. */
+  origin?: string;
   command: string;
   cwd: string;
   completionPolicy?: CompletionPolicy;
@@ -123,12 +125,60 @@ export interface TaskCompletion {
   outputTruncated?: boolean;
 }
 
-type StopReason =
+export type StopReason =
   | "user"
   | "shutdown"
   | "timeout"
   | "output_limit"
   | "log_failure";
+
+/** Why a task reached its terminal state. */
+export type TaskTerminalReason = StopReason | "exit";
+export type TaskWatchOrigin = "start" | "watch";
+
+/** Caller identity for one log read. */
+export interface TaskLogReadContext {
+  caller: string;
+  callId?: string;
+}
+
+export interface TaskLogReadRecord extends TaskLogReadContext {
+  at: number;
+  query: string;
+  taskId?: string;
+  requestedAfterByte?: number;
+  requestedMaxBytes?: number;
+  startByte?: number;
+  nextByte?: number;
+  bytesRead?: number;
+  totalBytes?: number;
+  truncated?: boolean;
+  droppedBytes?: number;
+  error?: string;
+}
+
+/** Final committed log evidence, reported before pruning or shutdown can remove the log. */
+export interface TaskOutputCapture {
+  taskId: string;
+  logPath: string;
+  committedBytes: number;
+  outputLimitBytes: number;
+  isOutputLimitReached: boolean;
+  logError?: string;
+}
+
+/**
+ * Durable observer of task history. Unlike callbacks, a recorder stays bound
+ * during a reload handoff. Recorder failures never change task state.
+ */
+export interface BackgroundTaskRecorder {
+  taskStarted?(task: TaskSnapshot, origin: string | undefined): void;
+  outputFinalized?(capture: TaskOutputCapture): void;
+  taskFinished?(task: TaskSnapshot, reason: TaskTerminalReason): void;
+  watchRegistered?(watch: TaskWatchSnapshot, origin: TaskWatchOrigin): void;
+  watchEnded?(watch: TaskWatchSnapshot): void;
+  logRead?(read: TaskLogReadRecord): void;
+}
 
 type ShellOutcome = {
   code: number | null;
@@ -365,6 +415,8 @@ export const formatModelContext = function formatModelContext(
 };
 
 export class BackgroundTaskManager {
+  /** Unique identity of this manager; it survives reload handoff. */
+  readonly id = randomUUID();
   readonly #tasks = new Map<string, RuntimeTask>();
   readonly #watches = new Map<string, RuntimeWatch>();
   readonly #watchCooldowns = new Map<string, number>();
@@ -383,6 +435,7 @@ export class BackgroundTaskManager {
     callback: (error?: Error | null) => void
   ) => boolean;
   #callbacks: BackgroundTaskCallbacks = {};
+  #recorder: BackgroundTaskRecorder = {};
   readonly #ownsRuntimeDir: boolean;
   #runtimeDir: string | undefined;
   #initializePromise: Promise<string> | undefined;
@@ -454,6 +507,19 @@ export class BackgroundTaskManager {
     this.#callbacks = { ...callbacks };
   }
 
+  /** Replace the durable recorder. Pass undefined to stop recording. */
+  setRecorder(recorder: BackgroundTaskRecorder | undefined): void {
+    this.#recorder = recorder ?? {};
+  }
+
+  #record(write: (recorder: BackgroundTaskRecorder) => void): void {
+    try {
+      write(this.#recorder);
+    } catch {
+      // A recorder failure must not change task state.
+    }
+  }
+
   /** Stop notifying the current owner without changing task state. */
   detachCallbacks(): void {
     this.#callbacks = {};
@@ -491,7 +557,8 @@ export class BackgroundTaskManager {
     }
     const watch = this.#addWatch(
       task,
-      BackgroundTaskManager.#validateWatchInput(input)
+      BackgroundTaskManager.#validateWatchInput(input),
+      "watch"
     );
     this.#notifyChange();
     return BackgroundTaskManager.#watchSnapshot(watch);
@@ -508,6 +575,7 @@ export class BackgroundTaskManager {
     }
     watch.status = "cancelled";
     watch.endedAt = Date.now();
+    this.#recordWatchEnded(watch);
     this.#notifyChange();
     return BackgroundTaskManager.#watchSnapshot(watch);
   }
@@ -623,8 +691,14 @@ export class BackgroundTaskManager {
         watchState: new Map(),
       };
       this.#tasks.set(id, task);
+      this.#record((recorder) =>
+        recorder.taskStarted?.(
+          BackgroundTaskManager.#snapshot(task),
+          input.origin
+        )
+      );
       if (initialWatch) {
-        this.#addWatch(task, initialWatch);
+        this.#addWatch(task, initialWatch, "start");
       }
 
       stream.on("error", (error) => {
@@ -691,7 +765,42 @@ export class BackgroundTaskManager {
   async logs(
     idOrPrefix: string,
     requestedBytes = MAX_LOG_READ_BYTES,
-    afterByte?: number
+    afterByte?: number,
+    context: TaskLogReadContext = { caller: "internal" }
+  ): Promise<TaskLogs> {
+    const read: TaskLogReadRecord = {
+      ...context,
+      at: Date.now(),
+      query: idOrPrefix,
+      requestedAfterByte: afterByte,
+      requestedMaxBytes: requestedBytes,
+    };
+    try {
+      const logs = await this.#readLogs(idOrPrefix, requestedBytes, afterByte);
+      const startByte = logs.startByte ?? logs.totalBytes - logs.bytesRead;
+      Object.assign(read, {
+        bytesRead: logs.bytesRead,
+        droppedBytes: logs.droppedBytes,
+        nextByte: logs.nextByte ?? startByte + logs.bytesRead,
+        startByte,
+        taskId: logs.task.id,
+        totalBytes: logs.totalBytes,
+        truncated: logs.truncated,
+      });
+      return logs;
+    } catch (error) {
+      read.error = error instanceof Error ? error.message : String(error);
+      read.taskId = this.#tasks.get(idOrPrefix.trim())?.id;
+      throw error;
+    } finally {
+      this.#record((recorder) => recorder.logRead?.(read));
+    }
+  }
+
+  async #readLogs(
+    idOrPrefix: string,
+    requestedBytes: number,
+    afterByte: number | undefined
   ): Promise<TaskLogs> {
     const task = this.#resolve(idOrPrefix);
     const maxBytes = Math.max(
@@ -896,7 +1005,8 @@ export class BackgroundTaskManager {
 
   #addWatch(
     task: RuntimeTask,
-    input: ValidatedTaskWatchInput
+    input: ValidatedTaskWatchInput,
+    origin: TaskWatchOrigin
   ): RuntimeWatch {
     const active = [...task.watchState.values()].filter(
       (watch) => watch.status === "active"
@@ -941,6 +1051,12 @@ export class BackgroundTaskManager {
     };
     task.watchState.set(id, watch);
     this.#watches.set(id, watch);
+    this.#record((recorder) =>
+      recorder.watchRegistered?.(
+        BackgroundTaskManager.#watchSnapshot(watch),
+        origin
+      )
+    );
     if (watch.condition === "inactivity") {
       this.#scheduleInactivityWatch(task, watch);
     }
@@ -1300,6 +1416,7 @@ export class BackgroundTaskManager {
     watch.endedAt = Date.now();
     watch.outputOverlap = undefined;
     this.#watchCooldowns.set(watch.signature, watch.endedAt);
+    this.#recordWatchEnded(watch);
     const event: TaskWatchEvent = {
       nextByte: watch.nextByte,
       output,
@@ -1365,6 +1482,13 @@ export class BackgroundTaskManager {
     watch.outputOverlap = undefined;
     watch.status = "expired";
     watch.endedAt = endedAt;
+    this.#recordWatchEnded(watch);
+  }
+
+  #recordWatchEnded(watch: RuntimeWatch): void {
+    this.#record((recorder) =>
+      recorder.watchEnded?.(BackgroundTaskManager.#watchSnapshot(watch))
+    );
   }
 
   #finishAfterCleanup(task: RuntimeTask): Promise<void> {
@@ -1583,6 +1707,7 @@ export class BackgroundTaskManager {
 
     let finalStatus = status;
     let finalError = error;
+    let finalizationError: string | undefined;
     try {
       task.stream.end();
       await finished(task.stream);
@@ -1590,16 +1715,25 @@ export class BackgroundTaskManager {
     } catch (streamError) {
       finalStatus = "failed";
       if (!task.logWriteError) {
-        finalError = appendError(
-          finalError,
-          `Log finalization failed: ${streamError instanceof Error ? streamError.message : String(streamError)}`
-        );
+        finalizationError = `Log finalization failed: ${streamError instanceof Error ? streamError.message : String(streamError)}`;
+        finalError = appendError(finalError, finalizationError);
       }
     }
     if (task.logWriteError && !finalError?.includes(task.logWriteError)) {
       finalStatus = "failed";
       finalError = appendError(finalError, task.logWriteError);
     }
+    const logError = task.logWriteError ?? finalizationError;
+    this.#record((recorder) =>
+      recorder.outputFinalized?.({
+        committedBytes: task.bytesWritten,
+        isOutputLimitReached: task.outputLimitReached,
+        logError,
+        logPath: task.logPath,
+        outputLimitBytes: this.#maxOutputBytes,
+        taskId: task.id,
+      })
+    );
 
     task.status = finalStatus;
     task.exitCode = code;
@@ -1621,12 +1755,21 @@ export class BackgroundTaskManager {
     this.#finishedSequence += 1;
     task.finishedOrder = this.#finishedSequence;
 
+    const terminalSnapshot = BackgroundTaskManager.#snapshot(task);
+    this.#record((recorder) =>
+      recorder.taskFinished?.(terminalSnapshot, task.stopReason ?? "exit")
+    );
     const completion: TaskCompletion = {
-      task: BackgroundTaskManager.#snapshot(task),
+      task: terminalSnapshot,
     };
     if (task.completionPolicy === "wake") {
       try {
-        const logs = await this.logs(task.id, MAX_COMPLETION_LOG_BYTES);
+        const logs = await this.logs(
+          task.id,
+          MAX_COMPLETION_LOG_BYTES,
+          undefined,
+          { caller: "completion" }
+        );
         completion.output = logs.output;
         completion.outputTruncated = logs.truncated;
       } catch (logError) {

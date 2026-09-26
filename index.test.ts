@@ -15,7 +15,10 @@ import backgroundTasksExtension, {
   completionMessage,
   HANDOFF_LEASE_ENV,
   MAX_COMPLETION_MESSAGE_BYTES,
+  recordingDashboardManager,
 } from "./index.ts";
+import { JOURNAL_ENV, TaskJournal } from "./journal.ts";
+import { Database } from "bun:sqlite";
 import {
   BACKGROUND_TASK_DISCOVERY_CHANNEL,
   BACKGROUND_TASK_SERVICE_CHANNEL,
@@ -115,7 +118,7 @@ interface RegisteredTool {
 }
 
 type EventHandler = (
-  event: { messages?: unknown[]; reason?: string },
+  event: Record<string, unknown> & { messages?: unknown[]; reason?: string },
   ctx: ExtensionContext
 ) => unknown | Promise<unknown>;
 
@@ -239,7 +242,10 @@ const createHarness = function createHarness(options: HarnessOptions = {}) {
 
   const emit = async (
     event: string,
-    data: { messages?: unknown[]; reason?: string } = {}
+    data: Record<string, unknown> & {
+      messages?: unknown[];
+      reason?: string;
+    } = {}
   ) => {
     let result: unknown;
     for (const handler of handlers.get(event) ?? []) {
@@ -254,14 +260,36 @@ const createHarness = function createHarness(options: HarnessOptions = {}) {
     if (!tool) {
       throw new Error("background_task was not registered");
     }
-    const prepared = tool.prepareArguments?.(params) ?? params;
-    return await tool.execute(
-      crypto.randomUUID(),
-      prepared,
-      undefined,
-      undefined,
-      ctx
-    );
+    // Mirror Pi: execution events surround every call, including failures.
+    const toolCallId = crypto.randomUUID();
+    const base = { toolCallId, toolName: "background_task" };
+    await emit("tool_execution_start", { ...base, args: params });
+    try {
+      const prepared = tool.prepareArguments?.(params) ?? params;
+      const result = await tool.execute(
+        toolCallId,
+        prepared,
+        undefined,
+        undefined,
+        ctx
+      );
+      await emit("tool_execution_end", { ...base, isError: false, result });
+      return result;
+    } catch (error) {
+      await emit("tool_execution_end", {
+        ...base,
+        isError: true,
+        result: {
+          content: [
+            {
+              text: error instanceof Error ? error.message : String(error),
+              type: "text",
+            },
+          ],
+        },
+      });
+      throw error;
+    }
   };
 
   return {
@@ -1674,6 +1702,432 @@ describe("background tasks extension", () => {
       expect(context.messages).toHaveLength(0);
     } finally {
       BackgroundTaskManager.prototype.shutdown = originalShutdown;
+    }
+  });
+});
+
+/** Point new extension instances at a fresh journal for one test. */
+const useJournal = async function useJournal() {
+  const dir = await mkdtemp(path.join(tmpdir(), "pi-index-journal-"));
+  const file = path.join(dir, "journal.sqlite");
+  const previous = process.env[JOURNAL_ENV];
+  process.env[JOURNAL_ENV] = file;
+  const query = <T>(sql: string): T[] => {
+    const db = new Database(file, { readonly: true });
+    try {
+      return db.prepare(sql).all() as T[];
+    } finally {
+      db.close();
+    }
+  };
+  const restore = async () => {
+    if (previous === undefined) {
+      Reflect.deleteProperty(process.env, JOURNAL_ENV);
+    } else {
+      process.env[JOURNAL_ENV] = previous;
+    }
+    await rm(dir, { force: true, recursive: true });
+  };
+  return { file, query, restore };
+};
+
+type ActionRow = {
+  action: string | null;
+  arguments: string | null;
+  is_error: number;
+  outcome: string | null;
+  source: string;
+  task_key: string | null;
+  tool_call_id: string | null;
+  watch_key: string | null;
+};
+
+type DeliveryRow = {
+  delivery_key: string;
+  kind: string;
+  notify: string;
+  task_key: string;
+  wake_requested: number;
+  watch_key: string | null;
+};
+
+type DeliveryEventRow = {
+  batch_id: string | null;
+  delivery_key: string;
+  error: string | null;
+  event: string;
+  via: string | null;
+};
+
+describe("journaled tool, service, and dashboard actions", () => {
+  test("records tool actions, rejected calls, and linked tasks", async () => {
+    const journal = await useJournal();
+    try {
+      const harness = createHarness();
+      await harness.emit("session_start");
+      const started = await harness.execute({
+        action: "start",
+        command: "printf journaled; sleep 30",
+        name: "Journaled",
+        watch: { condition: "output", pattern: "journaled" },
+      });
+      const taskId = started.details.task!.id;
+      await Bun.sleep(80);
+      await harness.execute({ action: "logs", afterByte: 0, taskId });
+      await harness.execute({ action: "status" });
+      await expect(
+        harness.execute({ action: "stop", taskId: "nope" })
+      ).rejects.toThrow("Unknown background task ID");
+      await expect(
+        harness.execute({ action: "start", command: "true", cwd: "/missing/dir" })
+      ).rejects.toThrow("does not exist");
+      // Pi rejects invalid arguments before execute but still ends the call.
+      await harness.emit("tool_execution_start", {
+        args: { action: "explode" },
+        toolCallId: "rejected-1",
+        toolName: "background_task",
+      });
+      await harness.emit("tool_execution_end", {
+        isError: true,
+        result: { content: [{ text: "Validation failed", type: "text" }] },
+        toolCallId: "rejected-1",
+        toolName: "background_task",
+      });
+      await harness.execute({ action: "stop", taskId });
+      await waitForCompletion();
+      await harness.emit("session_shutdown");
+
+      const actions = journal.query<ActionRow>(
+        "SELECT * FROM actions ORDER BY action_id"
+      );
+      expect(actions.map((row) => [row.action, row.is_error])).toEqual([
+        ["start", 0],
+        ["logs", 0],
+        ["status", 0],
+        ["stop", 1],
+        ["start", 1],
+        ["explode", 1],
+        ["stop", 0],
+      ]);
+      const [start, logs, , badStop, badStart, rejected] = actions;
+      expect(start?.task_key).toEndWith(`/${taskId}`);
+      expect(start?.watch_key).toEndWith(
+        `/${started.details.task!.watches![0]!.id}`
+      );
+      expect(JSON.parse(start!.arguments!)).toMatchObject({
+        command: "printf journaled; sleep 30",
+      });
+      expect(badStop).toMatchObject({ task_key: null });
+      expect(badStop?.outcome).toContain("Unknown background task ID");
+      expect(badStart?.outcome).toContain("does not exist");
+      expect(rejected).toMatchObject({
+        outcome: "Validation failed",
+        tool_call_id: "rejected-1",
+      });
+      const reads = journal.query<{ caller: string; tool_call_id: string }>(
+        "SELECT * FROM log_reads WHERE caller = 'tool'"
+      );
+      expect(reads).toEqual([
+        expect.objectContaining({ tool_call_id: logs!.tool_call_id! }),
+      ]);
+      const [task] = journal.query<{ origin: string; terminal_reason: string }>(
+        "SELECT * FROM tasks"
+      );
+      expect(task).toMatchObject({ origin: "tool", terminal_reason: "user" });
+    } finally {
+      await journal.restore();
+    }
+  });
+
+  test("records service actions and their failures", async () => {
+    const journal = await useJournal();
+    try {
+      const events = createEventBus();
+      let service: BackgroundTaskService | undefined;
+      events.on(BACKGROUND_TASK_SERVICE_CHANNEL, (data) => {
+        if (isBackgroundTaskServiceAnnouncement(data)) {
+          service = data.service;
+        }
+      });
+      const harness = createHarness({ events });
+      await harness.emit("session_start");
+      const task = await service!.start({ command: "sleep 30" });
+      const watch = service!.watch(task.id, { condition: "exit" });
+      service!.unwatch(watch.id);
+      expect(() => service!.stop("missing")).toThrow();
+      await expect(
+        service!.start({ command: "true", cwd: "/missing/dir" })
+      ).rejects.toThrow();
+      await service!.logs({ taskId: task.id });
+      service!.stop(task.id);
+      await waitForCompletion();
+      await harness.emit("session_shutdown");
+
+      const actions = journal.query<ActionRow>(
+        "SELECT * FROM actions ORDER BY action_id"
+      );
+      expect(
+        actions.map((row) => [row.source, row.action, row.is_error])
+      ).toEqual([
+        ["service", "start", 0],
+        ["service", "watch", 0],
+        ["service", "unwatch", 0],
+        ["service", "stop", 1],
+        ["service", "start", 1],
+        ["service", "stop", 0],
+      ]);
+      expect(actions[1]?.watch_key).toEndWith(`/${watch.id}`);
+      expect(
+        journal.query("SELECT * FROM log_reads WHERE caller = 'service'")
+      ).toHaveLength(1);
+      const [row] = journal.query<{ origin: string }>("SELECT * FROM tasks");
+      expect(row?.origin).toBe("service");
+    } finally {
+      await journal.restore();
+    }
+  });
+
+  test("records dashboard stops and log reads", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "pi-tui-journal-"));
+    const file = path.join(dir, "journal.sqlite");
+    const journal = TaskJournal.open({ path: file });
+    const manager = new BackgroundTaskManager({ runtimeDir: dir });
+    manager.setRecorder(journal.recorder(manager.id));
+    const dashboard = recordingDashboardManager(
+      () => manager,
+      () => journal
+    );
+    const task = await manager.start({ command: "sleep 30", cwd: dir });
+    await dashboard.logs(task.id, 100);
+    dashboard.stop(task.id);
+    expect(() => dashboard.stop("missing")).toThrow("Unknown");
+    await manager.wait(task.id);
+    await manager.shutdown();
+    journal.close();
+
+    const db = new Database(file, { readonly: true });
+    const actions = db
+      .prepare("SELECT source, action, is_error FROM actions ORDER BY action_id")
+      .all();
+    const reads = db.prepare("SELECT caller FROM log_reads").all();
+    db.close();
+    await rm(dir, { force: true, recursive: true });
+    expect(actions).toEqual([
+      { action: "stop", is_error: 0, source: "tui" },
+      { action: "stop", is_error: 1, source: "tui" },
+    ]);
+    expect(reads).toEqual([{ caller: "tui" }]);
+  });
+});
+
+describe("journaled wake delivery", () => {
+  test("records silent, notify, and wake decisions", async () => {
+    const journal = await useJournal();
+    try {
+      const harness = createHarness();
+      await harness.emit("session_start");
+      for (const completionPolicy of ["silent", "notify", "wake"] as const) {
+        // oxlint-disable-next-line eslint/no-await-in-loop
+        await harness.execute({
+          action: "start",
+          command: "true",
+          completionPolicy,
+          name: completionPolicy,
+        });
+      }
+      await waitForMessageCount(harness.sentMessages, 1);
+      await harness.emit("session_shutdown");
+
+      const deliveries = journal.query<DeliveryRow & { name: string }>(
+        `SELECT d.*, t.name FROM deliveries d JOIN tasks t USING (task_key)`
+      );
+      const byName = new Map(deliveries.map((row) => [row.name, row]));
+      expect(byName.get("silent")).toMatchObject({
+        notify: "silent",
+        wake_requested: 0,
+      });
+      expect(byName.get("notify")).toMatchObject({
+        notify: "shown",
+        wake_requested: 0,
+      });
+      expect(byName.get("wake")).toMatchObject({
+        kind: "completion",
+        notify: "shown",
+        wake_requested: 1,
+      });
+      const events = journal.query<DeliveryEventRow>(
+        "SELECT * FROM delivery_events ORDER BY event_id"
+      );
+      expect(events.map((row) => row.event)).toEqual([
+        "enqueue-attempted",
+        "enqueued",
+      ]);
+      expect(events[0]?.delivery_key).toBe(byName.get("wake")!.delivery_key);
+      expect(events[0]?.batch_id).toBe(events[1]!.batch_id);
+    } finally {
+      await journal.restore();
+    }
+  });
+
+  test("records batching and observation through model context", async () => {
+    const journal = await useJournal();
+    try {
+      const harness = createHarness();
+      await harness.emit("session_start");
+      await Promise.all(
+        ["one", "two"].map((name) =>
+          harness.execute({
+            action: "start",
+            command: "true",
+            completionPolicy: "wake",
+            name,
+          })
+        )
+      );
+      await waitForMessageCount(harness.sentMessages, 1);
+      const sent = harness.sentMessages[0]!.message as Record<string, unknown>;
+      await harness.emit("context", {
+        messages: [{ ...sent, role: "custom" }],
+      });
+      await harness.emit("session_shutdown");
+
+      const events = journal.query<DeliveryEventRow>(
+        "SELECT * FROM delivery_events ORDER BY event_id"
+      );
+      const attempted = events.filter((row) => row.event === "enqueue-attempted");
+      expect(attempted).toHaveLength(2);
+      expect(new Set(attempted.map((row) => row.batch_id)).size).toBe(1);
+      expect(
+        events.filter((row) => row.event === "observed").map((row) => row.via)
+      ).toEqual(["context", "context"]);
+    } finally {
+      await journal.restore();
+    }
+  });
+
+  test("records a failed enqueue and later fallback delivery", async () => {
+    const journal = await useJournal();
+    const originalError = console.error;
+    console.error = () => {};
+    try {
+      const harness = createHarness({
+        sendMessageError: new Error("queue closed"),
+      });
+      await harness.emit("session_start");
+      await harness.execute({
+        action: "start",
+        command: "false",
+        completionPolicy: "wake",
+      });
+      await Bun.sleep(400);
+      await harness.emit("context", { messages: [] });
+      await harness.emit("context", { messages: [] });
+      await harness.emit("session_shutdown");
+
+      const events = journal.query<DeliveryEventRow>(
+        "SELECT * FROM delivery_events ORDER BY event_id"
+      );
+      expect(events.map((row) => [row.event, row.via ?? row.error])).toEqual([
+        ["enqueue-attempted", null],
+        ["enqueue-failed", "queue closed"],
+        ["fallback-injected", null],
+        ["observed", "fallback"],
+      ]);
+    } finally {
+      console.error = originalError;
+      await journal.restore();
+    }
+  });
+
+  test("records fired-watch wake delivery and tool observation", async () => {
+    const journal = await useJournal();
+    try {
+      const harness = createHarness();
+      await harness.emit("session_start");
+      const started = await harness.execute({
+        action: "start",
+        command: "printf ready; sleep 30",
+        watch: { condition: "output", pattern: "ready", wake: true },
+      });
+      await waitForMessageCount(harness.sentMessages, 1);
+      const taskId = started.details.task!.id;
+      await harness.execute({ action: "stop", taskId });
+      await waitForCompletion();
+      await harness.emit("session_shutdown");
+
+      const [delivery] = journal.query<DeliveryRow>(
+        "SELECT * FROM deliveries WHERE kind = 'watch'"
+      );
+      expect(delivery).toMatchObject({ notify: "shown", wake_requested: 1 });
+      expect(delivery?.watch_key).toEndWith(
+        `/${started.details.task!.watches![0]!.id}`
+      );
+      const events = journal.query<DeliveryEventRow>(
+        "SELECT * FROM delivery_events"
+      );
+      expect(events.map((row) => row.event)).toEqual([
+        "enqueue-attempted",
+        "enqueued",
+      ]);
+    } finally {
+      await journal.restore();
+    }
+  });
+
+  test("records delivery by the adopting instance after reload", async () => {
+    const journal = await useJournal();
+    try {
+      const sessionId = `journal-reload-${crypto.randomUUID()}`;
+      const before = createHarness({ sessionId });
+      await before.emit("session_start");
+      await before.execute({
+        action: "start",
+        command: "sleep 0.2; printf later",
+        completionPolicy: "wake",
+      });
+      await before.emit("session_shutdown", { reason: "reload" });
+      await Bun.sleep(400);
+      const after = createHarness({ sessionId });
+      await after.emit("session_start");
+      await waitForMessageCount(after.sentMessages, 1);
+      await after.execute({ action: "status" });
+      await after.emit("session_shutdown");
+
+      const instances = journal.query<{ instance_id: string }>(
+        "SELECT instance_id FROM instances ORDER BY started_at"
+      );
+      expect(instances).toHaveLength(2);
+      const [first, second] = instances.map((row) => row.instance_id);
+      const [task] = journal.query<{
+        finished_by_instance: string;
+        started_by_instance: string;
+        status: string;
+      }>("SELECT * FROM tasks");
+      // The detached recorder stays bound, so the old instance records the finish.
+      expect(task).toMatchObject({
+        finished_by_instance: first!,
+        started_by_instance: first!,
+        status: "completed",
+      });
+      const [delivery] = journal.query<DeliveryRow & { instance_id: string }>(
+        "SELECT * FROM deliveries"
+      );
+      expect(delivery).toMatchObject({
+        instance_id: second!,
+        notify: "suppressed",
+        wake_requested: 1,
+      });
+      const events = journal.query<DeliveryEventRow & { instance_id: string }>(
+        "SELECT * FROM delivery_events ORDER BY event_id"
+      );
+      expect(events.map((row) => [row.event, row.via])).toEqual([
+        ["enqueue-attempted", null],
+        ["enqueued", null],
+        ["observed", "tool:status"],
+      ]);
+      expect(events.every((row) => row.instance_id === second)).toBe(true);
+    } finally {
+      await journal.restore();
     }
   });
 });

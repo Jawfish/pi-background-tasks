@@ -1,4 +1,5 @@
 import { StringEnum } from "@earendil-works/pi-ai";
+import { randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
 import path from "node:path";
 import type {
@@ -25,6 +26,8 @@ import type {
   TaskWatchEvent,
   TaskWatchSnapshot,
 } from "./core.ts";
+import { resolveJournalPath, TaskJournal } from "./journal.ts";
+import type { DeliveryNotifyResult } from "./journal.ts";
 import {
   formatUiDuration,
   renderBackgroundTaskCall,
@@ -597,6 +600,7 @@ export const HANDOFF_LEASE_MS = 15_000;
 
 interface HandoffState {
   deliveryLedger: CompletionDeliveryLedger;
+  journal: TaskJournal;
   manager: BackgroundTaskManager;
   readState: TaskDashboardReadState;
   unacknowledgedFailures: Map<string, TaskSnapshot>;
@@ -626,11 +630,17 @@ const releaseHandoff = function releaseHandoff(
   entry: HandoffState,
   reason: string
 ): void {
-  void entry.manager.shutdown().catch((error: unknown) => {
-    console.error(
-      `[background-tasks] ${reason}: ${error instanceof Error ? error.message : String(error)}`
-    );
-  });
+  void entry.manager
+    .shutdown()
+    .catch((error: unknown) => {
+      console.error(
+        `[background-tasks] ${reason}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    })
+    .finally(() => {
+      entry.manager.setRecorder(undefined);
+      entry.journal.close();
+    });
 };
 
 const storeHandoff = function storeHandoff(
@@ -672,6 +682,96 @@ const claimHandoff = function claimHandoff(
   return entry;
 };
 
+const TOOL_NAME = "background_task";
+
+interface ActionLinks {
+  taskId?: string;
+  watchId?: string;
+}
+
+/** Task and watch references proven valid by a tool result. */
+const actionLinks = function actionLinks(
+  details: unknown,
+  args: unknown
+): ActionLinks {
+  if (!details || typeof details !== "object") {
+    return {};
+  }
+  const value = details as {
+    task?: TaskSnapshot;
+    tasks?: TaskSnapshot[];
+    watch?: TaskWatchSnapshot;
+  };
+  if (value.watch) {
+    return { taskId: value.watch.taskId, watchId: value.watch.id };
+  }
+  if (value.task) {
+    const hasInitialWatch =
+      Boolean(args) &&
+      typeof args === "object" &&
+      Boolean((args as { watch?: unknown }).watch);
+    return {
+      taskId: value.task.id,
+      watchId: hasInitialWatch ? value.task.watches?.[0]?.id : undefined,
+    };
+  }
+  if (value.tasks?.length === 1) {
+    return { taskId: value.tasks[0]?.id };
+  }
+  return {};
+};
+
+const resultText = function resultText(result: unknown): string | undefined {
+  const content = (result as { content?: unknown } | undefined)?.content;
+  if (!Array.isArray(content)) {
+    return undefined;
+  }
+  return content
+    .map((part: { text?: unknown }) =>
+      typeof part?.text === "string" ? part.text : ""
+    )
+    .join("\n");
+};
+
+/** Dashboard manager port that journals TUI log reads and stop actions. */
+export const recordingDashboardManager = function recordingDashboardManager(
+  getManager: () => BackgroundTaskManager,
+  getJournal: () => TaskJournal
+) {
+  return {
+    list: () => getManager().list(),
+    logs: (idOrPrefix: string, requestedBytes?: number, afterByte?: number) =>
+      getManager().logs(idOrPrefix, requestedBytes, afterByte, {
+        caller: "tui",
+      }),
+    stop: (idOrPrefix: string): TaskSnapshot => {
+      const current = getManager();
+      try {
+        const task = current.stop(idOrPrefix);
+        getJournal().action({
+          action: "stop",
+          arguments: { taskId: idOrPrefix },
+          isError: false,
+          managerId: current.id,
+          outcome: `Stopping ${task.name} (${task.id}).`,
+          source: "tui",
+          taskId: task.id,
+        });
+        return task;
+      } catch (error) {
+        getJournal().action({
+          action: "stop",
+          arguments: { taskId: idOrPrefix },
+          isError: true,
+          outcome: error instanceof Error ? error.message : String(error),
+          source: "tui",
+        });
+        throw error;
+      }
+    },
+  };
+};
+
 const backgroundTasksExtension = function backgroundTasksExtension(
   pi: ExtensionAPI
 ): void {
@@ -683,6 +783,8 @@ const backgroundTasksExtension = function backgroundTasksExtension(
   let taskStatusWidgetRegistered = false;
   let dashboardReadState = new TaskDashboardReadState();
   let deliveryLedger = new CompletionDeliveryLedger();
+  let journal = TaskJournal.disabled();
+  const pendingToolCalls = new Map<string, { args: unknown; at: number }>();
   const unacknowledgedFailures = new Map<string, TaskSnapshot>();
   const serviceListeners = new Set<
     (event: BackgroundTaskLifecycleEvent) => void
@@ -693,6 +795,35 @@ const backgroundTasksExtension = function backgroundTasksExtension(
   let discoverySubscription: (() => void) | undefined;
   // Callbacks close over the manager, so initialization follows their definitions.
   let manager: BackgroundTaskManager;
+
+  // Ledger IDs restart per ledger; the manager ID makes them globally unique.
+  const deliveryKey = (record: CompletionDeliveryRecord): string =>
+    `${manager.id}:${record.deliveryId}`;
+
+  const recordDeliveryEvents = (
+    records: readonly CompletionDeliveryRecord[],
+    event: Omit<Parameters<TaskJournal["deliveryEvent"]>[0], "deliveryKey">
+  ): void => {
+    for (const record of records) {
+      journal.deliveryEvent({ ...event, deliveryKey: deliveryKey(record) });
+    }
+  };
+
+  /** Record first observation; call before the ledger marks records observed. */
+  const recordObserved = (
+    records: readonly CompletionDeliveryRecord[],
+    via: string
+  ): void => {
+    recordDeliveryEvents(
+      records.filter((record) => record.state !== "observed"),
+      { event: "observed", via }
+    );
+  };
+
+  const deliveriesForTasks = (
+    taskIds: readonly string[]
+  ): CompletionDeliveryRecord[] =>
+    deliveryLedger.list().filter((record) => taskIds.includes(record.taskId));
 
   const clearTaskStatusWidget = (ctx: ExtensionContext): void => {
     if (taskStatusWidgetRegistered) {
@@ -774,6 +905,8 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       }
       deliveryLedger.markWakeAttempted(records);
       const deliveryIds = records.map((record) => record.deliveryId);
+      const batchId = randomUUID();
+      recordDeliveryEvents(records, { batchId, event: "enqueue-attempted" });
       const triggerTurn: boolean = !wakeRequested;
       const completionRecords = records.filter(
         (record): record is Extract<
@@ -845,8 +978,14 @@ const backgroundTasksExtension = function backgroundTasksExtension(
           );
         }
         deliveryLedger.markEnqueued(records);
+        recordDeliveryEvents(records, { batchId, event: "enqueued" });
         wakeRequested ||= triggerTurn;
       } catch (error) {
+        recordDeliveryEvents(records, {
+          batchId,
+          error: error instanceof Error ? error.message : String(error),
+          event: "enqueue-failed",
+        });
         console.error(
           `[background-tasks] automatic continuation failed: ${error instanceof Error ? error.message : String(error)}`
         );
@@ -870,14 +1009,18 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       !shuttingDown &&
       task.completionPolicy === "wake" &&
       (task.status === "completed" || task.status === "failed");
-    if (shouldWake) {
-      deliveryLedger.add(completion);
-    }
+    const wakeRecord = shouldWake ? deliveryLedger.add(completion) : undefined;
 
     const ctx = currentCtx;
-    const shouldNotify =
-      !shuttingDown && task.completionPolicy !== "silent";
-    if (shouldNotify && ctx?.hasUI) {
+    let notify: DeliveryNotifyResult = "shown";
+    if (shuttingDown) {
+      notify = "suppressed";
+    } else if (task.completionPolicy === "silent") {
+      notify = "silent";
+    } else if (!ctx?.hasUI) {
+      notify = "no-ui";
+    }
+    if (notify === "shown" && ctx) {
       const duration = formatUiDuration(
         (task.endedAt ?? Date.now()) - task.startedAt
       );
@@ -893,11 +1036,22 @@ const backgroundTasksExtension = function backgroundTasksExtension(
           task.status === "failed" ? "error" : "info"
         );
       } catch (error) {
+        notify = "failed";
         console.error(
           `[background-tasks] completion notification failed: ${error instanceof Error ? error.message : String(error)}`
         );
       }
     }
+    journal.deliveryDecided({
+      deliveryKey: wakeRecord
+        ? deliveryKey(wakeRecord)
+        : `${manager.id}:notice:completion:${task.id}`,
+      kind: "completion",
+      managerId: manager.id,
+      notify,
+      taskId: task.id,
+      wakeRequested: shouldWake,
+    });
     if (shouldWake) {
       scheduleWake();
     }
@@ -984,6 +1138,45 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     }
   };
 
+  const recordServiceAction = (
+    action: string,
+    args: unknown,
+    outcome: { error: unknown } | { links: ActionLinks; text: string }
+  ): void => {
+    const isError = "error" in outcome;
+    journal.action({
+      action,
+      arguments: args,
+      isError,
+      managerId: manager.id,
+      outcome: isError
+        ? outcome.error instanceof Error
+          ? outcome.error.message
+          : String(outcome.error)
+        : outcome.text,
+      source: "service",
+      ...(isError ? {} : outcome.links),
+    });
+  };
+
+  /** Run one state-changing service call and journal its outcome. */
+  const serviceAction = <T>(
+    action: string,
+    args: unknown,
+    run: () => T,
+    describe: (value: T) => { links: ActionLinks; text: string }
+  ): T => {
+    let value: T;
+    try {
+      value = run();
+    } catch (error) {
+      recordServiceAction(action, args, { error });
+      throw error;
+    }
+    recordServiceAction(action, args, describe(value));
+    return value;
+  };
+
   const createService = (ctx: ExtensionContext): BackgroundTaskService => {
     const epoch = ++serviceEpoch;
     const requireCurrentService = (): void => {
@@ -1000,7 +1193,8 @@ const backgroundTasksExtension = function backgroundTasksExtension(
         const logs = await manager.logs(
           request.taskId,
           request.maxBytes,
-          request.afterByte
+          request.afterByte,
+          { caller: "service" }
         );
         requireCurrentService();
         return freezeServiceLogs(logs);
@@ -1009,16 +1203,27 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       start: async (request: BackgroundTaskStartRequest) => {
         requireCurrentService();
         const input = { ...request };
-        const cwd = await resolveTaskCwd(ctx.cwd, input.cwd);
-        requireCurrentService();
-        const task = await manager.start({
-          command: input.command,
-          completionPolicy: input.completionPolicy,
-          cwd,
-          environment: buildTaskEnvironment(ctx),
-          name: input.name,
-          timeoutSeconds: input.timeoutSeconds,
-          watch: input.watch,
+        let task: TaskSnapshot;
+        try {
+          const cwd = await resolveTaskCwd(ctx.cwd, input.cwd);
+          requireCurrentService();
+          task = await manager.start({
+            command: input.command,
+            completionPolicy: input.completionPolicy,
+            cwd,
+            environment: buildTaskEnvironment(ctx),
+            name: input.name,
+            origin: "service",
+            timeoutSeconds: input.timeoutSeconds,
+            watch: input.watch,
+          });
+        } catch (error) {
+          recordServiceAction("start", input, { error });
+          throw error;
+        }
+        recordServiceAction("start", input, {
+          links: actionLinks({ task }, input),
+          text: `Started ${task.name} (${task.id})`,
         });
         requireCurrentService();
         return freezeServiceTask(task);
@@ -1029,7 +1234,16 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       },
       stop: (taskIdOrPrefix: string) => {
         requireCurrentService();
-        return freezeServiceTask(manager.stop(taskIdOrPrefix));
+        const task = serviceAction(
+          "stop",
+          { taskId: taskIdOrPrefix },
+          () => manager.stop(taskIdOrPrefix),
+          (value) => ({
+            links: { taskId: value.id },
+            text: `Stopping ${value.name} (${value.id}).`,
+          })
+        );
+        return freezeServiceTask(task);
       },
       subscribe: (listener) => {
         requireCurrentService();
@@ -1043,12 +1257,30 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       },
       unwatch: (watchIdOrPrefix: string) => {
         requireCurrentService();
-        return freezeServiceWatch(manager.unwatch(watchIdOrPrefix));
+        const watch = serviceAction(
+          "unwatch",
+          { watchId: watchIdOrPrefix },
+          () => manager.unwatch(watchIdOrPrefix),
+          (value) => ({
+            links: { taskId: value.taskId, watchId: value.id },
+            text: `Cancelled ${value.condition} watch ${value.id}.`,
+          })
+        );
+        return freezeServiceWatch(watch);
       },
       version: BACKGROUND_TASK_SERVICE_VERSION,
       watch: (taskIdOrPrefix, input) => {
         requireCurrentService();
-        return freezeServiceWatch(manager.watch(taskIdOrPrefix, input));
+        const watch = serviceAction(
+          "watch",
+          { ...input, taskId: taskIdOrPrefix },
+          () => manager.watch(taskIdOrPrefix, input),
+          (value) => ({
+            links: { taskId: value.taskId, watchId: value.id },
+            text: `Watching ${value.taskId} for ${value.condition} (${value.id}).`,
+          })
+        );
+        return freezeServiceWatch(watch);
       },
       watchStatus: (taskIdOrPrefix?: string) => {
         requireCurrentService();
@@ -1075,26 +1307,60 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       try {
         // Adoption is sequential so one unreadable log cannot hide later tasks.
         // oxlint-disable-next-line eslint/no-await-in-loop
-        const logs = await manager.logs(task.id, MAX_COMPLETION_LOG_BYTES);
+        const logs = await manager.logs(
+          task.id,
+          MAX_COMPLETION_LOG_BYTES,
+          undefined,
+          { caller: "adoption" }
+        );
         completion.output = logs.output;
         completion.outputTruncated = logs.truncated;
       } catch (error) {
         completion.outputError =
           error instanceof Error ? error.message : String(error);
       }
-      deliveryLedger.add(completion);
+      const isNew = !deliveryLedger
+        .list()
+        .some(
+          (record) => record.kind === "completion" && record.taskId === task.id
+        );
+      const record = deliveryLedger.add(completion);
+      if (isNew) {
+        // The task finished while no instance was bound, so nobody notified.
+        journal.deliveryDecided({
+          deliveryKey: deliveryKey(record),
+          kind: "completion",
+          managerId: manager.id,
+          notify: "suppressed",
+          taskId: task.id,
+          wakeRequested: true,
+        });
+      }
     }
   };
 
   const handleWatchFired = (event: TaskWatchEvent): void => {
+    const noticeKey = `${manager.id}:notice:watch:${event.watch.id}`;
     if (shuttingDown) {
+      journal.deliveryDecided({
+        deliveryKey: noticeKey,
+        kind: "watch",
+        managerId: manager.id,
+        notify: "suppressed",
+        taskId: event.task.id,
+        wakeRequested: false,
+        watchId: event.watch.id,
+      });
       return;
     }
-    if (event.watch.wake) {
-      deliveryLedger.addWatch(event);
+    const wakeRecord = event.watch.wake
+      ? deliveryLedger.addWatch(event)
+      : undefined;
+    if (wakeRecord) {
       scheduleWake();
     }
     const ctx = currentCtx;
+    let notify: DeliveryNotifyResult = ctx?.hasUI ? "shown" : "no-ui";
     publishServiceEvent({
       nextByte: event.nextByte,
       output: event.output,
@@ -1110,11 +1376,21 @@ const backgroundTasksExtension = function backgroundTasksExtension(
           "info"
         );
       } catch (error) {
+        notify = "failed";
         console.error(
           `[background-tasks] watch notification failed: ${error instanceof Error ? error.message : String(error)}`
         );
       }
     }
+    journal.deliveryDecided({
+      deliveryKey: wakeRecord ? deliveryKey(wakeRecord) : noticeKey,
+      kind: "watch",
+      managerId: manager.id,
+      notify,
+      taskId: event.task.id,
+      wakeRequested: wakeRecord !== undefined,
+      watchId: event.watch.id,
+    });
   };
 
   const managerCallbacks = {
@@ -1142,7 +1418,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       "Task status is injected before every model call, so status and logs are not polling tools.",
       `Log reads are capped at ${String(MAX_LOG_READ_BYTES)} bytes. Reuse nextByte as afterByte for incremental reads.`,
     ].join(" "),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(toolCallId, params, _signal, _onUpdate, ctx) {
       currentCtx = ctx;
       switch (params.action) {
         case "start": {
@@ -1154,6 +1430,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
             cwd: await resolveTaskCwd(ctx.cwd, params.cwd),
             environment: buildTaskEnvironment(ctx),
             name: params.name,
+            origin: "tool",
             completionPolicy: params.completionPolicy,
             timeoutSeconds: params.timeoutSeconds,
             watch: params.watch,
@@ -1192,6 +1469,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
                 task.status === "completed" || task.status === "failed"
             )
             .map((task) => task.id);
+          recordObserved(deliveriesForTasks(terminalTaskIds), "tool:status");
           deliveryLedger.markObservedByTaskId(terminalTaskIds);
           for (const taskId of terminalTaskIds) {
             unacknowledgedFailures.delete(taskId);
@@ -1208,12 +1486,14 @@ const backgroundTasksExtension = function backgroundTasksExtension(
           const logs = await manager.logs(
             params.taskId,
             params.maxBytes,
-            params.afterByte
+            params.afterByte,
+            { callId: toolCallId, caller: "tool" }
           );
           if (
             logs.task.status === "completed" ||
             logs.task.status === "failed"
           ) {
+            recordObserved(deliveriesForTasks([logs.task.id]), "tool:logs");
             deliveryLedger.markObservedByTaskId([logs.task.id]);
             unacknowledgedFailures.delete(logs.task.id);
           }
@@ -1284,7 +1564,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       }
     },
     label: "Background Task",
-    name: "background_task",
+    name: TOOL_NAME,
     parameters: Parameters,
     prepareArguments: prepareBackgroundTaskArguments,
     renderCall(args, theme, context) {
@@ -1319,7 +1599,10 @@ const backgroundTasksExtension = function backgroundTasksExtension(
           (tui, theme, keybindings, done) => {
             dashboard = new TaskDashboardComponent({
               keybindings,
-              manager,
+              manager: recordingDashboardManager(
+                () => manager,
+                () => journal
+              ),
               onClose: () => done(),
               readState: dashboardReadState,
               theme,
@@ -1350,13 +1633,56 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     },
   });
 
+  pi.on("tool_execution_start", (event) => {
+    if (event.toolName === TOOL_NAME) {
+      pendingToolCalls.set(event.toolCallId, {
+        args: event.args,
+        at: Date.now(),
+      });
+    }
+  });
+
+  // Pi emits this for every call, including calls rejected before execute.
+  pi.on("tool_execution_end", (event) => {
+    if (event.toolName !== TOOL_NAME) {
+      return;
+    }
+    const pending = pendingToolCalls.get(event.toolCallId);
+    pendingToolCalls.delete(event.toolCallId);
+    const args = pending?.args;
+    const action = (args as { action?: unknown } | undefined)?.action;
+    journal.action({
+      action: typeof action === "string" ? action : undefined,
+      arguments: args,
+      at: pending?.at,
+      isError: event.isError,
+      managerId: manager.id,
+      outcome: resultText(event.result),
+      source: "tool",
+      toolCallId: event.toolCallId,
+      ...(event.isError
+        ? {}
+        : actionLinks(
+            (event.result as { details?: unknown } | undefined)?.details,
+            args
+          )),
+    });
+  });
+
   pi.on("context", (event) => {
     if (shuttingDown) {
       return { messages: event.messages };
     }
-    const observedTaskIds = deliveryLedger.markObservedByDeliveryId(
-      deliveryIdsInMessages(event.messages)
+    const seenDeliveryIds = new Set(deliveryIdsInMessages(event.messages));
+    recordObserved(
+      deliveryLedger
+        .list()
+        .filter((record) => seenDeliveryIds.has(record.deliveryId)),
+      "context"
     );
+    const observedTaskIds = deliveryLedger.markObservedByDeliveryId([
+      ...seenDeliveryIds,
+    ]);
     for (const taskId of observedTaskIds) {
       unacknowledgedFailures.delete(taskId);
     }
@@ -1433,6 +1759,8 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       for (const taskId of fallbackTaskIds) {
         unacknowledgedFailures.delete(taskId);
       }
+      recordDeliveryEvents(fallback, { event: "fallback-injected" });
+      recordObserved(fallback, "fallback");
       deliveryLedger.markObservedByDeliveryId(deliveryIds);
     }
     return { messages };
@@ -1444,10 +1772,22 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     if (ctx.hasUI) {
       ctx.ui.setStatus(BACKGROUND_TASK_WIDGET_KEY, undefined);
     }
+    journal.close();
+    journal = TaskJournal.open({
+      identity: {
+        cwd: ctx.cwd,
+        piSessionFile: ctx.sessionManager?.getSessionFile(),
+        piSessionId: ctx.sessionManager?.getSessionId(),
+      },
+      path: resolveJournalPath(),
+    });
     const adopted = claimHandoff(ctx.sessionManager?.getSessionId());
     if (adopted) {
       const discarded = manager;
       manager = adopted.manager;
+      // Rebind before closing so no finish between the two is lost.
+      manager.setRecorder(journal.recorder(manager.id));
+      adopted.journal.close();
       deliveryLedger = adopted.deliveryLedger;
       dashboardReadState = adopted.readState;
       for (const [taskId, task] of adopted.unacknowledgedFailures) {
@@ -1463,6 +1803,7 @@ const backgroundTasksExtension = function backgroundTasksExtension(
       }
       await adoptTerminalTasks();
     }
+    manager.setRecorder(journal.recorder(manager.id));
     await manager.initialize();
     updateUi();
     if (deliveryLedger.wakeCandidates().length > 0) {
@@ -1530,14 +1871,22 @@ const backgroundTasksExtension = function backgroundTasksExtension(
     try {
       if (reload && sessionId) {
         manager.detachCallbacks();
+        // The recorder stays bound so the handoff gap is still journaled.
         storeHandoff(sessionId, {
           deliveryLedger,
+          journal,
           manager,
           readState: dashboardReadState,
           unacknowledgedFailures: new Map(unacknowledgedFailures),
         });
+        journal = TaskJournal.disabled();
       } else {
-        await manager.shutdown();
+        try {
+          await manager.shutdown();
+        } finally {
+          manager.setRecorder(undefined);
+          journal.close();
+        }
       }
     } finally {
       currentCtx = undefined;
