@@ -554,3 +554,81 @@ describe("node runtime", () => {
     expect(Buffer.from(row.content).toString()).toBe("node-ok");
   }, 20_000);
 });
+
+describe("busy database", () => {
+  const openBusyJournal = async function openBusyJournal() {
+    const dir = await mkdtemp(path.join(tmpdir(), "pi-journal-busy-"));
+    const file = path.join(dir, "journal.sqlite");
+    const journal = TaskJournal.open({ backoffMs: 1, path: file });
+    cleanups.push(async () => {
+      journal.close();
+      await rm(dir, { force: true, recursive: true });
+    });
+    const query = <T>(sql: string): T[] => {
+      const db = new Database(file, { readonly: true });
+      try {
+        return db.prepare(sql).all() as T[];
+      } finally {
+        db.close();
+      }
+    };
+    return { file, journal, query };
+  };
+
+  test("keeps writes in order and commits them once the lock clears", async () => {
+    const { file, journal, query } = await openBusyJournal();
+    const blocker = new Database(file);
+    blocker.exec("BEGIN IMMEDIATE");
+    journal.action({ action: "first", isError: false, source: "tool" });
+    journal.action({ action: "second", isError: false, source: "tool" });
+    blocker.exec("ROLLBACK");
+    blocker.close();
+    await journal.flush();
+
+    expect(
+      query<{ action: string }>("SELECT action FROM actions ORDER BY action_id")
+    ).toEqual([{ action: "first" }, { action: "second" }]);
+    expect(journal.isEnabled).toBe(true);
+  });
+
+  test("records a write that stayed busy as a dropped record on the next write", async () => {
+    const { file, journal, query } = await openBusyJournal();
+    const blocker = new Database(file);
+    blocker.exec("BEGIN IMMEDIATE");
+    journal.action({ action: "lost", isError: false, source: "tool" });
+    await journal.flush();
+    blocker.exec("ROLLBACK");
+    blocker.close();
+    journal.action({ action: "kept", isError: false, source: "tool" });
+    await journal.flush();
+
+    expect(query<{ action: string }>("SELECT action FROM actions")).toEqual([
+      { action: "kept" },
+    ]);
+    expect(
+      query<{ location: string; reason: string }>(
+        "SELECT location, reason FROM journal_errors"
+      )
+    ).toEqual([{ location: "action", reason: "busy_dropped" }]);
+  }, 20_000);
+
+  test("a failed write disables the journal and records why", async () => {
+    const { file, journal, query } = await openBusyJournal();
+    const db = new Database(file);
+    db.exec("DROP TABLE actions");
+    db.close();
+    const originalError = console.error;
+    console.error = () => {};
+    try {
+      journal.action({ action: "x", isError: false, source: "tool" });
+    } finally {
+      console.error = originalError;
+    }
+
+    expect(journal.isEnabled).toBe(false);
+    const [instance] = query<{ disabled_reason: string | null }>(
+      "SELECT disabled_reason FROM instances"
+    );
+    expect(instance?.disabled_reason).toContain("no such table");
+  });
+});

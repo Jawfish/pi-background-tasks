@@ -18,6 +18,8 @@ import type {
 export const JOURNAL_ENV = "PI_BACKGROUND_TASK_JOURNAL";
 const DISABLED_VALUES = new Set(["0", "off", "false", "disabled", "none"]);
 const BUSY_TIMEOUT_MS = 250;
+const MAX_BUSY_RETRIES = 5;
+const DEFAULT_BACKOFF_MS = 50;
 /** A dashboard reads logs on every new chunk; keep at most one row per interval. */
 export const TUI_LOG_READ_INTERVAL_MS = 1000;
 
@@ -161,6 +163,18 @@ const MIGRATIONS: readonly (readonly string[])[] = [
         t.ended_at - t.started_at AS duration_ms
       FROM tasks t`,
   ],
+  [
+    `CREATE TABLE journal_errors (
+      error_id INTEGER PRIMARY KEY,
+      instance_id TEXT NOT NULL,
+      at INTEGER NOT NULL,
+      location TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      message TEXT
+    )`,
+    "ALTER TABLE instances ADD COLUMN disabled_at INTEGER",
+    "ALTER TABLE instances ADD COLUMN disabled_reason TEXT",
+  ],
 ];
 
 export const JOURNAL_SCHEMA_VERSION = MIGRATIONS.length;
@@ -225,6 +239,32 @@ const toSql = function toSql(value: SqlInput): SqlValue {
     return value ? 1 : 0;
   }
   return value;
+};
+
+const SQLITE_BUSY = 5;
+const SQLITE_LOCKED = 6;
+
+/** True for SQLITE_BUSY or SQLITE_LOCKED from either driver. */
+const isBusy = function isBusy(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) {
+    return false;
+  }
+  const { code, errcode, errno } = error as {
+    code?: unknown;
+    errcode?: unknown;
+    errno?: unknown;
+  };
+  if (typeof code === "string" && /^SQLITE_(BUSY|LOCKED)/u.test(code)) {
+    return true;
+  }
+  const numeric = typeof errcode === "number" ? errcode : errno;
+  if (typeof numeric !== "number") {
+    return false;
+  }
+  // Extended result codes keep the primary code in the low byte.
+  // oxlint-disable-next-line eslint/no-bitwise
+  const primary = numeric & 0xff;
+  return primary === SQLITE_BUSY || primary === SQLITE_LOCKED;
 };
 
 const errorText = function errorText(error: unknown): string {
@@ -342,50 +382,66 @@ export interface JournalDeliveryEvent {
 }
 
 export interface OpenJournalOptions {
+  /** First busy retry delay; later retries double it. */
+  backoffMs?: number;
   driver?: JournalDriver;
   identity?: JournalIdentity;
   /** Journal file. Undefined disables the journal. */
   path: string | undefined;
 }
 
+interface PendingWrite {
+  apply: () => void;
+  location: string;
+}
+
+interface DroppedWrite {
+  at: number;
+  location: string;
+  message: string;
+}
+
 /**
  * Append-only SQLite history of background tasks. Every write is best effort:
  * a journal error is logged once and never reaches a task or tool result.
+ *
+ * Writes run synchronously while the database is free. A busy write, and
+ * every write after it, waits in order for a retry with doubling backoff. A
+ * write still busy after MAX_BUSY_RETRIES is dropped, and the next successful
+ * write records the drop in `journal_errors`. Any other failure disables the
+ * journal for this instance.
  */
 export class TaskJournal {
   readonly instanceId = randomUUID();
   readonly path: string | undefined;
   #db: SqlDatabase | undefined;
   #error: string | undefined;
-  #hasReportedWriteError = false;
+  #isDisabled = false;
+  #openRequest: { driver: JournalDriver; identity: JournalIdentity } | undefined;
+  readonly #backoffMs: number;
+  readonly #pending: PendingWrite[] = [];
+  readonly #drops: DroppedWrite[] = [];
+  #retryAttempt = 0;
+  #retryTimer: ReturnType<typeof setTimeout> | undefined;
+  readonly #idleWaiters: (() => void)[] = [];
   readonly #tuiReads = new Map<string, { at: number; skipped: number }>();
 
-  private constructor(filePath: string | undefined) {
+  private constructor(filePath: string | undefined, backoffMs = DEFAULT_BACKOFF_MS) {
     this.path = filePath;
+    this.#backoffMs = backoffMs;
   }
 
   /** Open a journal. Open failures produce a disabled journal with an error. */
   static open(options: OpenJournalOptions): TaskJournal {
-    const journal = new TaskJournal(options.path);
+    const journal = new TaskJournal(options.path, options.backoffMs);
     if (options.path === undefined) {
       return journal;
     }
-    try {
-      journal.#db = TaskJournal.#connect(
-        options.path,
-        options.driver ?? (process.versions.bun ? "bun" : "node")
-      );
-      journal.#insertInstance(options.identity ?? {});
-    } catch (error) {
-      try {
-        journal.#db?.close();
-      } catch {
-        // The open error below is the useful failure.
-      }
-      journal.#db = undefined;
-      journal.#error = `Could not open task journal ${options.path}: ${errorText(error)}`;
-      console.error(`[background-tasks] ${journal.#error}`);
-    }
+    journal.#openRequest = {
+      driver: options.driver ?? (process.versions.bun ? "bun" : "node"),
+      identity: options.identity ?? {},
+    };
+    journal.#tryOpen();
     return journal;
   }
 
@@ -393,8 +449,9 @@ export class TaskJournal {
     return new TaskJournal(undefined);
   }
 
+  /** True while the journal records, or will record once a busy open succeeds. */
   get isEnabled(): boolean {
-    return this.#db !== undefined;
+    return this.#db !== undefined || this.#openRequest !== undefined;
   }
 
   /** Open or write failure, if any. */
@@ -402,13 +459,66 @@ export class TaskJournal {
     return this.#error;
   }
 
+  /** Resolves once every queued write has been committed or dropped. */
+  flush(): Promise<void> {
+    if (this.#pending.length === 0 && this.#openRequest === undefined) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      this.#idleWaiters.push(resolve);
+    });
+  }
+
   close(): void {
+    if (this.#retryTimer) {
+      clearTimeout(this.#retryTimer);
+      this.#retryTimer = undefined;
+    }
+    this.#openRequest = undefined;
+    // One last pass; whatever is still busy is lost with the connection.
+    this.#drainOnce(false);
+    this.#pending.length = 0;
     const db = this.#db;
     this.#db = undefined;
     try {
       db?.close();
     } catch {
       // Closing is best effort.
+    }
+    this.#notifyIdle();
+  }
+
+  /** One open attempt: connect, migrate, and record this instance. */
+  #tryOpen(): void {
+    const request = this.#openRequest;
+    if (!request || this.path === undefined) {
+      return;
+    }
+    let db: SqlDatabase | undefined;
+    try {
+      db = TaskJournal.#connect(this.path, request.driver);
+      this.#db = db;
+      this.#commit(() => this.#insertInstance(request.identity));
+      this.#openRequest = undefined;
+      this.#retryAttempt = 0;
+    } catch (error) {
+      this.#db = undefined;
+      try {
+        db?.close();
+      } catch {
+        // The open error below is the useful failure.
+      }
+      if (isBusy(error) && this.#retryAttempt < MAX_BUSY_RETRIES) {
+        this.#retryAttempt += 1;
+        this.#scheduleRetry();
+        return;
+      }
+      this.#openRequest = undefined;
+      this.#pending.length = 0;
+      this.#isDisabled = true;
+      this.#error = `Could not open task journal ${this.path}: ${errorText(error)}`;
+      console.error(`[background-tasks] ${this.#error}`);
+      this.#notifyIdle();
     }
   }
 
@@ -459,7 +569,11 @@ export class TaskJournal {
       db.exec(`PRAGMA user_version = ${String(MIGRATIONS.length)}`);
       db.exec("COMMIT");
     } catch (error) {
-      db.exec("ROLLBACK");
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // The migration error is the useful failure.
+      }
       throw error;
     }
   }
@@ -491,34 +605,153 @@ export class TaskJournal {
     db.prepare(sql).run(...params.map(toSql));
   }
 
-  /** Run one best-effort write; failures are reported once and swallowed. */
-  #write(write: () => void): void {
-    if (!this.#db) {
-      return;
-    }
-    try {
-      write();
-    } catch (error) {
-      this.#error = `Task journal write failed: ${errorText(error)}`;
-      if (!this.#hasReportedWriteError) {
-        this.#hasReportedWriteError = true;
-        console.error(`[background-tasks] ${this.#error}`);
-      }
-    }
-  }
-
-  #transaction(write: () => void): void {
+  /** Commit one write, with any recorded drops, in one transaction. Throws. */
+  #commit(apply: () => void): void {
     const db = this.#db;
     if (!db) {
       return;
     }
     db.exec("BEGIN IMMEDIATE");
+    const drops = this.#drops.slice();
     try {
-      write();
+      for (const drop of drops) {
+        this.#run(
+          `INSERT INTO journal_errors (instance_id, at, location, reason, message)
+           VALUES (?, ?, ?, 'busy_dropped', ?)`,
+          this.instanceId,
+          drop.at,
+          drop.location,
+          drop.message
+        );
+      }
+      apply();
       db.exec("COMMIT");
     } catch (error) {
-      db.exec("ROLLBACK");
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // No transaction to roll back.
+      }
       throw error;
+    }
+    this.#drops.splice(0, drops.length);
+  }
+
+  /** Run one best-effort write in order; failures never reach the caller. */
+  #write(location: string, apply: () => void): void {
+    if (this.#isDisabled || (!this.#db && !this.#openRequest)) {
+      return;
+    }
+    if (this.#pending.length > 0 || !this.#db) {
+      this.#pending.push({ apply, location });
+      this.#scheduleRetry();
+      return;
+    }
+    try {
+      this.#commit(apply);
+    } catch (error) {
+      if (isBusy(error)) {
+        this.#pending.push({ apply, location });
+        this.#scheduleRetry();
+        return;
+      }
+      this.#disable(`Task journal write failed at ${location}`, error);
+    }
+  }
+
+  #scheduleRetry(): void {
+    if (this.#retryTimer || this.#isDisabled) {
+      return;
+    }
+    const delay = this.#backoffMs * 2 ** Math.max(0, this.#retryAttempt - 1);
+    this.#retryTimer = setTimeout(() => {
+      this.#retryTimer = undefined;
+      if (!this.#db) {
+        this.#tryOpen();
+        if (!this.#db) {
+          return;
+        }
+      }
+      if (this.#drainOnce(true)) {
+        this.#notifyIdle();
+      }
+    }, delay);
+    this.#retryTimer.unref?.();
+  }
+
+  /**
+   * Commit queued writes in order. Returns true when the queue is empty.
+   * With `canRetry`, a busy head is retried later or dropped after
+   * MAX_BUSY_RETRIES; without it, draining stops at the first busy write.
+   */
+  #drainOnce(canRetry: boolean): boolean {
+    while (this.#pending.length > 0 && this.#db) {
+      const head = this.#pending[0]!;
+      try {
+        this.#commit(head.apply);
+        this.#pending.shift();
+        this.#retryAttempt = 0;
+      } catch (error) {
+        if (!isBusy(error)) {
+          this.#disable(`Task journal write failed at ${head.location}`, error);
+          return true;
+        }
+        if (!canRetry) {
+          return false;
+        }
+        if (this.#retryAttempt >= MAX_BUSY_RETRIES) {
+          this.#drops.push({
+            at: Date.now(),
+            location: head.location,
+            message: errorText(error),
+          });
+          this.#pending.shift();
+          this.#retryAttempt = 0;
+          continue;
+        }
+        this.#retryAttempt += 1;
+        this.#scheduleRetry();
+        return false;
+      }
+    }
+    return this.#pending.length === 0;
+  }
+
+  #disable(reason: string, error: unknown): void {
+    this.#error = `${reason}: ${errorText(error)}`;
+    console.error(`[background-tasks] ${this.#error}`);
+    try {
+      this.#run(
+        "UPDATE instances SET disabled_at = ?, disabled_reason = ? WHERE instance_id = ?",
+        Date.now(),
+        this.#error,
+        this.instanceId
+      );
+    } catch {
+      // The database may be the reason the journal is disabled.
+    }
+    this.#isDisabled = true;
+    this.#pending.length = 0;
+    if (this.#retryTimer) {
+      clearTimeout(this.#retryTimer);
+      this.#retryTimer = undefined;
+    }
+    const db = this.#db;
+    this.#db = undefined;
+    try {
+      db?.close();
+    } catch {
+      // Already unusable.
+    }
+    this.#notifyIdle();
+  }
+
+  #notifyIdle(): void {
+    if (this.#pending.length > 0 && !this.#isDisabled && this.#db) {
+      return;
+    }
+    for (const resolve of this.#idleWaiters.splice(0)) {
+      resolve();
     }
   }
 
@@ -526,22 +759,28 @@ export class TaskJournal {
   recorder(managerId: string): BackgroundTaskRecorder {
     return {
       logRead: (read) => {
-        this.#write(() => this.#logRead(managerId, read));
+        this.#logRead(managerId, read);
       },
       outputFinalized: (capture) => {
-        this.#write(() => this.#outputFinalized(managerId, capture));
+        this.#outputFinalized(managerId, capture);
       },
       taskFinished: (task, reason) => {
-        this.#write(() => this.#taskFinished(managerId, task, reason));
+        this.#write("task_finished", () =>
+          this.#taskFinished(managerId, task, reason)
+        );
       },
       taskStarted: (task, origin) => {
-        this.#write(() => this.#taskStarted(managerId, task, origin));
+        this.#write("task_started", () =>
+          this.#taskStarted(managerId, task, origin)
+        );
       },
       watchEnded: (watch) => {
-        this.#write(() => this.#watchEnded(managerId, watch));
+        this.#write("watch_ended", () => this.#watchEnded(managerId, watch));
       },
       watchRegistered: (watch, origin) => {
-        this.#write(() => this.#watchRegistered(managerId, watch, origin));
+        this.#write("watch_registered", () =>
+          this.#watchRegistered(managerId, watch, origin)
+        );
       },
     };
   }
@@ -615,6 +854,9 @@ export class TaskJournal {
   }
 
   #outputFinalized(managerId: string, capture: TaskOutputCapture): void {
+    if (!this.isEnabled || this.#isDisabled) {
+      return;
+    }
     let content: Buffer | undefined;
     let fileError: string | undefined;
     try {
@@ -636,7 +878,9 @@ export class TaskJournal {
     const sha256 = content
       ? createHash("sha256").update(content).digest("hex")
       : undefined;
-    this.#transaction(() => {
+    const recordedAt = Date.now();
+    // The log is read now: a deferred write must not race its deletion.
+    this.#write("output_finalized", () => {
       if (content && sha256) {
         this.#run(
           "INSERT OR IGNORE INTO output_blobs (sha256, size_bytes, content) VALUES (?, ?, ?)",
@@ -652,7 +896,7 @@ export class TaskJournal {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         taskKey(managerId, capture.taskId),
         this.instanceId,
-        Date.now(),
+        recordedAt,
         state,
         sha256,
         content?.length ?? 0,
@@ -666,6 +910,9 @@ export class TaskJournal {
   }
 
   #logRead(managerId: string, read: TaskLogReadRecord): void {
+    if (!this.isEnabled || this.#isDisabled) {
+      return;
+    }
     let coalesced = 0;
     if (read.caller === "tui" && !read.error) {
       const key = read.taskId ?? read.query;
@@ -677,7 +924,7 @@ export class TaskJournal {
       coalesced = previous?.skipped ?? 0;
       this.#tuiReads.set(key, { at: read.at, skipped: 0 });
     }
-    this.#run(
+    this.#write("log_read", () => this.#run(
       `INSERT INTO log_reads (instance_id, at, caller, tool_call_id, task_query, task_key,
         requested_after_byte, requested_max_bytes, start_byte, next_byte, bytes_read,
         total_bytes, truncated, dropped_bytes, coalesced_reads, error)
@@ -698,7 +945,7 @@ export class TaskJournal {
       read.droppedBytes,
       coalesced,
       read.error
-    );
+    ));
   }
 
   #watchRegistered(
@@ -743,14 +990,15 @@ export class TaskJournal {
   }
 
   action(record: JournalActionRecord): void {
-    this.#write(() => {
+    const at = record.at ?? Date.now();
+    this.#write("action", () => {
       const hasManager = record.managerId !== undefined;
       this.#run(
         `INSERT INTO actions (instance_id, at, source, action, tool_call_id, arguments,
           is_error, outcome, task_key, watch_key)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         this.instanceId,
-        record.at ?? Date.now(),
+        at,
         record.source,
         record.action,
         record.toolCallId,
@@ -768,7 +1016,8 @@ export class TaskJournal {
   }
 
   deliveryDecided(decision: JournalDeliveryDecision): void {
-    this.#write(() => {
+    const decidedAt = Date.now();
+    this.#write("delivery_decided", () => {
       this.#run(
         `INSERT OR IGNORE INTO deliveries (delivery_key, instance_id, kind, task_key,
           watch_key, decided_at, notify, wake_requested)
@@ -780,7 +1029,7 @@ export class TaskJournal {
         decision.watchId === undefined
           ? undefined
           : watchKey(decision.managerId, decision.watchId),
-        Date.now(),
+        decidedAt,
         decision.notify,
         decision.wakeRequested
       );
@@ -788,13 +1037,14 @@ export class TaskJournal {
   }
 
   deliveryEvent(event: JournalDeliveryEvent): void {
-    this.#write(() => {
+    const at = Date.now();
+    this.#write("delivery_event", () => {
       this.#run(
         `INSERT INTO delivery_events (delivery_key, instance_id, at, event, batch_id, via, error)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
         event.deliveryKey,
         this.instanceId,
-        Date.now(),
+        at,
         event.event,
         event.batchId,
         event.via,

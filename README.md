@@ -330,8 +330,15 @@ disable the journal.
 The journal uses WAL mode and a 250-millisecond lock timeout, so several Pi
 processes can share one file. Schema migrations are forward-only. A journal
 with a newer schema is not changed; the extension disables its journal for
-that session. A journal error never changes a task or a tool result. The
-extension reports the first write error on stderr.
+that session. A journal error never changes a task or a tool result.
+
+Writes are synchronous while the database is free. When another process holds
+the lock, the write and every later write wait in order and retry with doubling
+backoff (50 ms first). A write that is still busy after 5 retries is dropped,
+and the next successful write adds a `journal_errors` row with reason
+`busy_dropped`. Any other write failure disables the journal for that
+instance, reports the error on stderr, and records `disabled_at` and
+`disabled_reason` on its `instances` row when it still can.
 
 The journal contains commands, arguments, and complete command output. The
 file mode is `0600`. Treat the file as sensitive.
@@ -345,7 +352,8 @@ instance records its finish.
 
 | Table | Contents |
 | --- | --- |
-| `instances` | One row per extension instance: Pi session ID and file, cwd, package version, source hash, runtime, and process ID. |
+| `instances` | One row per extension instance: Pi session ID and file, cwd, package version, source hash, runtime, process ID, and `disabled_at` and `disabled_reason` when the journal stopped recording. |
+| `journal_errors` | Records the journal could not write: `location` (the record kind), `reason` (`busy_dropped`), and the error message. |
 | `tasks` | One row per task: origin (`tool` or `service`), command, cwd, policy, timeout, PID, start and end times, status, `terminal_reason`, exit code, signal, and error. |
 | `task_outputs` | Output capture for each task: `capture` (`complete`, `partial`, or `missing`), committed and stored sizes, output limit, and log or file errors. |
 | `output_blobs` | Content-addressed committed output, keyed by SHA-256. |
