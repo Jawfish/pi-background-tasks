@@ -17,9 +17,13 @@ import type {
 /** Journal path, or one of DISABLED_VALUES to turn the journal off. */
 export const JOURNAL_ENV = "PI_BACKGROUND_TASK_JOURNAL";
 const DISABLED_VALUES = new Set(["0", "off", "false", "disabled", "none"]);
-const BUSY_TIMEOUT_MS = 250;
-const MAX_BUSY_RETRIES = 5;
-const DEFAULT_BACKOFF_MS = 50;
+/**
+ * SQLite waits for a lock synchronously, which would stall Pi's event loop.
+ * The journal fails fast instead and retries on timers.
+ */
+const BUSY_TIMEOUT_MS = 0;
+const MAX_BUSY_RETRIES = 8;
+const DEFAULT_BACKOFF_MS = 25;
 /** A dashboard reads logs on every new chunk; keep at most one row per interval. */
 export const TUI_LOG_READ_INTERVAL_MS = 1000;
 

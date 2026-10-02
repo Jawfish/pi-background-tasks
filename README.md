@@ -327,14 +327,16 @@ file is `$XDG_STATE_HOME/pi-background-tasks/journal.sqlite`, or
 not set. Set `PI_BACKGROUND_TASK_JOURNAL` to another file path, or to `off` to
 disable the journal.
 
-The journal uses WAL mode and a 250-millisecond lock timeout, so several Pi
-processes can share one file. Schema migrations are forward-only. A journal
+The journal uses WAL mode, so several Pi processes can share one file. SQLite
+waits for a lock synchronously, so the lock timeout is 0 and a locked write
+retries on a timer instead of stalling Pi. Schema migrations are forward-only. A journal
 with a newer schema is not changed; the extension disables its journal for
 that session. A journal error never changes a task or a tool result.
 
 Writes are synchronous while the database is free. When another process holds
 the lock, the write and every later write wait in order and retry with doubling
-backoff (50 ms first). A write that is still busy after 5 retries is dropped,
+backoff (25 ms first). A write that is still busy after 8 retries (about 6 s)
+is dropped,
 and the next successful write adds a `journal_errors` row with reason
 `busy_dropped`. Any other write failure disables the journal for that
 instance, reports the error on stderr, and records `disabled_at` and
